@@ -507,6 +507,41 @@ fn spawn_reader(inner: Weak<Inner>, v6: bool, socket: Socket) -> tokio::task::Jo
     })
 }
 
+/// Whether a piece of ancillary data is the hop count we asked for.
+///
+/// What we ask for and what comes back are not the same name: Linux answers
+/// `IP_RECVTTL` with a cmsg tagged `IP_TTL`, while macOS and the BSDs tag it
+/// `IP_RECVTTL`. Accepting only one of the two is how the TTL column ends up
+/// empty on the other system.
+#[cfg(unix)]
+fn is_hop_cmsg(level: libc::c_int, kind: libc::c_int) -> bool {
+    (level == libc::IPPROTO_IP && (kind == libc::IP_TTL || kind == libc::IP_RECVTTL))
+        || (level == libc::IPPROTO_IPV6 && kind == libc::IPV6_HOPLIMIT)
+}
+
+/// Reads a hop count out of ancillary data.
+///
+/// Its width is not the same everywhere either: macOS sends the IPv4 TTL as a
+/// single byte, while Linux sends it as an `int`, and the IPv6 hop limit is an
+/// `int` on both. Reading the first byte of an `int` happens to work on a
+/// little-endian machine and is wrong everywhere else, so read what is there.
+#[cfg(unix)]
+unsafe fn cmsg_hop(cmsg: *const libc::cmsghdr, len: usize) -> u8 {
+    unsafe {
+        let data = libc::CMSG_DATA(cmsg);
+        let payload = len.saturating_sub(data as usize - cmsg as usize);
+        match payload {
+            1 => *data,
+            n if n >= 4 => {
+                let mut value = 0i32;
+                std::ptr::copy_nonoverlapping(data, &raw mut value as *mut u8, 4);
+                value.clamp(0, u8::MAX as i32) as u8
+            }
+            _ => 0,
+        }
+    }
+}
+
 /// Reads one datagram along with the TTL of the packet that carried it.
 ///
 /// `recvmsg` is what makes the TTL reachable: it arrives as ancillary data
@@ -541,10 +576,8 @@ fn recv_with_ttl(fd: RawFd, buf: &mut [u8]) -> io::Result<Option<(usize, IpAddr,
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
             let hdr = &*cmsg;
-            let is_ttl = (hdr.cmsg_level == libc::IPPROTO_IP && hdr.cmsg_type == libc::IP_RECVTTL)
-                || (hdr.cmsg_level == libc::IPPROTO_IPV6 && hdr.cmsg_type == libc::IPV6_HOPLIMIT);
-            if is_ttl {
-                ttl = *(libc::CMSG_DATA(cmsg) as *const u8);
+            if is_hop_cmsg(hdr.cmsg_level, hdr.cmsg_type) {
+                ttl = cmsg_hop(cmsg, hdr.cmsg_len as usize);
             }
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
@@ -729,6 +762,47 @@ mod tests {
         assert_eq!(checksum(&fixed), 0);
     }
 
+    /// A hop count is read whichever way the system reports it.
+    ///
+    /// The two systems disagree twice over: on what the ancillary data is
+    /// called, and on how wide it is. Only one of the two shapes can be
+    /// produced by the machine running the test, so both are built by hand.
+    #[cfg(unix)]
+    #[test]
+    fn a_hop_count_is_read_however_the_system_words_it() {
+        // Linux tags the IPv4 TTL IP_TTL and sends an int; macOS and the BSDs
+        // tag it IP_RECVTTL and send a byte; IPv6 is an int on both.
+        assert!(is_hop_cmsg(libc::IPPROTO_IP, libc::IP_TTL));
+        assert!(is_hop_cmsg(libc::IPPROTO_IP, libc::IP_RECVTTL));
+        assert!(is_hop_cmsg(libc::IPPROTO_IPV6, libc::IPV6_HOPLIMIT));
+        assert!(!is_hop_cmsg(libc::IPPROTO_IP, libc::IP_TOS));
+
+        // A cmsg built the way the kernel builds one, so the reading is
+        // tested against the real layout rather than against an assumption.
+        fn hop(payload: &[u8]) -> u8 {
+            unsafe {
+                let mut buf = [0u8; 64];
+                let cmsg = buf.as_mut_ptr() as *mut libc::cmsghdr;
+                let len = libc::CMSG_LEN(payload.len() as u32) as usize;
+                (*cmsg).cmsg_len = len as _;
+                (*cmsg).cmsg_level = libc::IPPROTO_IP;
+                (*cmsg).cmsg_type = libc::IP_TTL;
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    libc::CMSG_DATA(cmsg),
+                    payload.len(),
+                );
+                cmsg_hop(cmsg, len)
+            }
+        }
+
+        assert_eq!(hop(&[64u8]), 64, "the one-byte form");
+        assert_eq!(hop(&64i32.to_ne_bytes()), 64, "the int form");
+        // 255 is a real TTL and must survive the widening intact.
+        assert_eq!(hop(&255i32.to_ne_bytes()), 255);
+        assert_eq!(hop(&[]), 0, "nothing to read is no TTL, not a panic");
+    }
+
     /// The loopback answers its own pings, which exercises the socket, the
     /// reader task and the token matching together.
     #[test]
@@ -745,6 +819,10 @@ mod tests {
                 .expect("the loopback did not answer its own ping");
             assert_eq!(reply.kind, ReplyKind::Echo);
             assert_eq!(reply.from, "127.0.0.1".parse::<IpAddr>().unwrap());
+            // Unix reports the hop count as ancillary data. Windows has no
+            // equivalent for a socket the runtime did not create, so there the
+            // column is blank by design and there is nothing to assert.
+            #[cfg(unix)]
             assert!(reply.ttl > 0, "no TTL came back with the reply");
         });
     }
