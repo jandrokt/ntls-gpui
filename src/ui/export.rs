@@ -24,7 +24,14 @@ pub fn csv(columns: &[Column], rows: &[&Row], notes: &BTreeMap<String, String>) 
             .collect();
         cells.push(row.target.clone());
         cells.push(status_of(row.status).to_string());
-        cells.push(notes.get(&row.target).cloned().unwrap_or_default());
+        // The row's own note first: the workspace map is only what an older
+        // version of ntls left behind.
+        let note = row
+            .note
+            .clone()
+            .or_else(|| notes.get(&row.target).cloned())
+            .unwrap_or_default();
+        cells.push(note);
         write_line(&mut out, cells.iter().map(|c| field(c.as_str())));
     }
     out

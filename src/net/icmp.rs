@@ -75,6 +75,32 @@ impl std::fmt::Display for PingError {
 const MAGIC: [u8; 4] = *b"ntls";
 const PAYLOAD_HEADER: usize = 4 + 4 + 8; // magic + token + timestamp
 
+/// Whether this machine will let us speak ICMP at all.
+///
+/// Opening a socket is the only reliable way to ask, and unlike `Pinger` this
+/// needs no runtime, so the tests can decide whether there is anything to
+/// test before they build one.
+#[cfg(test)]
+pub fn available() -> bool {
+    Conn::open(false, None).is_ok()
+}
+
+/// What to do about a refused ICMP socket, on this system.
+///
+/// The advice differs enough between the three that one sentence for all of
+/// them would be wrong on two.
+fn permission_hint() -> &'static str {
+    if cfg!(windows) {
+        "run ntls as Administrator"
+    } else if cfg!(target_os = "linux") {
+        // The sysctl is the better answer of the two: it grants exactly this
+        // and nothing else, and it does not need the whole program to be root.
+        "sudo sysctl -w net.ipv4.ping_group_range=\"0 2147483647\", or run ntls with sudo"
+    } else {
+        "run ntls with sudo"
+    }
+}
+
 /// A second handle on the same socket for the reader to wait on.
 ///
 /// On Unix it is registered with the reactor, so the reader sleeps until the
@@ -252,7 +278,7 @@ impl Pinger {
 
         if v4.is_none() && v6.is_none() {
             let e = first_err.map(|e| e.to_string()).unwrap_or_else(|| "no family requested".into());
-            return Err(format!("cannot open an ICMP socket: {e} (try running with sudo)"));
+            return Err(format!("cannot open an ICMP socket: {e} (try: {})", permission_hint()));
         }
 
         let privileged = v4.as_ref().is_some_and(|c| c.raw) || v6.as_ref().is_some_and(|c| c.raw);

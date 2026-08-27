@@ -253,17 +253,14 @@ impl Workspace {
         self.vars.remove(name);
     }
 
-    /// The note attached to a result, if there is one.
+    /// A note an older version of ntls attached to a target.
+    ///
+    /// Notes belong to the row now, not to the workspace, since the same
+    /// address can be two different machines in two different runs. This still
+    /// answers so that notes written before that change are not lost; nothing
+    /// writes here any more.
     pub fn note(&self, target: &str) -> Option<&str> {
         self.notes.get(target).map(String::as_str).filter(|n| !n.is_empty())
-    }
-
-    pub fn set_note(&mut self, target: &str, note: &str) {
-        if note.trim().is_empty() {
-            self.notes.remove(target);
-        } else {
-            self.notes.insert(target.to_string(), note.trim().to_string());
-        }
     }
 
     /// What the tab is called.
@@ -682,15 +679,13 @@ mod tests {
     }
 
     #[test]
-    fn notes_are_kept_against_what_they_are_about() {
+    fn notes_written_by_an_older_version_are_still_readable() {
         let mut ws = workspace();
-        ws.set_note("192.168.1.1", "  the router  ");
+        ws.notes.insert("192.168.1.1".into(), "the router".into());
+        ws.notes.insert("192.168.1.2".into(), String::new());
         assert_eq!(ws.note("192.168.1.1"), Some("the router"));
-
-        // Clearing a note removes it rather than storing an empty one.
-        ws.set_note("192.168.1.1", "   ");
-        assert_eq!(ws.note("192.168.1.1"), None);
-        assert!(ws.record().notes.is_empty());
+        // An empty one is not a note.
+        assert_eq!(ws.note("192.168.1.2"), None);
     }
 
     #[test]

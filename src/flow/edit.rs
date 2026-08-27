@@ -34,10 +34,6 @@ impl Spot {
     pub fn block(&self) -> &[(usize, usize)] {
         &self.inside
     }
-
-    pub fn depth(&self) -> usize {
-        self.inside.len()
-    }
 }
 
 /// A step the editor can add.
@@ -110,8 +106,6 @@ pub enum Change {
     SetValueSummary(String),
     SetTimes(usize),
     SetWait(u32),
-    /// Set the whole condition, as typed.
-    SetCondition(String),
     /// Set one part of a condition that is being built rather than typed.
     SetSubject(String),
     SetField(String),
@@ -218,10 +212,6 @@ pub fn apply(steps: &mut Vec<Step>, spot: &Spot, change: &Change) -> Option<Spot
         }
         Change::ClearCondition => {
             set_condition(at_mut(steps, spot)?, String::new());
-            Some(spot.clone())
-        }
-        Change::SetCondition(text) => {
-            set_condition(at_mut(steps, spot)?, text.clone());
             Some(spot.clone())
         }
         Change::SetSubject(_)
@@ -696,8 +686,9 @@ mod tests {
     fn wrapping_makes_an_existing_step_conditional_without_rebuilding_it() {
         let mut steps = tree("run A");
         apply(&mut steps, &Spot::top(0), &Change::Wrap).unwrap();
-        apply(&mut steps, &Spot::top(0), &Change::SetCondition("up".into())).unwrap();
-        assert_eq!(shown(&steps), "if up {\n  run A\n}\n");
+        apply(&mut steps, &Spot::top(0), &Change::SetSubject("Sweep".into())).unwrap();
+        apply(&mut steps, &Spot::top(0), &Change::SetField("up".into())).unwrap();
+        assert_eq!(shown(&steps), "if Sweep.up {\n  run A\n}\n");
     }
 
     #[test]

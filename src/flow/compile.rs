@@ -73,12 +73,6 @@ impl Machine {
         Machine { program: compile(steps), pc: 0, counters: Vec::new(), done: false }
     }
 
-    /// How many operations it holds — nothing to do with how many steps were
-    /// written, and only interesting to a test.
-    pub fn length(&self) -> usize {
-        self.program.len()
-    }
-
     /// Works forward until something has to happen outside the machine.
     ///
     /// `truth` answers a condition. It may fail — a condition can name a run
@@ -152,10 +146,6 @@ impl Machine {
         if !ok {
             self.done = true;
         }
-    }
-
-    pub fn finished(&self) -> bool {
-        self.done
     }
 }
 
@@ -319,8 +309,8 @@ mod tests {
     fn a_repeat_costs_the_same_however_many_passes_it_asks_for() {
         // Unrolling would make a nested pair of hundred-pass loops ten
         // thousand operations long.
-        let few = Machine::new(&parse("repeat 2 {\n run A\n}").steps).length();
-        let many = Machine::new(&parse("repeat 100 {\n run A\n}").steps).length();
+        let few = Machine::new(&parse("repeat 2 {\n run A\n}").steps).program.len();
+        let many = Machine::new(&parse("repeat 100 {\n run A\n}").steps).program.len();
         assert_eq!(few, many);
     }
 
@@ -360,7 +350,7 @@ mod tests {
         assert!(matches!(machine.next(&mut |_| Ok(true)), Event::Run { .. }));
         machine.resume(false);
         assert_eq!(machine.next(&mut |_| Ok(true)), Event::Finished);
-        assert!(machine.finished());
+        assert!(machine.done);
     }
 
     #[test]

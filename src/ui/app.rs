@@ -2104,7 +2104,6 @@ impl App {
     pub fn choose(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
         match act {
-            Act::SelectWorkspace(i) => self.select_workspace(i, cx),
             Act::RenameWorkspace(i) => {
                 self.select_workspace(i, cx);
                 self.begin_workspace_rename(window, cx);

@@ -118,11 +118,6 @@ impl Flow {
         }
         count(&self.steps)
     }
-
-    /// What it is called: its first comment line.
-    pub fn title(&self) -> Option<&str> {
-        self.heading.first().map(String::as_str).filter(|t| !t.is_empty())
-    }
 }
 
 // --- reading -----------------------------------------------------------------
@@ -562,7 +557,7 @@ mod tests {
     #[test]
     fn the_heading_is_kept_and_names_the_workflow() {
         let flow = parse("# Nightly check\n# and why\n\nrun A");
-        assert_eq!(flow.title(), Some("Nightly check"));
+        // The first line names it; the rest is whatever else it wanted to say.
         assert_eq!(flow.heading, vec!["Nightly check", "and why"]);
         assert!(write(&flow).starts_with("# Nightly check\n# and why\n"));
     }

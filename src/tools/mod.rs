@@ -277,6 +277,19 @@ mod tests {
     /// ICMP engine round-trips a real packet.
     #[test]
     fn ping_reaches_the_loopback() {
+        // Whether ICMP can be spoken at all is the operating system's
+        // decision, not ours: Linux only allows it unprivileged when
+        // `net.ipv4.ping_group_range` covers this user's group, and Windows
+        // wants Administrator. Where it is refused there is nothing to test,
+        // so say so and stop rather than reporting a bug that is not there.
+        if !crate::net::icmp::available() {
+            eprintln!(
+                "skipped: this machine will not open an ICMP socket \
+                 (on Linux: sysctl -w net.ipv4.ping_group_range=\"0 2147483647\")"
+            );
+            return;
+        }
+
         let tool = super::ping::Ping;
         let mut params = Params::defaults(&crate::core::Tool::fields(&tool));
         params.set("target", "127.0.0.1");
@@ -298,8 +311,10 @@ mod tests {
         // the engine rather than a network condition.
         for r in &rows {
             assert_eq!(r.status, Status::Up, "the loopback did not answer: {:?}", r.cells);
-            // The TTL has a column of its own, and the loopback always
-            // reports one.
+            // The TTL has a column of its own, and the loopback reports one
+            // wherever the socket carries it. A Windows datagram socket does
+            // not, and the column is blank there by design.
+            #[cfg(unix)]
             assert!(
                 r.cells[3].parse::<u8>().is_ok_and(|t| t > 0),
                 "no TTL reported: {:?}",

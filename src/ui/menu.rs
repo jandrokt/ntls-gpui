@@ -16,7 +16,6 @@ use super::workspace::Group;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Act {
     // Workspaces.
-    SelectWorkspace(usize),
     RenameWorkspace(usize),
     TagWorkspace(usize, Tag),
     CloseWorkspace(usize),

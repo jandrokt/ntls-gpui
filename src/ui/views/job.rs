@@ -1015,10 +1015,11 @@ impl App {
         let from = job.tool.id();
         let row = job.selected_row()?;
         let (target, status) = (row.target.clone(), row.status);
+        let row_note = row.note.clone();
         if target.is_empty() {
             return None;
         }
-        let note = self.workspace().note(&target).map(str::to_string);
+        let note = row_note.or_else(|| self.workspace().note(&target).map(str::to_string));
 
         let destinations: Vec<AnyElement> = self
             .handoff_targets(from)
