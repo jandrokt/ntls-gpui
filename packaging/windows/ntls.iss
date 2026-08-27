@@ -1,8 +1,7 @@
-; The Windows installer, built with Inno Setup.
+; Inno Setup script for the Windows installer.
 ;
-; It installs one executable and its shortcuts. There is nothing else to
-; install: ntls keeps its workspaces in the user's Documents folder and writes
-; nothing to the registry beyond what an uninstaller needs.
+; One executable and its shortcuts. Workspaces live in Documents, and the only
+; registry keys are the ones an uninstaller needs.
 ;
 ;   iscc /DVersion=0.1.0 /DBinary=path\to\ntls.exe packaging\windows\ntls.iss
 
@@ -39,8 +38,7 @@ SetupIconFile=..\icon\ntls.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-; Installing for the user alone needs no administrator, which is the right
-; default for a program that does not install a service or a driver.
+; Per-user install, so no admin prompt. There's no service or driver here.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog commandline
 ArchitecturesAllowed={#Architectures}

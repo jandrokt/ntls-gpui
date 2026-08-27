@@ -1,88 +1,85 @@
 # ntls
 
-A desktop toolbox for the network questions you ask most often — is this host
-up, what else is on this network, what is it listening on, what does that
-endpoint answer — and a place to keep the answers.
+A desktop app for the network questions that come up over and over: is this
+host up, what else is on this subnet, what is it listening on, what does that
+endpoint actually return. Whatever it finds gets saved as a file in a directory
+you can open, and you can write notes and small automations on top of the
+results.
 
-![The ntls window: a workspace in the side bar, an IP scan and its results](docs/screenshot.png)
+![The ntls window, showing a subnet sweep and its results](docs/screenshot.png)
 
-Ten tools, one window. Everything a tool finds is a file on disk, several tools
-make a workspace, and a workspace can hold notes and workflows that read what
-the tools found. It runs on **macOS, Linux and Windows**, on Intel and ARM.
+Runs on macOS, Linux and Windows, on Intel and ARM. Written in Rust using
+[GPUI](https://gpui.rs).
 
-Built with [GPUI](https://gpui.rs), the GPU-accelerated UI framework behind Zed.
-
----
-
-## Contents
-
-- [The tools](#the-tools)
-- [Getting it](#getting-it)
-- [Basic usage](#basic-usage)
-- [Workspaces are directories](#workspaces-are-directories)
-- [Documents](#documents)
-- [Workflows](#workflows)
-- [Scripting: the expression language](#scripting-the-expression-language)
-- [Variables](#variables)
-- [Keyboard](#keyboard)
-- [What needs privileges, and where](#what-needs-privileges-and-where)
-- [Building](#building)
-- [Adding a tool](#adding-a-tool)
-
----
-
-## The tools
+## Tools
 
 | Tool | What it does |
 | --- | --- |
-| **Ping** | Probes one host continuously, with live loss, min/avg/max/mdev and a latency graph. |
-| **Traceroute** | Maps the routers between here and a host, probing hops in parallel so a full trace takes seconds. |
-| **IP scan** | Sweeps a subnet or range and lists the hosts that answer, with reverse DNS, MAC addresses and vendors. |
-| **Port scan** | Checks TCP, UDP or both, by list, range or all 65535, and reads service banners. |
-| **DNS lookup** | Resolves names and addresses against any server: A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, PTR. |
-| **HTTP request** | Sends a request and reports the status, timing, size and headers — once, or on an interval with a graph. |
-| **Subdomains** | Lists a domain's subdomains from certificate transparency logs, with search and sorting. |
-| **Internet speed** | Download, upload and latency against a public endpoint, or any URL you name. |
-| **LAN throughput** | Real speed between two machines running ntls, with the peer found by broadcast. |
-| **Download** | Paste one link or twenty and it works out what each is and fetches them, several at a time, resumable. |
+| Ping | Probes one host continuously. Live loss, min/avg/max/mdev, latency graph. |
+| Traceroute | Maps the routers to a host. Hops are probed in parallel, so a full trace takes seconds. |
+| IP scan | Sweeps a subnet or range, lists what answers, with reverse DNS, MAC and vendor. |
+| Port scan | TCP, UDP or both. A list, a range, or all 65535, with banner reading. |
+| DNS lookup | A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, PTR, against any server you like. |
+| HTTP request | Sends a request, checks the answer is what you expected, pulls a value out of it. |
+| Subdomains | Subdomains from certificate transparency logs, searchable and sortable. |
+| Internet speed | Download, upload and latency against a public endpoint or a URL you name. |
+| LAN throughput | Actual speed between two machines running ntls. The peer is found by broadcast. |
+| Download | Paste one link or twenty. It works out what each one is and fetches them, resumably. |
 
-Ping and IP scan work over **ICMP** or **ARP**. ICMP reaches anything routable;
-ARP only works on your own link but finds hosts that ignore pings, and is the
-only way to learn what a device actually is. ntls speaks both itself rather
-than shelling out, so a whole subnet sweep shares one socket.
+Ping and the IP scan can work over ICMP or ARP. ICMP reaches anything routable.
+ARP only works on your own link, but it finds devices that ignore pings, and
+it's the only way to get a real hardware address out of one. Both are spoken
+directly rather than by shelling out to `ping` or `arp`, so a /24 sweep runs on
+a single socket.
 
----
+### HTTP checks
 
-## Getting it
+The HTTP tool sends whatever you tell it to: any method, query parameters
+(escaped for you), headers, Basic or Bearer credentials, a body as text, JSON
+or form. It can go through a proxy, follow redirects or not, force HTTP/1.1,
+and skip certificate checking for the appliance in the rack with a self-signed
+cert.
 
-Every push builds all six targets, and a `v*` tag turns the same artifacts into
-a release:
+Two fields make it a check rather than just a request. **Expect** says what a
+good answer is: `any`, `2xx`, `404`, `200-204`, or a list. Anything else turns
+the row red and says what you asked for. **Capture** pulls one value out of
+every response into its own column, either a path into the JSON (`data.queue`,
+`items[0].id`), a header (`header:X-Request-Id`), the status, or the raw body.
 
-| System | What you get |
-| --- | --- |
-| **macOS** | `ntls.app` in a zip — one universal build for Intel and Apple silicon |
-| **Windows** | An installer, and a portable zip that is the `.exe` and nothing else — x64 and ARM64 |
-| **Linux** | A tarball with the binary, an icon and a `.desktop` file, plus an `install.sh` that puts them under `~/.local` |
+If what you capture is a number it gets graphed next to the response time, and
+it shows up in the run's summary, so `{{ "Status page".value.last() }}` works
+in a document. Set the request count to 60 with a one minute interval and
+you've got a monitor.
+
+## Installing
+
+CI builds every platform on every push, and tagging `v*` publishes a release
+with:
+
+- **macOS** `ntls.app` in a zip, one universal build for Intel and Apple
+  silicon.
+- **Windows** an installer, plus a portable zip that's just the `.exe`. x64 and
+  ARM64.
+- **Linux** a tarball with the binary, an icon, a `.desktop` file and an
+  `install.sh` that drops them under `~/.local`. x86-64 and aarch64.
 
 The macOS build is ad-hoc signed rather than notarised, so the first launch
-needs **right-click → Open**, or:
+needs a right-click, then Open. Or:
 
 ```
 xattr -dr com.apple.quarantine ntls.app
 ```
 
-Or build it yourself — see [Building](#building).
+Or build it yourself, see [Building](#building).
 
----
+## Using it
 
-## Basic usage
+A workspace is one investigation. It holds the tools you opened, what they
+found, and any notes or workflows you wrote about them. The tabs across the top
+switch between investigations rather than between tools.
 
-**A workspace is one investigation.** It holds the tools you opened, what they
-found, and any notes and workflows you wrote about them. The tab strip switches
-between investigations rather than between tools.
-
-**Add a tool.** `⌘K` (`Ctrl+K` off macOS) opens the command bar. Type a tool's
-name and press return for its form, or type the whole thing and skip the form:
+Press `⌘K` (`Ctrl+K` off macOS) for the command bar. Type a tool's name and hit
+return to get its form, or type the whole thing and skip the form entirely:
 
 ```
 ping 10.0.0.1
@@ -90,16 +87,16 @@ ping 10.0.0.1 count=10 interval=500ms
 ipscan 10.0.0.0/24 method=arp
 portscan 10.0.0.31 ports=top
 dns example.com type=MX
-http https://example.com/health count=5
+http https://example.com/health count=5 expect=2xx
 ```
 
-The first word picks the tool. Bare words fill the field the tool marks as its
-target; `key=value` fills any other field, by its key or by the label on
-screen. The bar shows what return will do before you press it, and `⇥` fills in
-whatever is highlighted.
+Bare words go into whatever the tool calls its target. `key=value` fills in
+anything else, matched against either the setting's key or its label. The bar
+shows you what return is about to do before you press it.
 
-`⇥` also expands shorthand in place, one step at a time, so you can see exactly
-what is about to happen:
+Tab is worth knowing about. It completes whatever is highlighted, and it also
+expands shorthand a step at a time so you can see and edit what you're about to
+run:
 
 ```
 auto  →  10.0.0.0/24  →  10.0.0.1-10.0.0.254
@@ -107,90 +104,75 @@ all   →  1-65535
 top   →  21-23,25,53,67-69,80,110,111,123,135,137-139,…
 ```
 
-**The same box searches everything open** — a tool by name, a workspace, a
-document by a line inside it, a workflow by a run it starts, an interface, and
-every row of every set of results. An address found last week is one query
-away, and choosing it opens the workspace, the tool and the row it is in.
+That same box searches everything you have open, not just the tool list:
+workspaces, open tools, documents by a line inside them, workflows by a run
+they start, network interfaces, and every row of every result table. An address
+you scanned last week is one query away, and picking it opens the workspace,
+the tool and the row.
 
-**Running.** `⌘R` runs, `⌘.` stops. A scan that is stopped keeps what it found
-and offers **Resume** (carry on, adding to the table) and **Restart** (throw it
-away and do the whole thing again). The IP scan and the DNS lookup also have a
-**Keep earlier results** switch: a run then adds to the table instead of
-replacing it, so a host that has gone quiet keeps its row and an address a
-different device has taken over gets a row of its own beside it.
+`⌘R` runs, `⌘.` stops. Stopping keeps what was found, and the buttons become
+Resume and Restart. The IP scan and DNS lookup also have a *Keep earlier
+results* switch: with it on, a new run adds to the table instead of replacing
+it, so a host that's gone quiet keeps its row, and an address that a different
+device has taken over gets a second row next to the first.
 
-**Reading results.** Click a heading to sort, drag its edge to resize, `⌘F` to
-filter. Every row has a **NOTE** you can type into, and notes belong to the
-workspace rather than to the run — a remark made while reading a sweep is still
-there in the port scan that follows it. Selecting a row reveals a **Send** bar:
-pick a host out of a sweep and one click lands it in the port scanner, port and
-all.
+Click a column heading to sort, drag its edge to resize, `⌘F` to filter. Every
+row has a NOTE you can type into. Notes are attached to the workspace rather
+than to the run, so something you jotted down while reading a sweep is still
+there in the port scan you do next. Select a row and a Send bar appears: pick a
+host out of a sweep, one click, and it's in the port scanner with the port
+filled in.
 
-**Comparing.** *Compare with…* in a run's menu reads it against another run of
-the same tool: what appeared, what went, and what changed, with the previous
-value struck through beside the current one.
+There's also *Compare with…* in a run's menu, which diffs it against another
+run of the same tool (appeared, went, changed), and *Export as CSV…*, which
+writes out exactly what's on screen, filter and sort order included.
 
-**Exporting.** *Export as CSV…* writes what is on screen — the tool's columns,
-the rows in the order they are sorted and filtered into, and the notes.
+Right-click things. Workspaces, tools, documents, workflows, group headings,
+result rows, interfaces, the background. The menu is about whatever is under
+the pointer.
 
-**Right-click anything.** A workspace, a tool, a document, a workflow, a group
-heading, a result row, an interface, the background. The menu is about what is
-under the pointer: run it, rename it, colour it, star it, reveal it, copy it,
-send it somewhere, delete it.
+## Files on disk
 
----
-
-## Workspaces are directories
-
-A workspace is a directory, and everything in it is a file:
+A workspace is a directory. Everything in it is a file:
 
 ```
 ~/Documents/ntls/
   office-lan/
-    workspace.json      the name, the colour, the notes, the variables
-    001-ipscan.json     one tool: its settings, and its results
+    workspace.json      name, colour, notes, variables
+    001-ipscan.json     one tool: its settings and its results
     002-portscan.json
     report.md           a document
     nightly.flow        a workflow
-    perimeter/          a folder, holding more of the same
+    perimeter/          a folder with more of the same
       003-dns.json
 ```
 
-Everything is written as it changes and read back at startup, so results from
-last week are still there — rows, log, charts and all. You can open the
-directory in your file manager, copy one somewhere, or delete it by hand.
+Writes happen as things change and everything is read back at startup, so last
+week's results are still there, rows and log and charts included. Copy a
+workspace somewhere, delete one by hand, whatever you like.
 
-The side bar lists **folders first**, then what is loose in the workspace,
-grouped by the stage each tool is at — *Not run*, *Running*, *Results* — with
-the documents and workflows under them. Every heading can be emptied, and
-emptying one empties the heading you clicked rather than every heading of that
-name.
+The side bar lists folders first, then whatever is loose in the workspace,
+grouped by where each tool has got to (Not run, Running, Results) with the
+documents and workflows below. Any heading can be emptied, and it empties the
+one you clicked rather than every heading with that name.
 
-The **page button** at the top of that side bar switches it to a **file view**:
-the same workspace, listed the way the filesystem holds it — every file, its
-real name and size, the folders they sit in, and `.closed` where anything
-removed went. Clicking a file shows what it is; a file the workspace does not
-hold is handed to your file manager.
-
-Nothing is destroyed by a click: removing a tool, a document or a workflow
-moves its file into the workspace's own `.closed` folder. Deleting a whole
-workspace is the one action that destroys anything, and it asks first.
-
----
+The page button at the top of that side bar flips it into a file view: the same
+workspace listed the way the filesystem has it, with real names and sizes,
+folders, and `.closed`, which is where anything you remove ends up. Nothing
+here is deleted by a single click. Clicking a file opens whatever it is, and
+files ntls doesn't recognise get handed to your file manager.
 
 ## Documents
 
-**New document** writes an empty `.md` file beside the tools and opens it here,
-split: the source on one side, what it comes to on the other, updating as you
-type.
+*New document* makes an empty `.md` file next to the tools and opens it split:
+source on one side, rendered on the other, updating as you type.
 
-What makes a document more than a text file is that anything between double
-braces is an expression, worked out against the tools in the same workspace
-every time the document is shown.
+The useful part is that anything in double braces is an expression, evaluated
+against the tools in the same workspace every time the document is displayed.
 
-![A document, its expressions worked out against the runs beside it](docs/document.png)
+![A document with its expressions filled in from the runs beside it](docs/document.png)
 
-The document above is written like this:
+That one is written like this:
 
 ```markdown
 # Office LAN, {{ subnet }}
@@ -204,57 +186,53 @@ averaging **{{ fixed(Uplink.rtt.avg(), 2) }} ms**.
 - Open ports on the NAS: {{ "Ports on the NAS".rows }}
 - Health endpoint: {{ fixed("Status page".time.avg(), 1) }} ms average
 
-> Verdict: {{ if Uplink.rtt.avg() < 5 then "healthy" else "the gateway is slow" }}.
+> Verdict: {{ if Uplink.rtt.avg() < 5 then "healthy" else "gateway is slow" }}.
 ```
 
-A tool that has not run yet is *nothing* rather than an error, so a document
-written before the scan still renders. An expression that is actually wrong is
-left where it was written, in red, saying why.
+A tool that hasn't run yet evaluates to nothing rather than an error, so you
+can write the document before the scan. An expression that's genuinely wrong is
+left in place, in red, with the reason.
 
-The editor colours what you are writing and **completes what it knows**: the
-runs in the workspace, the variables, the columns and summary figures of
-whichever run you named before the dot, the fields every run has, and the
-functions of the expression language. `⇥` takes the highlighted suggestion,
-`↑↓` walks them, `esc` dismisses.
+The editor highlights as you type and completes what it knows about: runs in
+this workspace, variables, the columns and summary figures of whatever run you
+named before the dot, and the language's functions. Tab accepts, arrows walk
+the list, escape dismisses.
 
-*Open in another editor…* hands the file to whatever else you write markdown
-with. Nothing else does that unasked.
-
----
+*Open in another editor…* hands the file to whatever you normally write
+markdown in. That's the only thing that does.
 
 ## Workflows
 
-A question about a network is rarely one tool, and rarely the same tools every
-time — you sweep, and *then* scan the ports of whatever answered, or give up if
-nothing did. A workflow writes that down, and you build it with the mouse.
+Most network questions take more than one tool, and not always the same ones.
+You sweep, and then port scan whatever answered, or give up if nothing did. A
+workflow writes that down, and you build it by clicking.
 
-![The workflow editor: steps, conditions and a variable being set](docs/workflow.png)
+![The workflow editor with steps, a condition and a variable being set](docs/workflow.png)
 
-- **Add step** offers the six kinds there are, and every block ends in a faint
-  `+ step` that puts one inside a branch or a repeat.
-- **Click a step** and its controls appear on its own line: which run a `run`
-  starts, how many passes a `repeat` makes, how long a `wait` waits, what a
-  `set` works out and what it keeps it under.
-- **The condition is chosen, not typed.** *only if* opens four controls — which
-  run, which of its figures, how to compare, and what to compare with — and
-  each offers what actually exists: the runs in this workspace, then that run's
-  own columns and the figures it reported.
-- `⌃`/`⌄` move a step among its neighbours, `+` opens the rest of what can be
-  done to it, `×` removes it. Clicking past the steps, or `⏎`, or `esc`, puts
-  the controls away.
-- Each kind of step has a colour — blue does the work, amber decides, green
-  goes round again, grey waits, red ends it.
+*Add step* offers the six kinds. Every block ends in a faint `+ step` for
+putting one inside a branch or a repeat. Click a step and its controls appear
+on its line: which run a `run` starts, how many passes a `repeat` does, how
+long a `wait` waits.
 
-Underneath, a workflow is a text file, and the two are the same thing: **Text**
-shows the source and edits it directly, changes made there appear in the
-controls as you type, and changes made with the controls appear in the text.
+Conditions are picked, not typed. *only if* opens four controls (which run,
+which of its figures, how to compare, what to compare against) and each one
+only offers what actually exists. `⌃`/`⌄` move a step among its neighbours, `+`
+opens everything else you can do to it, `×` deletes it. Click empty space, or
+press return or escape, to put the controls away.
+
+Steps are colour-coded: blue does work, amber decides, green loops, grey waits,
+red stops.
+
+The file underneath is text, and the two stay in sync. *Text* shows the source
+and lets you edit it directly, edits there show up in the controls as you type,
+and edits with the controls show up in the text.
 
 ```text
 # Nightly check
 
 run "Sweep"
 set hosts_up = Sweep.up
-if Sweep.up > 0 {
+if hosts_up > 0 {
   run "Ports on the NAS"
   wait 30s
   run "Status page"
@@ -264,51 +242,45 @@ if Sweep.up > 0 {
 stop if Sweep.down > 20
 ```
 
-| Step | What it does |
+| Step | Does |
 | --- | --- |
-| `run "Name"` | Starts a run in this workspace by name and waits for it to finish. |
-| `if … { } else { }` | Takes one branch or the other. |
-| `repeat 3 { }` | Does the same thing a fixed number of times. |
-| `wait 30s` | Pauses. |
-| `set name = expression` | Works something out and keeps it under a name. |
-| `stop` | Ends the workflow. |
+| `run "Name"` | Starts a run in this workspace and waits for it |
+| `if … { } else { }` | Branches |
+| `repeat 3 { }` | Repeats a fixed number of times |
+| `wait 30s` | Pauses |
+| `set name = expression` | Works something out and keeps it |
+| `stop` | Ends the workflow |
 
-`run` and `stop` can carry an `if` of their own. Every condition is worked out
-**when the step is reached**, not when the workflow starts — which is the whole
-point: a step sees what the steps before it found. A step whose condition is
-false is skipped and says so; a run that fails stops the workflow, because
-carrying on would be acting on results that are not there.
+`run` and `stop` can carry their own `if`. Conditions are evaluated when the
+step is reached, not when the workflow starts, which is the entire point: a
+step gets to see what the steps before it found. A step whose condition is
+false is skipped and says so. A run that fails stops the workflow, since
+carrying on would mean acting on results that don't exist.
 
----
+## Expressions
 
-## Scripting: the expression language
+The same small language works inside `{{ }}` in a document, in a workflow's
+conditions, and on the right hand side of `set`.
 
-The same language runs inside `{{ }}` in a document, in a workflow's
-conditions, and on the right of a workflow's `set`.
-
-**Naming a run.** By the name you gave it, or by its tool:
+Name a run by whatever you called it, or by its tool:
 
 ```
 Sweep.up          the run called Sweep
-ipscan.rows       the one IP scan in this workspace
-"Port scan".open  a name with a space in it goes in quotes
-tool("Port scan") the same thing, written the long way
+ipscan.rows       the only IP scan in this workspace
+"Port scan".open  quotes, if the name has a space in it
+tool("Port scan") same thing, spelled out
 ```
 
-**What a run answers to:**
+Every run answers to `rows`, `up`, `down`, `warn`, `target`, `state`, `ok`,
+`elapsed` and `name`. It also answers to any of its columns by name
+(`Sweep.rtt`, `Sweep.vendor`), which gives you a list with one entry per row,
+and to any figure from its summary (`Uplink.loss`, `Sweep.scanned`).
 
-| | |
-| --- | --- |
-| `rows` `up` `down` `warn` | how many results, and how they went |
-| `target` `state` `ok` `elapsed` `name` | what it was pointed at, where it got to, how long it took |
-| any column, by name | `Sweep.rtt`, `Sweep.host`, `Sweep.vendor` — a list, one entry per row |
-| any figure from its summary | `Uplink.loss`, `Sweep.scanned` — whatever the tool reported |
+Columns are text with units in them. The arithmetic reads the number out, so
+`Sweep.rtt.avg()` averages `"12.4 ms"` and skips rows that never answered.
 
-Columns are text with units, and the arithmetic reads the figure out of them,
-so `Sweep.rtt.avg()` averages `"12.4 ms"` and skips the rows that got no reply.
-
-**Functions.** A method is the same thing written the other way round, so
-`avg(Sweep.rtt)` and `Sweep.rtt.avg()` are one expression:
+Functions, which you can also write as methods (`avg(x)` and `x.avg()` are the
+same thing):
 
 ```
 avg  min  max  sum  count  median  p95  percentile
@@ -317,40 +289,26 @@ first  last  join  text  upper  lower  number
 exists  tool  tools
 ```
 
-There is `if … then … else …`, the usual arithmetic and comparisons, and
-`&&` `||` `!` (or `not`). There are no loops, no definitions and no side
-effects: an expression reads what was found and says what it means.
+Plus `if … then … else …`, the usual arithmetic and comparisons, and `&&`,
+`||`, `!` (or `not`). No loops, no definitions, no side effects.
 
 ```
 {{ if Sweep.up == 0 then "nothing answered" else Sweep.up + " hosts" }}
 {{ fixed(percent(Sweep.up / Sweep.rows), 1) }}
 {{ Sweep.host.join(", ") }}
-{{ exists(tool("Nightly sweep")) }}
 ```
-
----
 
 ## Variables
 
-A variable is a named value belonging to the workspace rather than to any run
-in it. Every document, condition and workflow in the workspace reads it by
-name, and there are two kinds:
+Variables belong to the workspace rather than to any run in it, and everything
+in the workspace can read them by name. They come in two flavours: plain text,
+and formulas. A formula holds an expression that gets evaluated every time it's
+read, so `gateway = Sweep.host.first()` follows the sweep, while the same thing
+stored as text is whatever the sweep said on the day you wrote it down.
 
-| Kind | What it holds | When it changes |
-| --- | --- | --- |
-| **Text** | what you typed, or what a workflow kept | when something writes it |
-| **Formula** | an expression | never: it is worked out afresh every time it is read |
-
-The difference is the difference between a fact somebody wrote down and one
-that stays current. `subnet = 10.0.0.0/24` is text. `gateway =
-Sweep.host.first()` as a formula follows the sweep; as text it is whatever the
-sweep said the day it was written.
-
-### The editor
-
-The **Variables** section of the side bar is where they live. Each row shows
-the name, **what it comes to now** — a formula shows its answer, with the
-expression underneath — and a line saying where the value came from and who
+The Variables section in the side bar is where they live. Each row shows the
+name, what it currently comes to (a formula shows its answer with the
+expression underneath), and a line about where the value came from and what
 reads it:
 
 ```
@@ -365,20 +323,20 @@ subnet      10.0.0.0/24                    =  ×
             the network this workspace is about
 ```
 
-Click the name to rename it, the value to retype it, the bottom line to say
-what it is for, and `=` to switch between text and formula — the same text is
-kept either way, so an expression you typed as text starts working the moment
-you press it. A formula that cannot be worked out says why, in red, where its
-answer would be. One that names itself, directly or through another, answers
-with nothing rather than going round for ever.
+Click the name to rename, the value to retype it, the bottom line to write a
+note about what it's for, and `=` to switch between text and formula. The text
+is kept either way, so an expression you typed as text starts working the
+moment you flip it. A formula that can't be evaluated shows the reason in red
+where its answer would go. One that refers to itself, directly or in a circle,
+comes back empty rather than hanging.
 
-*Read by* is counted from the documents, workflows and other formulas that
-actually name it, so a variable nothing reads says so.
+"Read by" is worked out from the documents, workflows and other formulas that
+actually mention the name, so a variable nothing uses says so.
 
-### Workflows set them
+### Workflows write them
 
-A `set` step works an expression out **when the step is reached**, against
-everything found so far, and keeps the answer:
+A `set` step evaluates an expression when the step is reached and keeps the
+answer:
 
 ```text
 run "Sweep"
@@ -386,58 +344,59 @@ set hosts_up = Sweep.up
 run "Ports on the NAS" if hosts_up > 0
 ```
 
-While you build it, the step shows what it would keep — `set hosts_up =
-Sweep.up → 10` — and the name is chosen from the variables the workspace
-already has. When it runs, the trail against that step says what it set, and
-the variable remembers which workflow wrote it and when.
+You don't have to type any of that. The name comes from the variables you
+already have, and the value is picked the same way a condition is: which run,
+which figure, and how to reduce a column of many rows to one value (`as it is`,
+`avg`, `max`, `count`, `first`, and so on). The step shows what it would keep
+while you're building it:
 
-A condition can be about a variable as easily as about a run: choosing a
-variable as the subject drops the "which figure" control, because a variable is
-a value already — `if [hosts_up] [is more than] [0]`.
+```
+Set [hosts_up] = [Sweep] [up] [as it is]  → 10
+```
 
-A run and a variable can share a name; the run wins, so a document that names
-one means the run.
+Anything too involved for those controls you type instead, and it's marked *as
+written*. When the workflow runs, the trail against that step says what it set,
+and the variable remembers which workflow wrote it and when.
 
----
+Conditions can be about a variable as easily as about a run. Pick a variable as
+the subject and the "which figure" control disappears, because a variable is
+already a value: `if [hosts_up] [is more than] [0]`.
+
+If a run and a variable share a name, the run wins.
 
 ## Keyboard
 
-Shortcuts are written here the way macOS writes them; on Windows and Linux
-every ⌘ is **Ctrl**.
+Written the macOS way. On Windows and Linux every ⌘ is Ctrl.
 
 | Where | Keys |
 | --- | --- |
-| Adding | `⌘K` the command bar · `⌘1`–`⌘9` add that tool straight away |
-| Workspaces | `⌘T` new · `⌘⇧W` close · `⌘⇧[` / `⌘⇧]` previous/next |
-| Tools | `⌘[` / `⌘]` previous/next · `⌘W` close the tab (the tool stays) |
-| A run | `⌘R` run · `⌘.` stop · `⌘E` settings · `⌘I` rename · `⌘G` enlarge the graph |
-| Layout | `⌘B` side bar · `⌘J` output panel · `⇧⌘O` workspaces · `⇧⌘E` tools |
-| Results | `↑↓` select · `pgup`/`pgdn` page · `⌘↑`/`⌘↓` first/last · `⌘F` filter · `⌘⇧N` note · `⏎` send the selection onward |
-| Anywhere | `⌘D` light/dark · `esc` back out · `⌘Q` quit |
+| Adding | `⌘K` command bar, `⌘1`–`⌘9` add that tool directly |
+| Workspaces | `⌘T` new, `⌘⇧W` close, `⌘⇧[` / `⌘⇧]` previous/next |
+| Tools | `⌘[` / `⌘]` previous/next, `⌘W` close the tab (tool stays) |
+| A run | `⌘R` run, `⌘.` stop, `⌘E` settings, `⌘I` rename, `⌘G` big graph |
+| Layout | `⌘B` side bar, `⌘J` output panel, `⇧⌘O` workspaces, `⇧⌘E` tools |
+| Results | `↑↓` select, `pgup`/`pgdn` page, `⌘↑`/`⌘↓` first/last, `⌘F` filter, `⌘⇧N` note, `⏎` send onward |
+| Anywhere | `⌘D` light/dark, `esc` back out, `⌘Q` quit |
 
----
+## Permissions
 
-## What needs privileges, and where
-
-Everything works everywhere except where the operating system reserves it:
+Most of it needs nothing special. The exceptions are where the OS says so:
 
 | | macOS | Linux | Windows |
 | --- | --- | --- | --- |
-| **ICMP** ping, traceroute, ICMP sweep | unprivileged | unprivileged where `net.ipv4.ping_group_range` allows it, otherwise root | needs **Administrator**: Windows has no unprivileged ICMP socket |
-| **TTL** column | yes | yes | blank — a Windows datagram socket does not carry it |
-| **ARP** sweep, hardware addresses | real ARP over BPF with ChmodBPF, otherwise the neighbour table | the neighbour table from `/proc/net/arp` | the neighbour table from `arp -a` |
-| Port scan, DNS, HTTP, subdomains, speed tests, downloads | yes | yes | yes |
+| ICMP (ping, traceroute, ICMP sweep) | works unprivileged | unprivileged if `net.ipv4.ping_group_range` allows it, otherwise root | needs Administrator, Windows has no unprivileged ICMP socket |
+| TTL column | yes | yes | blank, a Windows datagram socket doesn't carry it |
+| ARP sweep and hardware addresses | real ARP over BPF with ChmodBPF installed, otherwise the neighbour table | neighbour table from `/proc/net/arp` | neighbour table from `arp -a` |
+| Everything else | yes | yes | yes |
 
-Hardware addresses are resolved against the IEEE registries — about 54,000
-prefixes, compiled into the binary — so lookups are instant, work offline, and
-never tell anyone what you are scanning. Addresses a device made up for itself
-are reported as `randomised` rather than guessed at.
+MAC vendors are looked up in the IEEE registries, all ~54,000 prefixes compiled
+into the binary, so it's instant, works offline, and doesn't tell anyone what
+you're scanning. Addresses a device made up for itself are reported as
+`randomised` rather than guessed at.
 
-The **Download** tool uses [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and
-[`gallery-dl`](https://github.com/mikf/gallery-dl) if they are on your `PATH`,
-and says so in the log if they are not. Neither is required or bundled.
-
----
+The download tool will use [yt-dlp](https://github.com/yt-dlp/yt-dlp) and
+[gallery-dl](https://github.com/mikf/gallery-dl) if they're on your `PATH`, and
+mentions it in the log if they aren't. Neither is bundled or required.
 
 ## Building
 
@@ -446,14 +405,14 @@ cargo build --release
 cargo test
 ```
 
-Rust 1.85 or newer. On macOS, the Metal toolchain GPUI compiles its shaders
-with:
+Rust 1.85 or newer. On macOS you'll want the Metal toolchain GPUI compiles
+shaders with:
 
 ```
 xcodebuild -downloadComponent MetalToolchain
 ```
 
-On Debian and Ubuntu, what GPUI links against:
+On Debian and Ubuntu, the libraries GPUI links against:
 
 ```
 sudo apt install libasound2-dev libfontconfig-dev libwayland-dev \
@@ -461,28 +420,24 @@ sudo apt install libasound2-dev libfontconfig-dev libwayland-dev \
     libssl-dev libzstd-dev libvulkan-dev make cmake clang
 ```
 
-On Windows, the MSVC toolchain — nothing else.
+On Windows, just the MSVC toolchain.
 
-The tests are hermetic: they exercise target and port parsing, the certificate
-transparency aggregation, the embedded vendor database, the tool contract, the
-expression language, the workflow reader, writer and machine, and a real port
-scan and ping against the loopback interface. Nothing in them touches the
-network beyond this machine.
+The tests don't touch the network beyond this machine. They cover target and
+port parsing, the certificate transparency aggregation, the vendor database,
+the tool contract, the expression language, the workflow reader, writer and
+machine, and a real port scan and ping against loopback.
 
-**Packaging.** `packaging/icon/make-icons.py` draws the application icon and
-writes every form the three systems want from one drawing;
-`packaging/macos/bundle.sh` puts a built binary in a `.app`;
-`packaging/windows/ntls.iss` is the Inno Setup script;
-`packaging/linux/` holds the `.desktop` file and the tarball's installer.
-`.github/workflows/build.yml` runs all of it.
-
----
+Packaging lives in `packaging/`: `icon/make-icons.py` draws the icon and writes
+out every format the three platforms want, `macos/bundle.sh` wraps a binary in
+a `.app`, `windows/ntls.iss` is the Inno Setup script, and `linux/` has the
+`.desktop` file and the tarball's installer. `.github/workflows/build.yml`
+drives all of it.
 
 ## Adding a tool
 
-The interface knows nothing about pinging or port scanning. It renders a form
-from whatever fields a tool declares and a table from whatever columns it
-declares, so a new tool is one file and one line.
+The UI doesn't know what pinging or port scanning is. It builds a form out of
+whatever fields a tool declares and a table out of whatever columns it
+declares, so a new tool is one file plus one line in the registry.
 
 ```rust
 pub trait Tool: Send + Sync + 'static {
@@ -496,15 +451,12 @@ pub trait Tool: Send + Sync + 'static {
 }
 ```
 
-A run emits events — a row, a log line, a summary figure, a progress update, a
-numeric sample — and the interface turns those into a table, an output panel, a
-stat bar, a progress bar and a live graph without being told to. Implement the
-trait in `src/tools/`, add one line to `register`, and the picker, the command
-bar, the form, validation, hand-offs, saving, resuming, the CSV export and the
-expression language all follow.
-
----
+A run emits events (a row, a log line, a summary figure, progress, a numeric
+sample) and the UI turns those into a table, an output panel, a stat bar, a
+progress bar and a live graph on its own. Write the impl in `src/tools/`, add a
+line to `register`, and the picker, command bar, form, validation, hand-offs,
+saving, resuming, CSV export and expression language all come with it.
 
 ## Licence
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0, see [LICENSE](LICENSE).

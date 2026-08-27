@@ -17,7 +17,7 @@ use gpui::{
     px,
 };
 
-use crate::flow::edit::{Change, Guide, Spot, Test, condition_of, takes_a_condition};
+use crate::flow::edit::{Change, Guide, Recipe, Spot, Test, condition_of, takes_a_condition};
 use crate::flow::{Step, seconds_text};
 use crate::ui::app::App;
 use crate::ui::flows::Outcome;
@@ -612,7 +612,7 @@ fn open_step(
                 cx,
             ));
         }
-        Step::Set { .. } => {
+        Step::Set { value, .. } => {
             // Every variable the workspace already has, so a step that keeps
             // something is usually one click and no typing.
             let known: Vec<Item> = vars
@@ -632,7 +632,25 @@ fn open_step(
                     d.child(pick("step-var-name", known, theme, cx))
                 })
                 .child(div().text_meta().text_color(theme.faint).child("="))
-                .child(boxed(value_input.clone(), px(200.), theme))
+                // What it keeps is chosen the way a condition is: which run,
+                // which of its figures, and how a column of many rows becomes
+                // one value. An expression the controls cannot describe is
+                // typed instead, and says so.
+                .children(match Recipe::read(value) {
+                    Some(recipe) => {
+                        value_controls(flow, spot, &recipe, tables, vars, theme, cx)
+                    }
+                    None => vec![
+                        boxed(value_input.clone(), px(220.), theme).into_any_element(),
+                        pill("as written", theme.dim, theme.track).into_any_element(),
+                        small_icon("step-value-clear", "close", theme, cx, {
+                            let at = spot.clone();
+                            move |app, _, cx| {
+                                app.change_step(flow, &at, &Change::SetVarValue(String::new()), cx)
+                            }
+                        }),
+                    ],
+                })
                 // What the expression comes to right now, which is what the
                 // step would keep if it ran this second.
                 .children(preview.map(|answer| match answer {
@@ -1025,6 +1043,135 @@ fn small_icon(
         .child(icon(name, px(13.), dim))
         .on_click(cx.listener(move |app, e: &ClickEvent, _, cx| click(app, e, cx)))
         .into_any_element()
+}
+
+/// The controls that build what a `set` step keeps.
+///
+/// The same three questions the condition controls ask, minus the comparison:
+/// which run or variable, which of its figures, and — because a column is a
+/// list — how to make one value out of it.
+#[allow(clippy::too_many_arguments)]
+fn value_controls(
+    flow: usize,
+    spot: &Spot,
+    recipe: &Recipe,
+    tables: &[crate::expr::Table],
+    vars: &[String],
+    theme: &Theme,
+    cx: &mut Context<App>,
+) -> Vec<AnyElement> {
+    let mut subjects: Vec<Item> = Vec::new();
+    if !tables.is_empty() {
+        subjects.push(Item::Heading("Runs".into()));
+        for table in tables {
+            subjects.push(Item::choice(
+                table.name.clone(),
+                "play",
+                Act::ChangeStep(flow, spot.clone(), Change::SetValueSubject(table.name.clone())),
+            ));
+        }
+    }
+    if !vars.is_empty() {
+        subjects.push(Item::Heading("Variables".into()));
+        for name in vars {
+            subjects.push(Item::choice(
+                name.clone(),
+                "gear",
+                Act::ChangeStep(flow, spot.clone(), Change::SetValueSubject(name.clone())),
+            ));
+        }
+    }
+
+    let mut out = vec![chooser(
+        "step-value-subject",
+        if recipe.subject.is_empty() { "choose\u{2026}".into() } else { recipe.subject.clone() },
+        recipe.subject.is_empty(),
+        subjects,
+        theme,
+        cx,
+    )];
+    if recipe.subject.is_empty() {
+        return out;
+    }
+
+    // A variable is a value already; only a run has figures to pick from.
+    let subject = tables
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(&recipe.subject))
+        .or_else(|| tables.iter().find(|t| t.tool.eq_ignore_ascii_case(&recipe.subject)));
+    let Some(table) = subject else { return out };
+
+    let mut fields: Vec<Item> = vec![Item::Heading("Every run".into())];
+    for (name, _) in crate::ui::complete::FIELDS {
+        fields.push(Item::plain(
+            name,
+            Act::ChangeStep(flow, spot.clone(), Change::SetValueField(name.into())),
+        ));
+    }
+    let columns: Vec<&String> = table
+        .columns
+        .iter()
+        .filter(|c| c.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .collect();
+    if !columns.is_empty() {
+        fields.push(Item::Separator);
+        fields.push(Item::Heading("Its columns".into()));
+        for column in columns {
+            let name = column.to_lowercase();
+            fields.push(Item::plain(
+                name.clone(),
+                Act::ChangeStep(flow, spot.clone(), Change::SetValueField(name)),
+            ));
+        }
+    }
+    if !table.stats.is_empty() {
+        fields.push(Item::Separator);
+        fields.push(Item::Heading("What it reported".into()));
+        for (key, value) in &table.stats {
+            fields.push(Item::plain(
+                format!("{key} \u{b7} {value}"),
+                Act::ChangeStep(flow, spot.clone(), Change::SetValueField(key.clone())),
+            ));
+        }
+    }
+
+    out.push(chooser(
+        "step-value-field",
+        if recipe.field.is_empty() { "what\u{2026}".into() } else { recipe.field.clone() },
+        recipe.field.is_empty(),
+        fields,
+        theme,
+        cx,
+    ));
+    if recipe.field.is_empty() {
+        return out;
+    }
+
+    // Only a column is a list, and only a list needs summarising — but the
+    // control is harmless where it is not needed and unmissable where it is.
+    let summaries: Vec<Item> = crate::flow::edit::SUMMARIES
+        .iter()
+        .map(|(name, about)| {
+            let label = if name.is_empty() { "as it is".to_string() } else { format!("{name} \u{b7} {about}") };
+            Item::plain(
+                label,
+                Act::ChangeStep(
+                    flow,
+                    spot.clone(),
+                    Change::SetValueSummary((*name).to_string()),
+                ),
+            )
+        })
+        .collect();
+    out.push(chooser(
+        "step-value-summary",
+        if recipe.summary.is_empty() { "as it is".into() } else { recipe.summary.clone() },
+        recipe.summary.is_empty(),
+        summaries,
+        theme,
+        cx,
+    ));
+    out
 }
 
 /// A control that only offers: no value of its own, just the arrow.

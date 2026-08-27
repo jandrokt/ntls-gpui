@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# Assembles ntls.app around a binary that is already built.
-#
-# A .app is a directory with a fixed shape and a plist saying what is inside
-# it, so this is a copy and a heredoc rather than a tool with opinions.
+# Wraps an already-built binary in ntls.app.
 #
 #   packaging/macos/bundle.sh <binary> <output-dir> [version]
 #
@@ -58,9 +55,8 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# An unsigned bundle is refused by Gatekeeper on another machine; an ad-hoc
-# signature is enough for it to run once the quarantine flag is cleared, and
-# costs nothing when a real identity is not available.
+# Ad-hoc signature. Enough to run once quarantine is cleared, and free when
+# there's no real signing identity around.
 if command -v codesign >/dev/null 2>&1; then
     codesign --force --deep --sign - "$app" >/dev/null 2>&1 || \
         echo "note: could not ad-hoc sign the bundle" >&2

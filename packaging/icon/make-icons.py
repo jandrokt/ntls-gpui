@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Draws the ntls application icon and writes every form the systems want.
+"""Draws the ntls icon and writes out the formats the three platforms want.
 
-One drawing, scaled: the sonar arcs the Ping tool is drawn with, on the same
-blue the interface uses for anything that is running. It is drawn rather than
-traced from an SVG so that a check-out needs nothing installed to rebuild it —
-Pillow and the standard library are the whole of it.
+The mark is the sonar shape from the Ping tool, on the interface's blue. It's
+drawn in code rather than traced from an SVG so that rebuilding it only needs
+Pillow.
 
     python3 packaging/icon/make-icons.py
 
-Writes packaging/icon/png/*.png, ntls.ico, ntls.iconset/ and, where `iconutil`
-exists, ntls.icns.
+Writes png/*.png, ntls.ico, ntls.iconset/ and (on a Mac) ntls.icns.
 """
 
 import math
@@ -23,14 +21,13 @@ from PIL import Image, ImageDraw
 
 HERE = Path(__file__).resolve().parent
 
-# The interface's own accent, and a slightly deeper shade under it so the tile
-# has somewhere to sit at small sizes.
+# The interface accent, with a deeper shade under it so the tile still reads
+# at 16px.
 TOP = (94, 162, 255, 255)
 BOTTOM = (11, 107, 203, 255)
 MARK = (255, 255, 255, 255)
 
-# Drawn eight times the largest size it is shown at and scaled down, which is
-# what keeps the arcs smooth at 16 pixels.
+# Drawn big and scaled down, which is what keeps the arcs smooth when small.
 CANVAS = 2048
 
 

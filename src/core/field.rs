@@ -62,6 +62,8 @@ pub enum Validator {
     CtDomain,
     /// A transfer rate: `2MB`, `500KB`, `1.5MB/s`, or empty for no limit.
     Rate,
+    /// What a good HTTP answer is: `any`, `2xx`, `404`, `200-204`, or a list.
+    Expect,
 }
 
 impl Validator {
@@ -95,6 +97,7 @@ impl Validator {
             }
             Validator::Ports => crate::net::ports::parse_ports(s).map(|_| ()),
             Validator::CtDomain => crate::net::ct::normalize_domain(s).map(|_| ()),
+            Validator::Expect => crate::tools::http::valid_expect(s),
             Validator::Rate => {
                 if s.is_empty() || parse_rate(s).is_some() {
                     Ok(())
