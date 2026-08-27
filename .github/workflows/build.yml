@@ -61,7 +61,7 @@ jobs:
             target/x86_64-apple-darwin/release/ntls \
             target/aarch64-apple-darwin/release/ntls
           lipo -info dist/ntls
-          packaging/macos/bundle.sh dist/ntls dist "$version"
+          bash packaging/macos/bundle.sh dist/ntls dist "$version"
           rm dist/ntls
           # ditto, not zip: it keeps the bundle structure and the signature.
           ditto -c -k --keepParent dist/ntls.app "dist/ntls-$version-macos-universal.zip"
@@ -151,17 +151,22 @@ jobs:
           cp README.md "dist/$name/README.md"
           cd dist && 7z a "$name.zip" "$name" >/dev/null
 
+      # PowerShell, not bash: Git Bash rewrites arguments that look like paths,
+      # and iscc's /D options are exactly that shape.
       - name: Installer
-        shell: bash
+        shell: pwsh
         run: |
-          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
           choco install innosetup --no-progress -y
-          iscc.exe //DVersion="$version" \
-                   //DBinary="$(pwd -W)/target/${{ matrix.target }}/release/ntls.exe" \
-                   //DOutDir="$(pwd -W)/dist" \
-                   //DArch="${{ matrix.arch }}" \
-                   //DArchitectures="${{ matrix.architectures }}" \
-                   packaging/windows/ntls.iss
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DVersion=$version" `
+            "/DBinary=$env:GITHUB_WORKSPACE\target\${{ matrix.target }}\release\ntls.exe" `
+            "/DOutDir=$env:GITHUB_WORKSPACE\dist" `
+            "/DArch=${{ matrix.arch }}" `
+            "/DArchitectures=${{ matrix.architectures }}" `
+            packaging\windows\ntls.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v4
         with:

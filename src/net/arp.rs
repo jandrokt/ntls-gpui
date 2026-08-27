@@ -94,11 +94,19 @@ pub struct ArpProber {
 impl ArpProber {
     /// Prepares a prober for the network reached through `interface`, whose
     /// address on it is `src`.
-    pub fn new(interface: Option<&str>, src: Option<Ipv4Addr>) -> Result<ArpProber, String> {
+    ///
+    /// Only the BSD family can open a raw link socket here, so `interface` and
+    /// `src` are only read there. Everywhere else the neighbour table is the
+    /// whole of what is available.
+    pub fn new(
+        #[allow(unused_variables)] interface: Option<&str>,
+        #[allow(unused_variables)] src: Option<Ipv4Addr>,
+    ) -> Result<ArpProber, String> {
         if !supported() {
             return Err("ARP probing is not supported on this platform".into());
         }
 
+        #[allow(unused_mut)]
         let mut raw_error = None;
         #[cfg(any(
             target_os = "macos",
