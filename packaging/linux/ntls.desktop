@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ntls
+GenericName=Network toolbox
+Comment=Reachability, discovery, port and DNS enumeration, throughput and downloads
+Exec=ntls
+Icon=ntls
+Terminal=false
+Categories=Network;System;Utility;
+Keywords=ping;scan;dns;port;network;traceroute;download;
+StartupWMClass=ntls
