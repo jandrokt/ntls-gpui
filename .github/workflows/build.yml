@@ -1,0 +1,206 @@
+name: build
+
+# Builds every platform on every push, and releases what it built.
+#
+# ntls counts builds, not versions. `github.run_number` goes up by one per run
+# of this workflow, so it goes up on every commit and never repeats. It gets
+# stamped into the binaries at compile time, names every artifact, and is the
+# tag on the release. Renaming this file would restart the count, so do not.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug info makes these builds huge and nothing here reads it.
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
+  # The build number. Read by build.rs and by every packaging step below.
+  NTLS_BUILD: ${{ github.run_number }}
+
+jobs:
+  # Nothing in the tests is platform-specific, so once is enough.
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the libraries GPUI links against
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libfontconfig-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-dri3-dev libxkbcommon-x11-dev libssl-dev \
+            libzstd-dev libvulkan-dev libgit2-dev make cmake clang mold
+      # Let this user open an unprivileged ICMP socket, so the ping test
+      # actually runs here instead of skipping itself.
+      - run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+
+      # Nothing here touches the network beyond loopback.
+      - run: cargo test
+
+  macos:
+    name: macOS (universal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Metal toolchain
+        run: |
+          # GPUI compiles shaders at build time. Usually already installed.
+          xcodebuild -downloadComponent MetalToolchain 2>/dev/null || \
+            echo "the Metal toolchain is already installed, or cannot be fetched here"
+
+      - name: Build x86_64 and aarch64
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: lipo into one binary, wrap in a .app
+        run: |
+          mkdir -p dist
+          lipo -create -output dist/ntls \
+            target/x86_64-apple-darwin/release/ntls \
+            target/aarch64-apple-darwin/release/ntls
+          lipo -info dist/ntls
+          bash packaging/macos/bundle.sh dist/ntls dist "$NTLS_BUILD"
+          rm dist/ntls
+          # ditto, not zip: it keeps the bundle structure and the signature.
+          ditto -c -k --keepParent dist/ntls.app "dist/ntls-$NTLS_BUILD-macos-universal.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ntls-macos-universal
+          path: dist/*.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the libraries GPUI links against
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libfontconfig-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-dri3-dev libxkbcommon-x11-dev libssl-dev \
+            libzstd-dev libvulkan-dev libgit2-dev make cmake clang mold
+
+      - run: cargo build --release
+
+      - name: Tarball with a .desktop file and an icon
+        run: |
+          name="ntls-$NTLS_BUILD-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$name"
+          cp target/release/ntls "dist/$name/ntls"
+          cp packaging/linux/ntls.desktop "dist/$name/ntls.desktop"
+          cp packaging/linux/install.sh "dist/$name/install.sh"
+          cp packaging/icon/png/ntls-512.png "dist/$name/ntls.png"
+          cp README.md "dist/$name/README.md"
+          cp -r docs "dist/$name/docs"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ntls-linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            architectures: x64compatible
+          - arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            architectures: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Portable zip
+        shell: bash
+        run: |
+          name="ntls-$NTLS_BUILD-windows-${{ matrix.arch }}-portable"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/ntls.exe" "dist/$name/ntls.exe"
+          cp README.md "dist/$name/README.md"
+          cd dist && 7z a "$name.zip" "$name" >/dev/null
+
+      # PowerShell, not bash: Git Bash rewrites arguments that look like paths,
+      # and iscc's /D options are exactly that shape.
+      - name: Installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DBuild=$env:NTLS_BUILD" `
+            "/DBinary=$env:GITHUB_WORKSPACE\target\${{ matrix.target }}\release\ntls.exe" `
+            "/DOutDir=$env:GITHUB_WORKSPACE\dist" `
+            "/DArch=${{ matrix.arch }}" `
+            "/DArchitectures=${{ matrix.architectures }}" `
+            packaging\windows\ntls.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ntls-windows-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.exe
+          if-no-files-found: error
+
+  # Every commit on the default branch becomes a release, tagged by its build
+  # number. There is nothing to tag by hand: the number is the name of the
+  # thing. A pull request builds and is checked, and leaves nothing behind.
+  release:
+    if: github.event_name == 'push'
+    needs: [test, macos, linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: ntls build ${{ github.run_number }}
+          body: |
+            Build ${{ github.run_number }}, from ${{ github.sha }}.
+          files: artifacts/**/*
+          generate_release_notes: true
+          draft: false

@@ -53,8 +53,7 @@ you've got a monitor.
 
 ## Installing
 
-Every commit becomes a release. CI builds every platform, publishes what it
-built, and tags it `build-<n>`:
+Every commit becomes a release, tagged `build-<n>`:
 
 - **macOS** `ntls.app` in a zip, one universal build for Intel and Apple
   silicon.
@@ -66,8 +65,8 @@ built, and tags it `build-<n>`:
 ## Builds, not versions
 
 ntls doesn't have a version number. It has a build number, and every commit
-gets the next one. It's the CI pipeline's own count, so it goes up by one each
-time and never repeats. It gets stamped into the binary at compile time, it's
+gets the next one. It's `github.run_number`, the workflow's own count, so it
+goes up by one each time and never repeats. It gets stamped into the binary at compile time, it's
 what the program calls itself on the welcome screen and in Settings, it names
 every artifact, and it's the tag on the release those artifacts hang off. Build
 412 is one commit, one pipeline, one set of binaries.
@@ -497,18 +496,15 @@ machine, and a real port scan and ping against loopback.
 Packaging lives in `packaging/`: `icon/make-icons.py` draws the icon and writes
 out every format the three platforms want, `macos/bundle.sh` wraps a binary in
 a `.app`, `windows/ntls.iss` is the Inno Setup script, and `linux/` has the
-`.desktop` file and the tarball's installer. `.gitlab-ci.yml` drives all of it:
-a test job, a build job per platform, and a release job that collects what they
-made.
+`.desktop` file and the tarball's installer. `.github/workflows/build.yml`
+drives all of it: a test job, a build job per platform on a GitHub-hosted
+runner of that platform, and a release job that collects what they made.
 
-Each build job uploads its artifacts to the project's generic package registry
-and writes down the URL; the release job hangs those URLs off the release. That
-way a release keeps working after the job artifacts expire.
-
-The pipeline names the runners it wants: Docker for the two Linux jobs, one of
-them arm64, plus the SaaS macOS and Windows runners. Delete the job for any
-platform you have no runner for. The release waits for the whole build stage,
-and a job no runner can take never finishes.
+Each platform is built on its own machine because it has to be. macOS needs
+Apple hardware, since GPUI compiles Metal shaders with `xcrun metal` and the
+SDK is licensed to Apple machines. Windows needs Windows, for MSVC and Inno
+Setup. GitHub hands out runners for all of them, including arm64 Linux and
+Windows, which is the whole reason the builds live there.
 
 ## Adding a tool
 
