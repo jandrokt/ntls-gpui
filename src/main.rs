@@ -1,4 +1,4 @@
-//! ntls — a desktop toolbox for the network questions you ask most often: is
+//! ntls: a desktop toolbox for the network questions you ask most often. Is
 //! this host up, what else is on this network, and what is it listening on.
 
 mod core;
@@ -45,7 +45,13 @@ fn main() {
                         // keep their own titlebar, because hiding it there
                         // takes the window's buttons with it.
                         appears_transparent: cfg!(target_os = "macos"),
-                        traffic_light_position: Some(point(px(13.), px(13.))),
+                        // Sized and placed from one set of numbers, so the
+                        // strip ntls draws and the buttons the system draws
+                        // on top of it agree about where the middle is.
+                        traffic_light_position: Some(point(
+                            px(sys::TRAFFIC_LIGHT_LEFT),
+                            px(sys::TRAFFIC_LIGHT_TOP),
+                        )),
                     }),
                     ..Default::default()
                 },
@@ -76,7 +82,11 @@ fn menus() -> Vec<Menu> {
     vec![
         Menu {
             name: "ntls".into(),
-            items: vec![MenuItem::action("Quit ntls", ui::app::Quit)],
+            items: vec![
+                MenuItem::action("Settings…", ui::app::Preferences),
+                MenuItem::separator(),
+                MenuItem::action("Quit ntls", ui::app::Quit),
+            ],
         },
         Menu {
             name: "File".into(),
@@ -100,7 +110,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Add Tool…", ui::app::AddTool),
                 MenuItem::action("Run", ui::app::Run),
                 MenuItem::action("Stop", ui::app::Stop),
-                MenuItem::action("Settings", ui::app::Settings),
+                MenuItem::action("Show Form", ui::app::Settings),
                 MenuItem::action("Name and Colour", ui::app::ToggleProperties),
                 MenuItem::action("Note on Selection", ui::app::FocusNote),
                 MenuItem::separator(),
@@ -116,6 +126,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Toggle Log", ui::app::ToggleLog),
                 MenuItem::action("Toggle Chart", ui::app::ToggleChart),
                 MenuItem::action("Toggle Theme", ui::app::ToggleTheme),
+                MenuItem::action("Notifications", ui::app::ShowNotices),
             ],
         },
     ]

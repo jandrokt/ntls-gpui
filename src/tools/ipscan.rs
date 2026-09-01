@@ -37,7 +37,7 @@ impl Tool for IpScan {
             target_field(
                 "Network",
                 "auto, 192.168.1.0/24, 10.0.0.1-50",
-                "auto uses your own subnet — press tab to expand it into the exact range, then edit it",
+                "auto uses your own subnet. Press tab to expand it into the exact range, then edit it",
             )
             .default("auto"),
             method_field(),
@@ -64,7 +64,7 @@ impl Tool for IpScan {
             Field::boolean(
                 "vendors",
                 "Identify hardware",
-                "Resolve the MAC and vendor of hosts on this link — ICMP alone cannot tell you what a device is",
+                "Resolve the MAC and vendor of hosts on this link. ICMP alone cannot tell you what a device is",
                 true,
             ),
             Field::boolean(
@@ -76,7 +76,7 @@ impl Tool for IpScan {
             Field::boolean(
                 "keep",
                 "Keep earlier results",
-                "Add to what previous runs found instead of replacing it: a host that has since gone quiet keeps its row, and an address a different device has taken over gets a second one",
+                "Add to what earlier runs found. Every row says which scan last saw it, hosts that have gone quiet are kept and marked, and an address that has changed hands gets a second row",
                 false,
             )
             .role(Role::Keep),
@@ -95,6 +95,12 @@ impl Tool for IpScan {
             col("NAME", 24),
             col("MAC", 18),
             col("VENDOR", 0),
+            // Only a scan that keeps what earlier ones found fills this in.
+            // a single scan is all one moment, and every row of it would say
+            // the same thing. The heading is short because a column is never
+            // narrower than its own title, and this one is empty most of the
+            // time: an unused column must not take its room from the vendor.
+            col("SEEN", 12),
         ]
     }
 
@@ -144,6 +150,12 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
             seen.len()
         ));
     }
+
+    // What this run asks about, so that a row about an address outside the
+    // range is left alone and not aged. A scan of one host says nothing
+    // whatever about the rest of the subnet.
+    let probed: std::collections::HashSet<String> =
+        targets.iter().map(|a| a.to_string()).collect();
 
     let prober = Arc::new(Prober::new(&p, &targets, timeout).map_err(anyhow::Error::msg)?);
     prober.emit_notes(&emit);
@@ -206,7 +218,9 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                 match res {
                     Err(e) => {
                         if show_down && !cancel.is_cancelled() {
-                            let cells = cells![addr, "-", "", "", "", failure_text(&e)];
+                            // Nothing answered, so there is nothing this row
+                            // has ever been seen to be.
+                            let cells = cells![addr, "-", "", "", "", failure_text(&e), ""];
                             if keep {
                                 // One row per address for the silent ones, so
                                 // a nightly sweep does not grow a row a night
@@ -230,25 +244,28 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                             String::new()
                         };
                         let status = if r.suspect { Status::Warn } else { Status::Up };
-                        let cells =
-                            cells![addr, ms(r.rtt), r.ttl_text(), name, r.mac, r.vendor];
+                        let cells = cells![
+                            addr,
+                            ms(r.rtt),
+                            r.ttl_text(),
+                            name,
+                            r.mac,
+                            r.vendor,
+                            if keep { SEEN_NOW } else { "" }
+                        ];
                         if keep {
-                            answered.lock().await.insert(addr.to_string());
+                            let key = seen.key_for(&addr.to_string(), &r.mac);
+                            answered.lock().await.insert(key.clone());
                             match seen.compare(&addr.to_string(), &r.mac) {
                                 Was::Nothing => {}
                                 Was::New => emit.good(format!("{addr} is new since the last run")),
                                 Was::Same => {}
                                 Was::Different(before) => emit.warn(format!(
-                                    "{addr} now answers from {} — the row for {before} is kept",
+                                    "{addr} now answers from {}; the row for {before} is kept",
                                     hardware(&r.mac)
                                 )),
                             }
-                            emit.upsert_as(
-                                seen.key_for(&addr.to_string(), &r.mac),
-                                status,
-                                addr.to_string(),
-                                cells,
-                            );
+                            emit.upsert_as(key, status, addr.to_string(), cells);
                         } else {
                             emit.row(status, addr.to_string(), cells);
                         }
@@ -264,14 +281,32 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
     ticker.abort();
     publish();
 
-    if keep && !seen.is_empty() {
+    // Every row this scan asked about and did not get an answer from gets a
+    // scan older and stops claiming to be current. Without this the table
+    // reads as though everything in it were still there, the
+    // thing a record kept over time must not do.
+    if keep && !cancel.is_cancelled() {
         let answered = answered.lock().await;
-        let quiet = seen.missing(&answered);
-        if quiet > 0 {
+        let quiet = stale(&r.prior, &probed, &answered);
+        for row in &quiet {
+            let mut cells = row.cells.clone();
+            age(&mut cells);
+            emit.upsert_as(row.identity(), Status::Warn, row.target.clone(), cells);
+        }
+        if !quiet.is_empty() {
             emit.info(format!(
-                "{quiet} address(es) that answered before did not answer this time; their rows are left as they were"
+                "{} row(s) that answered before did not answer this time; they are kept, marked, and dated to the scan that last found them",
+                quiet.len()
             ));
         }
+        // What is on screen is no longer just what this scan found, so the
+        // figures say how much of it is history.
+        emit.stats(vec![
+            kv("scanned", format!("{}/{total}", done.load(Ordering::Relaxed) + skipped)),
+            kv("up", up.load(Ordering::Relaxed).to_string()),
+            kv("kept", quiet.len().to_string()),
+            kv("elapsed", elapsed(start.elapsed())),
+        ]);
     }
 
     let found = up.load(Ordering::Relaxed);
@@ -288,15 +323,77 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Which column carries the hardware address, and which carries the date.
+///
+/// Both are read back out of rows written by earlier runs, including runs of
+/// earlier versions whose rows are one column short, so the positions are
+/// named, not counted out at each use.
+const MAC_COL: usize = 4;
+const SEEN_COL: usize = 6;
+
+/// What the date column says about a row this scan has just confirmed.
+const SEEN_NOW: &str = "this scan";
+
+/// The rows a kept run should put a scan into the past: the ones it asked
+/// about and did not hear from.
+///
+/// A row about an address this run never probed is not evidence of anything;
+/// scanning one host says nothing about the rest of the subnet. A row
+/// that only ever recorded silence has no date to move.
+fn stale<'a>(
+    prior: &'a [crate::core::Row],
+    probed: &std::collections::HashSet<String>,
+    answered: &std::collections::HashSet<String>,
+) -> Vec<&'a crate::core::Row> {
+    prior
+        .iter()
+        .filter(|row| row.status != Status::Down)
+        .filter(|row| probed.contains(&row.target))
+        .filter(|row| !answered.contains(row.identity()))
+        .collect()
+}
+
+/// Puts a row one scan further into the past.
+///
+/// The count is kept in the cell and nowhere else, because the cell
+/// is the only part of a row written to disk and read back, and
+/// what lets a table survive being closed and reopened and still know how old
+/// each line in it is.
+fn age(cells: &mut Vec<String>) {
+    if cells.len() <= SEEN_COL {
+        cells.resize(SEEN_COL + 1, String::new());
+    }
+    cells[SEEN_COL] = older(&cells[SEEN_COL]);
+}
+
+fn older(current: &str) -> String {
+    let current = current.trim();
+    let scans = if current == SEEN_NOW {
+        0
+    } else if let Some(n) = current.strip_suffix(" scans ago").and_then(|n| n.parse::<u32>().ok()) {
+        n
+    } else if current == "1 scan ago" {
+        1
+    } else {
+        // A row from before any of this existed cannot be dated, and guessing
+        // a number for it would be inventing one.
+        return "earlier".into();
+    };
+    match scans + 1 {
+        1 => "1 scan ago".into(),
+        n => format!("{n} scans ago"),
+    }
+}
+
 /// What was in the table when this run started, for a run that is adding to
-/// it rather than replacing it.
+/// it and does not replace it.
 ///
 /// Only the hosts that answered are worth remembering: a row saying an address
 /// was silent says nothing about what lives there.
 struct Seen {
     devices: HashMap<String, Vec<Device>>,
     /// The rows saying an address did not answer, which are about the address
-    /// rather than about anything living on it.
+    /// and not about anything living on it.
     silent: HashMap<String, String>,
 }
 
@@ -305,14 +402,14 @@ struct Device {
     /// Its hardware address, lowercased, or empty where none was learned.
     mac: String,
     /// What that row calls itself, so answering again rewrites that row rather
-    /// than adding a second one beside it — including for the rows of runs
+    /// than adding a second one beside it, including for the rows of runs
     /// made before this switch existed, which name themselves by their target.
     row: String,
 }
 
 /// What an address was, the last time anything answered on it.
 enum Was {
-    /// Nothing was there to compare with — a first run with this switch on.
+    /// Nothing was there to compare with: a first run with this switch on.
     Nothing,
     /// The address had never answered before.
     New,
@@ -334,7 +431,7 @@ impl Seen {
                 silent.insert(row.target.clone(), row.identity().to_string());
                 continue;
             }
-            let mac = identity(row.cells.get(4).map(String::as_str).unwrap_or_default());
+            let mac = identity(row.cells.get(MAC_COL).map(String::as_str).unwrap_or_default());
             let entry = devices.entry(row.target.clone()).or_default();
             if !entry.iter().any(|d| d.mac == mac) {
                 entry.push(Device { mac, row: row.identity().to_string() });
@@ -382,11 +479,6 @@ impl Seen {
             .chain(self.silent.keys())
             .collect::<std::collections::HashSet<_>>()
             .len()
-    }
-
-    /// How many of the addresses that answered before did not answer now.
-    fn missing(&self, answered: &std::collections::HashSet<String>) -> usize {
-        self.devices.keys().filter(|addr| !answered.contains(*addr)).count()
     }
 
     fn compare(&self, addr: &str, mac: &str) -> Was {
@@ -453,7 +545,7 @@ mod tests {
 
     fn row(target: &str, mac: &str, status: Status, key: Option<&str>) -> Row {
         Row {
-            cells: crate::cells![target, "1 ms", "64", "", mac, ""],
+            cells: crate::cells![target, "1 ms", "64", "", mac, "", SEEN_NOW],
             status,
             target: target.into(),
             note: None,
@@ -464,7 +556,7 @@ mod tests {
     #[test]
     fn a_host_that_answers_again_rewrites_the_row_it_already_had() {
         // Including the rows of runs made before any of this existed, which
-        // name themselves by their target — otherwise the first kept run
+        // name themselves by their target. Otherwise the first kept run
         // would double every line in the table.
         let seen = Seen::of(&[row("10.0.0.1", "aa:bb:cc:dd:ee:ff", Status::Up, None)]);
         assert_eq!(seen.key_for("10.0.0.1", "AA:BB:CC:DD:EE:FF"), "10.0.0.1");
@@ -509,13 +601,59 @@ mod tests {
     }
 
     #[test]
-    fn what_did_not_answer_this_time_is_counted_rather_than_removed() {
-        let seen = Seen::of(&[
+    fn an_address_never_recorded_is_new_rather_than_changed() {
+        let seen = Seen::of(&[row("10.0.0.1", "aa:bb:cc:dd:ee:ff", Status::Up, None)]);
+        assert!(matches!(seen.compare("10.0.0.7", ""), Was::New));
+    }
+
+    #[test]
+    fn only_what_was_asked_about_and_stayed_quiet_is_put_into_the_past() {
+        let prior = vec![
             row("10.0.0.1", "aa:bb:cc:dd:ee:ff", Status::Up, None),
             row("10.0.0.2", "11:22:33:44:55:66", Status::Up, None),
-        ]);
+            row("10.0.0.3", "22:33:44:55:66:77", Status::Up, None),
+            row("10.0.0.9", "", Status::Down, None),
+        ];
+        // This run swept .1 to .3; .9 was in the table from a wider one.
+        let probed =
+            ["10.0.0.1", "10.0.0.2", "10.0.0.3"].into_iter().map(str::to_string).collect();
         let answered = std::collections::HashSet::from(["10.0.0.1".to_string()]);
-        assert_eq!(seen.missing(&answered), 1);
-        assert!(matches!(seen.compare("10.0.0.7", ""), Was::New));
+
+        let quiet: Vec<&str> =
+            stale(&prior, &probed, &answered).iter().map(|r| r.target.as_str()).collect();
+        // .1 answered, .9 was never asked, and a row recording silence has no
+        // date to move.
+        assert_eq!(quiet, ["10.0.0.2", "10.0.0.3"]);
+    }
+
+    #[test]
+    fn a_row_that_did_not_answer_gets_a_scan_older_rather_than_staying_current() {
+        // The whole point of keeping earlier results is being able to tell
+        // what is still there from what merely was, so the row has to say
+        // which scan last found it.
+        let mut cells = crate::cells!["10.0.0.1", "1 ms", "64", "", "", "", SEEN_NOW];
+        age(&mut cells);
+        assert_eq!(cells[SEEN_COL], "1 scan ago");
+        age(&mut cells);
+        assert_eq!(cells[SEEN_COL], "2 scans ago");
+        for _ in 0..8 {
+            age(&mut cells);
+        }
+        assert_eq!(cells[SEEN_COL], "10 scans ago");
+    }
+
+    #[test]
+    fn a_row_written_before_there_was_a_date_column_gets_one() {
+        // Six cells, from a version of ntls that had six columns. Ageing it
+        // must not put the date in the vendor column, and must not claim a
+        // number nothing recorded.
+        let mut cells = crate::cells!["10.0.0.1", "1 ms", "64", "host", "aa:bb", "Acme"];
+        age(&mut cells);
+        assert_eq!(cells.len(), SEEN_COL + 1);
+        assert_eq!(cells[5], "Acme");
+        assert_eq!(cells[SEEN_COL], "earlier");
+        // And stays there, since there is nothing to count from.
+        age(&mut cells);
+        assert_eq!(cells[SEEN_COL], "earlier");
     }
 }

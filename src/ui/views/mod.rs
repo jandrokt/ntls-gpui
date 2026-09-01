@@ -5,9 +5,14 @@ mod chrome;
 mod doc;
 mod flow;
 mod job;
+mod interfaces;
 mod menu;
+mod notices;
+mod page;
 mod palette;
 mod picker;
+mod settings;
+mod variables;
 mod welcome;
 
 use gpui::{
@@ -20,6 +25,9 @@ use super::widgets::Type;
 
 impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // With the theme following the desktop, this is where a desktop that
+        // has changed is noticed.
+        self.apply_theme(window, cx);
         let theme = self.theme(cx);
         self.sync_filter(cx);
         if self.sync_note(cx) {
@@ -30,6 +38,7 @@ impl Render for App {
         }
         self.commit_item_rename(cx);
         self.commit_var(cx);
+        self.sync_var_filter(cx);
         // A document is a file something else edits, so a save elsewhere shows
         // up here.
         if self.refresh_docs() {
@@ -59,22 +68,43 @@ impl Render for App {
             });
         }
 
+        // A page takes the whole window: no side bar, no tab strip, no output
+        // panel. What it is about is not a thing inside the workspace, so a
+        // list of what is inside the workspace is only in the way.
+        let page = self.page;
         let has_jobs = self.workspace().any_open();
-        let sidebar = self.sidebar_open.then(|| self.sidebar(&theme, cx));
-        let tabs = has_jobs.then(|| self.tab_bar(&theme, cx));
-        let crumbs = has_jobs.then(|| self.breadcrumbs(&theme));
-        let body = match self.workspace().showing() {
-            _ if !has_jobs => self.welcome(&theme, cx),
-            Some(super::workspace::Item::Doc(id)) => self.doc_pane(id, &theme, cx),
-            Some(super::workspace::Item::Flow(id)) => self.flow_pane(id, &theme, cx),
-            _ => self.job_pane(&theme, window, cx),
+        // The side bar is drawn whenever it has any width at all: it slides
+        // shut and does not vanish, and something has to be there to slide.
+        let sidebar_at = self.sidebar_at();
+        let sidebar = (page.is_none() && sidebar_at > 0.).then(|| self.sidebar(&theme, cx));
+        // The slide is a layout instead of one element's own style, so it
+        // asks for the next frame itself. `notify` is not enough: a repaint
+        // asked for from inside a repaint is the one thing it will not do.
+        if self.sidebar_moving() {
+            window.request_animation_frame();
+        }
+        let tabs = (has_jobs && page.is_none()).then(|| self.tab_bar(&theme, cx));
+        let crumbs = (has_jobs && page.is_none()).then(|| self.breadcrumbs(&theme));
+        let body = match page {
+            Some(app::Page::Settings) => self.settings_page(&theme, window, cx),
+            Some(app::Page::Variables) => self.variables_page(&theme, window, cx),
+            Some(app::Page::Interfaces) => self.interfaces_page(&theme, window, cx),
+            None => match self.workspace().showing() {
+                _ if !has_jobs => self.welcome(&theme, cx),
+                Some(super::workspace::Item::Doc(id)) => self.doc_pane(id, &theme, cx),
+                Some(super::workspace::Item::Flow(id)) => self.flow_pane(id, &theme, cx),
+                _ => self.job_pane(&theme, window, cx),
+            },
         };
         let showing_doc = matches!(
             self.workspace().showing(),
             Some(super::workspace::Item::Doc(_) | super::workspace::Item::Flow(_))
         );
-        let panel =
-            (self.panel_open && has_jobs && !showing_doc).then(|| self.panel(&theme, cx)).flatten();
+        let panel = (self.panel_open && has_jobs && !showing_doc && page.is_none())
+            .then(|| self.panel(&theme, cx))
+            .flatten();
+        let toasts = self.toasts(&theme, cx);
+        let notices = self.notices.open.then(|| self.notice_list(&theme, cx));
 
         div()
             .key_context("Ntls")
@@ -137,7 +167,7 @@ impl Render for App {
             .child(self.status_bar(&theme, cx))
             // Dropping is shown as an outline drawn over the window rather
             // than as a border on it: a border would inset everything by its
-            // own width, which is why the status bar stopped short of the
+            // own width, and the status bar would stop short of the
             // corner.
             .when(self.drop_hover, |d| {
                 d.child(
@@ -149,6 +179,8 @@ impl Render for App {
                         .bg(theme.accent.opacity(0.06)),
                 )
             })
+            .children(toasts)
+            .children(notices)
             .when(self.palette_open, |d| d.child(self.palette_overlay(&theme, cx)))
             .when(self.picker_open, |d| d.child(self.picker_overlay(&theme, cx)))
             .when(self.menu.is_some(), |d| d.child(self.menu_overlay(&theme, window, cx)))
@@ -158,7 +190,7 @@ impl Render for App {
 /// Every action the window answers to, in one place.
 ///
 /// The four navigation keys mean different things depending on what is open,
-/// so each resolves to a single action and the handler decides — which is
+/// so each resolves to a single action and the handler decides, which
 /// simpler to reason about than four overlapping key contexts.
 trait Actions: Sized {
     fn actions(self, cx: &mut Context<App>) -> Self;
@@ -172,7 +204,7 @@ impl Actions for gpui::Div {
                 app.close_workspace(at, cx);
             }))
             .on_action(cx.listener(|app, _: &app::CloseJob, _, cx| {
-                // Closing with nothing selected closes the workspace, which is
+                // Closing with nothing selected closes the workspace, as
                 // what the same key does in every tabbed application.
                 match app.workspace().selected {
                     Some(id) => app.close_job(id, cx),
@@ -197,7 +229,7 @@ impl Actions for gpui::Div {
             .on_action(cx.listener(|app, _: &app::Stop, _, cx| app.stop_selected(cx)))
             .on_action(cx.listener(|app, _: &app::Settings, window, cx| {
                 // On a document or a workflow, the settings key edits the
-                // source — which is the same idea: show me the thing behind
+                // source. Same idea: show me the thing behind
                 // what I am looking at.
                 match app.workspace().showing() {
                     Some(item @ (super::workspace::Item::Doc(_) | super::workspace::Item::Flow(_))) => {
@@ -226,14 +258,16 @@ impl Actions for gpui::Div {
                 }
             }))
             .on_action(cx.listener(|app, _: &app::FocusNote, window, cx| {
-                // Only useful with a result selected, which is the only time
+                // Only useful with a result selected, the only time
                 // there is anything to annotate.
-                if app.note_for.is_some() {
-                    let handle = app.note_input.read(cx).focus_handle.clone();
-                    window.focus(&handle);
-                    cx.notify();
+                if let Some(line) = app.selected_job().and_then(|j| j.selected) {
+                    app.begin_note(line, window, cx);
                 }
             }))
+            .on_action(cx.listener(|app, _: &app::Preferences, window, cx| {
+                app.show_page(app::Page::Settings, window, cx)
+            }))
+            .on_action(cx.listener(|app, _: &app::ShowNotices, _, cx| app.toggle_notices(cx)))
             .on_action(cx.listener(|app, _: &app::ToggleLog, _, cx| app.toggle_panel(cx)))
             .on_action(cx.listener(|app, _: &app::ToggleSidebar, _, cx| app.toggle_sidebar(cx)))
             .on_action(cx.listener(|app, _: &app::ShowWorkspaces, w, cx| {
@@ -382,6 +416,14 @@ impl App {
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.picker_open {
             self.close_picker(window, cx);
+            return;
+        }
+        if self.notices.open {
+            self.toggle_notices(cx);
+            return;
+        }
+        if self.page.is_some() {
+            self.close_page(cx);
             return;
         }
         if self.menu.is_some() {

@@ -3,15 +3,14 @@
 //! The tree says what the workflow *is*; running it needs somewhere to be in
 //! the middle of, and a branch or a loop has no obvious "next" in a tree. So
 //! the tree is compiled once, when the workflow starts, into a flat list of
-//! operations with a program counter — the same reason a language has a
-//! bytecode rather than walking its syntax.
+//! operations with a program counter, for the same reason a language has a
+//! bytecode and does not walk its syntax.
 //!
-//! A repeat becomes a counter on a stack rather than a hundred copies of its
+//! A repeat becomes a counter on a stack instead of a hundred copies of its
 //! body, so nesting two of them costs two operations and not ten thousand.
 //!
 //! Nothing here knows what a run is or how to evaluate a condition. The caller
-//! answers both, which is what lets the whole machine be tested without a
-//! window.
+//! answers both, so the whole machine can be tested without a window.
 
 use super::Step;
 
@@ -75,9 +74,9 @@ impl Machine {
 
     /// Works forward until something has to happen outside the machine.
     ///
-    /// `truth` answers a condition. It may fail — a condition can name a run
-    /// that has not been done — and a condition that cannot be answered is
-    /// treated as false rather than as a reason to stop, since the step it
+    /// `truth` answers a condition. It may fail, since a condition can name a
+    /// run that has not been done, and a condition that cannot be answered is
+    /// treated as false instead of as a reason to stop, since the step it
     /// guards is exactly the step that should not run.
     pub fn next(&mut self, truth: &mut impl FnMut(&str) -> Result<bool, String>) -> Event {
         loop {
@@ -324,7 +323,7 @@ mod tests {
 
     #[test]
     fn a_variable_is_set_where_the_step_is_reached() {
-        // The machine does not work the expression out — the caller does,
+        // The machine does not work the expression out; the caller does,
         // against what the steps before it found.
         assert_eq!(
             trace("run A\nset gateway = Sweep.up\nrun B", &[]),

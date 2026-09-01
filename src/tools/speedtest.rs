@@ -16,8 +16,8 @@ use crate::tools::stats::{RttStats, elapsed, ms};
 
 pub struct SpeedTest;
 
-/// Cloudflare runs an open, unauthenticated speed-test endpoint, which is what
-/// makes it usable here without an account or an API key.
+/// Cloudflare runs an open, unauthenticated speed-test endpoint, so this
+/// works without an account or an API key.
 const CF_UP: &str = "https://speed.cloudflare.com/__up";
 /// The size asked for per request. Cloudflare rejects requests much above
 /// 50 MB outright, and each stream simply asks again when a chunk runs out, so
@@ -207,7 +207,7 @@ async fn transfer(
     };
 
     // A steady progress bar while a transfer runs: the tool knows how long it
-    // means to take, so the bar tracks time rather than bytes.
+    // means to take, so the bar tracks time and not bytes.
     let running = Arc::new(AtomicBool::new(true));
     let bar = {
         let (emit, running, cancel) = (emit.clone(), running.clone(), cancel.clone());

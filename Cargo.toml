@@ -1,6 +1,10 @@
 [package]
 name = "ntls"
-version = "0.1.0"
+# Cargo insists on a semantic version. ntls does not have one: it has a build
+# number, which CI stamps in through `NTLS_BUILD` and which is what the program
+# calls itself everywhere. This field is here because the manifest format
+# requires it, and nothing reads it.
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A desktop toolbox for the network questions you ask most often, and for getting things off it"

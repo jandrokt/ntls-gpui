@@ -3,9 +3,9 @@
 //! `yt-dlp` knows how to get media off some eighteen hundred sites and
 //! `gallery-dl` off several hundred more, and both are updated as those sites
 //! change. Writing any of that here would mean maintaining it here, so ntls
-//! asks them instead: whether they recognise a link, and — for the media
-//! extractor, whose answers are often several files that have to be put back
-//! together — to do the download and report progress while it does.
+//! asks them instead: whether they recognise a link, and, for the media
+//! extractor whose answers are often several files to be put back together,
+//! to do the download and report progress while it does.
 //!
 //! Neither is required. With both missing, the page reader in
 //! [`super::resolve`] still handles direct links and the file hosts that
@@ -148,7 +148,7 @@ pub async fn ytdlp_download(
 ) -> Result<Vec<PathBuf>> {
     let binary = Extractor::YtDlp
         .found()
-        .with_context(|| format!("yt-dlp is not installed — {}", Extractor::YtDlp.install()))?;
+        .with_context(|| format!("yt-dlp is not installed. {}", Extractor::YtDlp.install()))?;
     std::fs::create_dir_all(dir)?;
 
     let output_template = dir.join("%(title)s [%(id)s].%(ext)s");
@@ -313,7 +313,7 @@ pub fn availability() -> String {
     match (have.is_empty(), missing.is_empty()) {
         (_, true) => format!("Extractors: {}", have.join(", ")),
         (true, _) => format!(
-            "No extractors installed — direct links and simple file hosts only. Install with: {}",
+            "No extractors installed. Direct links and simple file hosts only. Install with: {}",
             Extractor::YtDlp.install()
         ),
         _ => format!("Extractors: {} · missing: {}", have.join(", "), missing.join(", ")),

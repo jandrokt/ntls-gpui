@@ -1,7 +1,7 @@
 //! Measures real speed to another machine running ntls.
 //!
 //! An internet speed test tells you what your line does. This tells you what
-//! your own cabling, switches and wireless do, which is usually the thing
+//! your own cabling, switches and wireless do, usually the thing
 //! actually limiting a file copy.
 
 use std::net::IpAddr;
@@ -201,7 +201,7 @@ async fn measure(
                 peer_spec = peers[0].addr_port();
             }
             n => {
-                emit.info(format!("found {n} peers — select one and press enter to test against it"));
+                emit.info(format!("found {n} peers; select one and press enter to test against it"));
                 for peer in peers {
                     emit.row(
                         Status::Info,

@@ -35,7 +35,7 @@ pub fn pieces(source: &str) -> Vec<Piece> {
 /// The document with every expression replaced by what it comes to.
 ///
 /// An expression that cannot be worked out is left in place as `⟨why⟩`, so the
-/// mistake is visible where it was made rather than swallowed.
+/// mistake is visible where it was made and not swallowed.
 pub fn expand(source: &str, data: &dyn Source) -> String {
     let mut out = String::new();
     for piece in pieces(source) {

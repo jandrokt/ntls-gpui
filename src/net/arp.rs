@@ -4,7 +4,7 @@
 //! Sending genuine ARP requests needs a raw link-layer socket and therefore
 //! root, so without that privilege this nudges the kernel into resolving the
 //! address and reads the neighbour table, marking any answer that came out of
-//! the cache — those can be minutes old.
+//! the cache, since those can be minutes old.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -25,8 +25,10 @@ use super::arplink::{ArpLink, format_mac};
 #[derive(Clone, Debug, Default)]
 pub struct ArpResult {
     pub mac: String,
-    /// True when the answer came from an entry this run created rather than
-    /// from a pre-existing cache entry.
+    /// True when the wire, or this run's own resolution, answered for it just
+    /// now. False for an address taken from a cache or remembered from an
+    /// earlier run: still the best answer anything has, but not proof that
+    /// what holds it is still there.
     pub fresh: bool,
     pub rtt: Duration,
     /// Anything else worth saying about the answer, kept separate from the
@@ -190,7 +192,7 @@ impl ArpProber {
         }
         if self.empty_table {
             out.push(
-                "this system will not show hardware addresses to an unprivileged process — join the access_bpf group (Wireshark's ChmodBPF installs it) or run as root, and ntls will ask the wire directly"
+                "this system will not show hardware addresses to an unprivileged process. Join the access_bpf group (Wireshark's ChmodBPF installs it) or run as root, and ntls will ask the wire directly"
                     .to_string(),
             );
         }
@@ -206,7 +208,7 @@ impl ArpProber {
             return Err(ArpError::NotLocalLink);
         }
         // A host never ARPs for its own address, so answer for ourselves
-        // rather than leaving a gap in the middle of a subnet sweep.
+        // so a subnet sweep has no gap in the middle of it.
         if iface::is_local_addr(dst) {
             return Ok(ArpResult {
                 mac: iface::self_mac_for(dst),
@@ -230,11 +232,13 @@ impl ArpProber {
         if let Some(link) = &self.link {
             let IpAddr::V4(v4) = dst else { return Err(ArpError::Unsupported) };
             return match link.resolve(v4, timeout).await {
-                Some((mac, rtt)) => Ok(ArpResult {
-                    mac: format_mac(mac),
-                    fresh: true,
-                    rtt,
-                    note: String::new(),
+                Some(answer) => Ok(ArpResult {
+                    mac: format_mac(answer.mac),
+                    fresh: answer.fresh,
+                    rtt: answer.rtt,
+                    // An address nothing answered for just now, offered from
+                    // what it was last seen to be, has to say so.
+                    note: if answer.fresh { String::new() } else { "last seen".into() },
                 }),
                 None => Err(ArpError::Timeout),
             };
@@ -382,7 +386,7 @@ fn read_arp_command() -> Result<HashMap<IpAddr, String>, String> {
     Ok(table)
 }
 
-/// Parses `arp -a` on Windows, which prints a table rather than a line per
+/// Parses `arp -a` on Windows, which prints a table instead of a line per
 /// entry and separates the octets with dashes.
 ///
 /// ```text

@@ -115,7 +115,7 @@ async fn grab_banner(stream: &mut tokio::net::TcpStream, addr: IpAddr, port: u16
 }
 
 /// Collapses a raw byte response into one printable ASCII line. Anything
-/// outside printable ASCII is dropped rather than rendered, because a binary
+/// outside printable ASCII is dropped, not rendered, because a binary
 /// payload printed verbatim is noise that also corrupts the table.
 fn sanitize(b: &[u8], max: usize) -> String {
     let mut out = String::with_capacity(max);
@@ -217,7 +217,7 @@ fn classify_udp_error(e: &io::Error) -> PortState {
 }
 
 /// A payload likely to make the service on this port answer. Sending the right
-/// thing is the difference between a useful UDP scan and a page of
+/// thing separates a useful UDP scan from a page of
 /// "open|filtered".
 fn udp_probe(port: u16) -> Vec<u8> {
     match port {
@@ -290,7 +290,7 @@ pub fn raise_file_limit() -> u64 {
         lim.rlim_cur as u64
     }
     // Windows has no such limit to raise: sockets are handles and the ceiling
-    // is memory. Zero means "no figure to report", which is what the caller
+    // is memory. Zero means "no figure to report", which the caller
     // does with an unraisable limit anyway.
     #[cfg(not(unix))]
     0

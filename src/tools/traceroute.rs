@@ -81,7 +81,7 @@ struct Hop {
 
 /// How many TTLs are probed at once. The TTL is a socket setting, but it is
 /// applied under the same lock as the write that uses it, so probes at
-/// different TTLs can safely overlap — and overlapping them is the difference
+/// different TTLs can safely overlap, and overlapping them is the difference
 /// between a trace that takes two seconds and one that takes a minute.
 const PARALLEL_HOPS: usize = 8;
 
@@ -267,7 +267,7 @@ async fn emit_row(emit: &Emitter, hop: Hop, target: IpAddr, resolve: bool) {
 }
 
 /// Renders each probe's round trip followed by a star for every one that never
-/// came back, which is how traceroute has always shown loss.
+/// came back, as traceroute has always shown loss.
 fn format_rtts(hop: &Hop) -> String {
     let mut parts: Vec<String> =
         hop.rtts.iter().map(|r| ms(*r).trim_end_matches(" ms").to_string()).collect();

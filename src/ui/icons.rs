@@ -55,6 +55,10 @@ icons![
     "folder",
     "note",
     "compare",
+    "bell",
+    "variables",
+    "check",
+    "alert",
 ];
 
 /// Serves the icons to GPUI's SVG renderer.

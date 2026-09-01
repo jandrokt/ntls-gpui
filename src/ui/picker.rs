@@ -1,8 +1,8 @@
 //! A searchable list, shown over the window.
 //!
 //! The command bar is the right shape for choosing one thing out of many, so
-//! anything else that has to — which run to compare against, which folder to
-//! move a tool into — borrows it rather than growing a submenu that becomes
+//! anything else that has to (which run to compare against, which folder to
+//! move a tool into) borrows it without growing a submenu that becomes
 //! unusable at twenty entries.
 
 use gpui::{AppContext, Context, Entity, Window};
@@ -19,7 +19,7 @@ pub struct Choice {
     pub detail: String,
 }
 
-/// What a picker is for, which is what the caller does with the answer.
+/// What a picker is for, and what the caller does with the answer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Purpose {
     /// Choose another run to read the given one against.

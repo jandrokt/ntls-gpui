@@ -2,7 +2,7 @@
 //!
 //! A question about a network is rarely one tool: you sweep the subnet, pick a
 //! host out of it, scan its ports, look up its name. A workspace holds all of
-//! that together — every tool you have pointed at the same thing — and the
+//! that together (every tool you have pointed at the same thing) and the
 //! side bar lists the investigations, while the editor's tabs list the tools
 //! inside whichever one is open.
 
@@ -15,7 +15,7 @@ use super::job::{Job, State};
 use super::store::{self, Tag, WorkspaceRecord};
 
 /// Where a tool sits in its own life. The side bar groups by this, so the
-/// three questions — what have I set up, what is working, what did I find —
+/// three questions: what have I set up, what is working, what did I find.
 /// each have their own place.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 pub enum Stage {
@@ -49,9 +49,9 @@ impl Stage {
 /// A group in the side bar: the things listed under one heading.
 ///
 /// The tools are grouped by the stage they are at; documents and workflows are
-/// groups of their own. Anything that can be done to a whole heading — empty
-/// it, ask before emptying it — is done to one of these, so all three headings
-/// behave the same way rather than the tools having the only one that works.
+/// groups of their own. Anything done to a whole heading (empty it, ask before
+/// emptying it) goes through one of these, so all three headings
+/// behave the same way instead of the tools having the only one that works.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Group {
     Stage(Stage),
@@ -70,7 +70,7 @@ impl Group {
 
     /// What emptying it does, in the word the heading shows.
     ///
-    /// Running tools are stopped rather than thrown away; everything else in a
+    /// Running tools are stopped, not thrown away; everything else in a
     /// group is a file, and emptying it retires those files.
     pub fn is_stop(self) -> bool {
         matches!(self, Group::Stage(Stage::Running))
@@ -111,8 +111,8 @@ pub struct Workspace {
     pub marks: BTreeMap<String, store::Mark>,
     /// The workspace's variables.
     ///
-    /// One name to one piece of text — or to a formula that works one out —
-    /// belonging to the investigation rather than to any run in it: written by
+    /// One name to one piece of text, or to a formula that works one out,
+    /// belonging to the investigation instead of to any run in it: written by
     /// hand in the side bar, or set by a workflow as it goes, and read by
     /// every document, condition and workflow in the workspace.
     pub vars: BTreeMap<String, store::Var>,
@@ -285,7 +285,7 @@ impl Workspace {
             }
         }
         // The most-used target wins; ties go to whichever was opened first,
-        // which is the one the investigation started from.
+        // the one the investigation started from.
         counts
             .into_iter()
             .max_by_key(|(_, n)| *n)
@@ -322,7 +322,7 @@ impl Workspace {
         jobs
     }
 
-    /// The same, inside one folder — or in the workspace itself, for `None`.
+    /// The same, inside one folder, or in the workspace itself for `None`.
     pub fn stage_in(&self, folder: Option<&str>, stage: Stage) -> Vec<&Job> {
         let mut jobs: Vec<&Job> = self
             .jobs
@@ -333,7 +333,7 @@ impl Workspace {
         jobs
     }
 
-    /// The documents in one folder — or in the workspace root for `None`.
+    /// The documents in one folder, or in the workspace root for `None`.
     pub fn docs_in(&self, folder: Option<&str>) -> Vec<&super::notes::Doc> {
         self.docs
             .iter()
@@ -341,7 +341,7 @@ impl Workspace {
             .collect()
     }
 
-    /// The workflows in one folder — or in the workspace root for `None`.
+    /// The workflows in one folder, or in the workspace root for `None`.
     pub fn flows_in(&self, folder: Option<&str>) -> Vec<&super::flows::Sheet> {
         self.flows
             .iter()

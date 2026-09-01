@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Wraps an already-built binary in ntls.app.
 #
-#   packaging/macos/bundle.sh <binary> <output-dir> [version]
+#   packaging/macos/bundle.sh <binary> <output-dir> [build]
 #
-# Writes <output-dir>/ntls.app.
+# Writes <output-dir>/ntls.app. `build` is the build number that ntls calls
+# itself by. macOS wants two version strings; both get that number.
 set -euo pipefail
 
-binary="${1:?usage: bundle.sh <binary> <output-dir> [version]}"
-out="${2:?usage: bundle.sh <binary> <output-dir> [version]}"
-version="${3:-0.1.0}"
+binary="${1:?usage: bundle.sh <binary> <output-dir> [build]}"
+out="${2:?usage: bundle.sh <binary> <output-dir> [build]}"
+build="${3:-0}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 app="$out/ntls.app"
@@ -36,9 +37,9 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key>
     <string>ntls</string>
     <key>CFBundleVersion</key>
-    <string>$version</string>
+    <string>$build</string>
     <key>CFBundleShortVersionString</key>
-    <string>$version</string>
+    <string>$build</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>

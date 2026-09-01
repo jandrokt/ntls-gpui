@@ -28,7 +28,7 @@ impl Transfer {
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Called with the bytes moved since the previous call and the interval they
-/// were moved in, which is what feeds the live chart.
+/// were moved in. That feeds the live chart.
 pub type Sampler = Arc<dyn Fn(u64, Duration) + Send + Sync>;
 
 /// Measures throughput against an HTTP endpoint.
@@ -184,7 +184,7 @@ impl SpeedClient {
         }
     }
 
-    /// Measures request round trips, which is what shows up as lag even on a
+    /// Measures request round trips, the lag you notice even on a
     /// fast link.
     pub async fn latency(
         &self,

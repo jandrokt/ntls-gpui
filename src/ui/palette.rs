@@ -1,6 +1,6 @@
 //! The command bar: search, and the command line behind it.
 //!
-//! Anything typed is first a search across everything open — see
+//! Anything typed is first a search across everything open; see
 //! [`super::search`]. Once the first word names a tool and is followed by a
 //! space, it is a command instead: `ping 1.1.1.1`, `portscan 10.0.0.1
 //! ports=top`, `download https://… parallel=4`. The first word picks the tool,
@@ -37,8 +37,8 @@ impl Palette {
         }
     }
 
-    /// Clears the box and puts the caret in it, which is what opening should
-    /// always do — a palette that remembers your last search is a palette you
+    /// Clears the box and puts the caret in it, which opening should
+    /// always do. A palette that remembers your last search is one you
     /// have to clear first.
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cursor = 0;
@@ -94,7 +94,7 @@ fn tail(query: &str) -> &str {
     query.split_whitespace().next_back().unwrap_or("")
 }
 
-/// The tool the query names, once the first word has been finished — either by
+/// The tool the query names, once the first word is finished, either by
 /// a space after it or by naming a tool exactly.
 pub fn tool_of(query: &str, registry: &Registry) -> Option<Arc<dyn Tool>> {
     tool_settled(query, registry)
@@ -110,7 +110,7 @@ fn tool_settled(query: &str, registry: &Registry) -> Option<Arc<dyn Tool>> {
 /// What to offer for what has been typed so far.
 ///
 /// Three things, in the order a command is written: which tool, which of its
-/// settings, and — once a setting is named — which values it takes.
+/// settings, and, once a setting is named, which values it takes.
 pub fn suggest(query: &str, registry: &Registry, hits: Vec<super::search::Hit>) -> Suggest {
     let Some(tool) = tool_settled(query, registry) else {
         return Suggest::Search(hits);
@@ -119,7 +119,7 @@ pub fn suggest(query: &str, registry: &Registry, hits: Vec<super::search::Hit>) 
     let tail = tail(query);
     let fields = tool.fields();
 
-        // `key=` — the values that setting accepts.
+        // `key=`: the values that setting accepts.
         if let Some((key, typed)) = tail.split_once('=')
             && let Some(field) = fields.iter().find(|f| f.key.eq_ignore_ascii_case(key))
         {
@@ -298,15 +298,15 @@ impl<'a> Command<'a> {
         !self.bare.is_empty() || !self.named.is_empty()
     }
 
-    /// The bare words joined back up, which is what a target field wants: one
+    /// The bare words joined back up: what a target field wants, one
     /// host, or a list of links.
     pub fn target(&self) -> String {
         self.bare.join(" ")
     }
 }
 
-/// A field key is a bare identifier. Anything else — a host, a URL, a port
-/// range — is a value that happens to contain an equals sign.
+/// A field key is a bare identifier. Anything else (a host, a URL, a port
+/// range) is a value that happens to contain an equals sign.
 fn is_key(word: &str) -> bool {
     !word.is_empty()
         && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -341,7 +341,7 @@ mod tests {
         let r = registry();
         assert_eq!(complete("por", 0, &r).as_deref(), Some("portscan "));
         // With a space after it, the tool has settled and the settings come
-        // next — so tab no longer rewrites the name.
+        // next, so tab no longer rewrites the name.
         assert!(complete("portscan ", 0, &r).is_some_and(|c| c.starts_with("portscan ")));
     }
 

@@ -68,12 +68,19 @@ pub struct Series {
 }
 
 /// How many samples a chart keeps. Past this the oldest fall off the left,
-/// which is what a live graph should do.
+/// the way a live graph should.
 const MAX_SAMPLES: usize = 1200;
 
 /// How many log lines are kept. A wide scan can log thousands and only the
 /// recent ones are ever read.
 const MAX_LOG: usize = 2000;
+
+/// One end of a table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum End {
+    Top,
+    Bottom,
+}
 
 /// A message from the running tool, or the news that it has stopped.
 pub enum Msg {
@@ -88,7 +95,7 @@ pub struct Job {
     pub state: State,
 
     /// The name the user gave this run, so two port scans in one workspace can
-    /// be told apart by what they are for rather than by what they are.
+    /// be told apart by what they are for instead of by what they are.
     pub title: Option<String>,
     /// A Finder-style colour, for the ones worth spotting at a glance.
     pub tag: Tag,
@@ -104,7 +111,7 @@ pub struct Job {
 
     /// The widest cell seen in each column, in characters. Column widths are
     /// derived from this so a column never reserves room for text that is
-    /// never there — until the user drags one, after which their width wins.
+    /// never there. Once the user drags one, their width wins.
     pub content_width: Vec<usize>,
     /// Widths the user set by dragging, in pixels.
     pub column_override: Vec<Option<f32>>,
@@ -119,7 +126,7 @@ pub struct Job {
     pub filter_revision: usize,
     pub filter: String,
     /// The column to sort on and whether it is descending. `None` keeps
-    /// arrival order, which is usually what you want while a scan is running.
+    /// arrival order, usually what you want while a scan is running.
     pub sort: Option<(usize, bool)>,
     pub selected: Option<usize>,
     /// Whether it has a tab in the editor. Closing the tab clears this; it is
@@ -127,7 +134,7 @@ pub struct Job {
     pub open: bool,
     /// The folder inside the workspace its file sits in, if any. A folder is
     /// a way of grouping; the stage the tool is at still orders it, inside the
-    /// folder rather than instead of it.
+    /// folder and not across the workspace.
     pub folder: Option<String>,
     /// Another run of the same tool this one is being read against. Runtime
     /// only: a comparison is a way of looking, not part of the result.
@@ -139,6 +146,9 @@ pub struct Job {
     pub field_error: Option<(usize, String)>,
 
     pub table_scroll: UniformListScrollHandle,
+    /// How many lines the table had when it was last painted, so a run that
+    /// has just added some can be followed.
+    shown: usize,
     pub log_scroll: ScrollHandle,
     /// Whether the log should stick to the newest line.
     pub log_follow: bool,
@@ -196,6 +206,7 @@ impl Job {
             chart_expanded: false,
             field_error: None,
             table_scroll: UniformListScrollHandle::new(),
+            shown: 0,
             log_scroll: ScrollHandle::new(),
             log_follow: true,
             view: Vec::new(),
@@ -270,7 +281,7 @@ impl Job {
             }
         }
         // A restored run has results to read, so the form starts out of the
-        // way rather than covering them.
+        // way, not covering them.
         self.show_form = self.state == State::Setup;
         self.restored_elapsed = record.elapsed;
         self.view_dirty = true;
@@ -279,8 +290,8 @@ impl Job {
     /// What the tab strip and the hub show next to the tool's name.
     ///
     /// A target field the tool is currently hiding does not describe this job
-    /// — the speed test against Cloudflare is not a job "about" whatever is in
-    /// the custom URL box — so the nearest visible choice stands in instead.
+    /// The speed test against Cloudflare is not a job "about" whatever is in
+    /// the custom URL box, so the nearest visible choice stands in instead.
     pub fn target(&self) -> String {
         let fields = self.tool.fields();
         if let Some(f) = fields.iter().find(|f| f.role == Role::Target)
@@ -318,7 +329,7 @@ impl Job {
     }
 
     /// Clears what a previous run said about itself while leaving the table
-    /// it built, for a run that is adding to it rather than replacing it.
+    /// it built, for a run that is adding to it, not replacing it.
     ///
     /// The log, the figures and the graph all describe one run and would read
     /// as nonsense spliced together; the rows are a record of what is out
@@ -332,7 +343,7 @@ impl Job {
     }
 
     /// Clears everything a previous run produced, so a re-run starts from a
-    /// clean table rather than appending to the old one.
+    /// clean table and does not append to the old one.
     pub fn reset_output(&mut self) {
         self.rows.clear();
         self.log.clear();
@@ -345,7 +356,7 @@ impl Job {
         self.set_filter(String::new());
     }
 
-    /// Widens the remembered content width to fit a row, which is what the
+    /// Widens the remembered content width to fit a row, which the
     /// table sizes its columns from.
     fn widen(&mut self, row: &Row) {
         for (i, cell) in row.cells.iter().enumerate() {
@@ -373,14 +384,15 @@ impl Job {
             Event::Upsert(row) => {
                 self.widen(&row);
                 // What counts as the same row is the row's own idea of its
-                // identity, which is its target unless it says otherwise.
+                // identity: its target, unless it says otherwise.
                 match self.rows.iter_mut().find(|r| r.identity() == row.identity()) {
                     // Rewriting a row in place must not disturb the order the
                     // table is sorted or filtered into, so the view is only
                     // marked stale when a row is genuinely new.
                     Some(existing) => *existing = row,
                     None => {
-                        self.rows.push(row);
+                        let at = place(&self.rows, &row.target);
+                        self.rows.insert(at, row);
                         self.view_dirty = true;
                     }
                 }
@@ -457,6 +469,50 @@ impl Job {
         }
     }
 
+    /// Which end of the table is being read, when it is one of them.
+    ///
+    /// A scan that is still going adds lines while you are reading, and where
+    /// they appear depends on how the table is sorted. Staying put at either
+    /// end is what makes a live table readable: at the bottom you watch what
+    /// arrives, at the top you watch what arrives, and anywhere in between you
+    /// are reading something and nothing should move.
+    pub fn end_in_view(&self) -> Option<End> {
+        let state = self.table_scroll.0.borrow();
+        let offset = state.base_handle.offset().y;
+        let max = state.base_handle.max_offset().height;
+        // Nothing to scroll: both ends are in view, and the bottom is the one
+        // worth following.
+        if max <= gpui::px(1.) {
+            return Some(End::Bottom);
+        }
+        let from_top = -offset;
+        if from_top <= gpui::px(2.) {
+            return Some(End::Top);
+        }
+        if from_top >= max - gpui::px(2.) {
+            return Some(End::Bottom);
+        }
+        None
+    }
+
+    /// Follows the end that was in view, if the table has grown since the last
+    /// frame.
+    pub fn follow(&mut self, end: Option<End>) {
+        let lines = self.view_len();
+        let grew = lines > self.shown;
+        self.shown = lines;
+        if !grew || lines == 0 {
+            return;
+        }
+        match end {
+            Some(End::Bottom) => {
+                self.table_scroll.scroll_to_item(lines - 1, gpui::ScrollStrategy::Bottom)
+            }
+            Some(End::Top) => self.table_scroll.scroll_to_item(0, gpui::ScrollStrategy::Top),
+            None => {}
+        }
+    }
+
     /// The row the selection points at, if any.
     pub fn selected_row(&mut self) -> Option<&Row> {
         let selected = self.selected?;
@@ -507,7 +563,7 @@ impl Job {
         parts.join("  ·  ")
     }
 
-    /// How many log lines were good, worrying and wrong, which is what the
+    /// How many log lines were good, worrying and wrong, which the
     /// output panel puts in its header.
     pub fn log_counts(&self) -> (usize, usize, usize) {
         let count = |want: Level| self.log.iter().filter(|l| l.level == want).count();
@@ -526,7 +582,7 @@ impl Job {
 ///
 /// A host or a subnet is already short. A pasted link is not, and a whole URL
 /// in a tab pushes everything else off the strip, so it is shown as the site
-/// it points at — and a list of links as how many there are.
+/// it points at, and a list of links as how many there are.
 fn shorten(target: &str) -> String {
     let links: Vec<&str> = target.split_whitespace().filter(|s| !s.is_empty()).collect();
     if links.len() > 1 && links.iter().all(|l| l.contains("://") || l.contains('.')) {
@@ -540,6 +596,19 @@ fn shorten(target: &str) -> String {
         Some(bare) if !bare.is_empty() => bare.to_string(),
         _ if host.is_empty() => target.to_string(),
         _ => host.to_string(),
+    }
+}
+
+/// Where a new row about `target` belongs.
+///
+/// A second row about something the table already has a row about goes next to
+/// it instead of at the bottom: the two devices that have answered on one
+/// address are only worth keeping both of if they can be read against each
+/// other. Anything genuinely new goes at the end, in arrival order.
+fn place(rows: &[Row], target: &str) -> usize {
+    match rows.iter().rposition(|r| r.target == target) {
+        Some(beside) => beside + 1,
+        None => rows.len(),
     }
 }
 
@@ -582,7 +651,22 @@ fn leading_number(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::shorten;
+    use super::{Row, place, shorten};
+
+    fn row(target: &str) -> Row {
+        Row { target: target.into(), ..Row::default() }
+    }
+
+    #[test]
+    fn a_second_device_on_one_address_lands_beside_the_first() {
+        let rows = vec![row("10.0.0.1"), row("10.0.0.2"), row("10.0.0.3")];
+        assert_eq!(place(&rows, "10.0.0.1"), 1);
+        // Behind every row already about it, not in the middle of them.
+        let two = vec![row("10.0.0.1"), row("10.0.0.1"), row("10.0.0.2")];
+        assert_eq!(place(&two, "10.0.0.1"), 2);
+        // And something new goes where new things go.
+        assert_eq!(place(&rows, "10.0.0.9"), 3);
+    }
 
     #[test]
     fn a_pasted_link_is_shown_as_the_site_it_points_at() {

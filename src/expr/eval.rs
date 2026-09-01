@@ -11,11 +11,11 @@ pub trait Source {
     /// name first and the tool's title second.
     fn table(&self, name: &str) -> Option<Arc<Table>>;
     /// Every tool in scope, for `tools()` and for a name that names a tool
-    /// type rather than a run.
+    /// type instead of a run.
     fn tables(&self) -> Vec<Arc<Table>>;
     /// A variable of the workspace, by name.
     ///
-    /// A source that has none — a document evaluated on its own, a test —
+    /// A source that has none (a document evaluated on its own, a test)
     /// says so by saying nothing, and every name goes on being a run.
     fn var(&self, _name: &str) -> Option<String> {
         None
@@ -75,7 +75,7 @@ pub fn eval(expr: &Expr, source: &dyn Source) -> Result<Value, String> {
 
 /// What is being asked about, where something is being asked about it.
 ///
-/// A run is normally named as a bare word — `Router.rtt` — but a run called
+/// A run is normally named as a bare word, `Router.rtt`, but a run called
 /// `IP scan` cannot be written that way, and most runs are called what their
 /// tool is called. So a quoted name in front of a dot names the run too, and
 /// `"IP scan".up` reads as well as `tool("IP scan").up` did.
@@ -252,7 +252,7 @@ fn call(name: &str, args: &[Value], source: &dyn Source) -> Result<Value, String
             percentile(numbers(), want)
         }
 
-        // Shaping a list shapes what is in it, which is what `rtt.fixed(1)`
+        // Shaping a list shapes what is in it, so `rtt.fixed(1)`
         // has to mean if it is to mean anything.
         "round" => shape(first, "round", |n| Value::Number(n.round()))?,
         "floor" => shape(first, "floor", |n| Value::Number(n.floor()))?,
@@ -291,7 +291,7 @@ fn call(name: &str, args: &[Value], source: &dyn Source) -> Result<Value, String
             }
         }
         // The explicit forms, for a column or a figure whose name is not
-        // something that can be written after a dot — `#`, say.
+        // something that can be written after a dot, `#` say.
         "col" | "column" => match (first, args.get(1)) {
             (Some(Value::Table(t)), Some(name)) => {
                 t.column(&name.show()).unwrap_or(Value::Nothing)
@@ -336,7 +336,7 @@ fn call(name: &str, args: &[Value], source: &dyn Source) -> Result<Value, String
     })
 }
 
-/// Applies a function to a number — or to each number in a list, which is
+/// Applies a function to a number, or to each number in a list, which is
 /// what a column is.
 fn shape(
     value: Option<&Value>,
@@ -380,8 +380,8 @@ fn pick(numbers: Vec<f64>, args: &[Value], choose: fn(f64, f64) -> f64) -> Value
 }
 
 /// The percentile by linear interpolation between the two ranks it falls
-/// between — the definition a spreadsheet uses, so the median of an even
-/// number of samples is the midpoint of the middle two rather than one of
+/// between: the definition a spreadsheet uses, so the median of an even
+/// number of samples is the midpoint of the middle two instead of one of
 /// them.
 fn percentile(mut numbers: Vec<f64>, want: f64) -> Value {
     if numbers.is_empty() {
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn a_run_whose_name_has_a_space_is_named_in_quotes() {
         // Most runs are called what their tool is called, and half the tools
-        // are two words — so this is the common case, not the awkward one.
+        // are two words, so this is the common case, not the awkward one.
         let source = Spaced(Arc::new(Table {
             name: "IP scan".into(),
             tool: "ipscan".into(),
@@ -472,7 +472,7 @@ mod tests {
         assert_eq!(value(r#""ip scan".up"#), "2", "however it is capitalised");
         // The long way round still works, and means the same thing.
         assert_eq!(value(r#"tool("IP scan").rows"#), "2");
-        // A name that is not there says so, rather than complaining about
+        // A name that is not there says so, and does not complain about
         // text having no fields.
         let missing = run(r#""Nowhere".rows"#, &source).expect_err("an error");
         assert!(missing.contains("Nowhere"), "{missing}");
@@ -531,7 +531,7 @@ mod tests {
     }
 
     /// A sweep of the forms someone would reasonably write, so that a method
-    /// that does not work is found here rather than in a document.
+    /// that does not work is found here instead of in a document.
     #[test]
     fn the_ways_a_figure_gets_written_all_work() {
         let source = source();

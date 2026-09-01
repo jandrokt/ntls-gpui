@@ -3,10 +3,11 @@
 ; One executable and its shortcuts. Workspaces live in Documents, and the only
 ; registry keys are the ones an uninstaller needs.
 ;
-;   iscc /DVersion=0.1.0 /DBinary=path\to\ntls.exe packaging\windows\ntls.iss
+;   iscc /DBuild=412 /DBinary=path\to\ntls.exe packaging\windows\ntls.iss
 
-#ifndef Version
-  #define Version "0.1.0"
+; ntls counts builds, not versions, so this is a plain number.
+#ifndef Build
+  #define Build "0"
 #endif
 #ifndef Binary
   #define Binary "..\..\target\release\ntls.exe"
@@ -17,7 +18,7 @@
 #ifndef Arch
   #define Arch "x64"
 #endif
-; Which machines this build will install on. Passed in rather than worked out
+; Which machines this build will install on. Passed in and not worked out
 ; here, so the installer script has no idea what a target triple is.
 #ifndef Architectures
   #define Architectures "x64compatible"
@@ -26,14 +27,17 @@
 [Setup]
 AppId={{7F6C4E2A-9F3B-4E1D-9E28-6E0B2C4B4E11}
 AppName=ntls
-AppVersion={#Version}
+AppVersion={#Build}
+; Windows itself wants a numeric file version in the resource, whatever the
+; program calls itself, so the build number is given one to sit in.
+VersionInfoVersion=0.0.{#Build}
 AppPublisher=ntls
 DefaultDirName={autopf}\ntls
 DefaultGroupName=ntls
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\ntls.exe
 OutputDir={#OutDir}
-OutputBaseFilename=ntls-{#Version}-windows-{#Arch}-setup
+OutputBaseFilename=ntls-{#Build}-windows-{#Arch}-setup
 SetupIconFile=..\icon\ntls.ico
 Compression=lzma2
 SolidCompression=yes

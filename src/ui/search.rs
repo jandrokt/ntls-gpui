@@ -168,7 +168,7 @@ pub fn search(
         for job in &ws.jobs {
             let (name, target) = (job.name(), job.target());
             // A tool matched by what it is pointed at is usually what was
-            // being looked for, so it ranks with a name match rather than
+            // being looked for, so it ranks with a name match and not
             // below it.
             if let Some(rank) =
                 rank_of(&name.to_lowercase(), &needle).or(rank_of(&target.to_lowercase(), &needle))
@@ -186,7 +186,7 @@ pub fn search(
                 );
             }
 
-            // And the rows themselves, which is what makes an address
+            // And the rows themselves, so an address becomes
             // findable long after the scan that found it.
             let mut taken = 0;
             for (row_index, row) in job.rows.iter().enumerate() {
@@ -220,7 +220,7 @@ pub fn search(
     }
 
     // The documents and workflows a workspace holds, which are as much a part
-    // of an investigation as the runs are — by what they are called, by their
+    // of an investigation as the runs are: by what they are called, by their
     // file name, and by the line they open with.
     for (index, ws) in workspaces.iter().enumerate() {
         let elsewhere = if index == active { String::new() } else { format!(" · {}", ws.name()) };

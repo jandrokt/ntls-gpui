@@ -20,8 +20,8 @@ pub enum Cells {
     #[default]
     Text,
     /// The cell is a fraction between 0 and 1, drawn as a filled bar with the
-    /// percentage beside it. A tool that tracks work in flight — a transfer,
-    /// an upload — gets a bar per row without the interface knowing what the
+    /// percentage beside it. A tool that tracks work in flight (a transfer,
+    /// an upload) gets a bar per row without the interface knowing what the
     /// work is.
     Bar,
 }
@@ -110,19 +110,24 @@ pub struct Run {
     /// A tool that works through a list only needs [`Run::done`]; a tool that
     /// measures one thing over time needs to know what it measured, so that a
     /// resumed run continues the sequence and the summary counts everything
-    /// rather than starting over halfway down the table.
+    /// and does not start over halfway down the table.
     pub prior: Vec<super::event::Row>,
     /// This run is adding to a table earlier runs of the same job left behind,
-    /// rather than carrying on from one that was interrupted.
+    /// and is not carrying on from one that was interrupted.
     ///
     /// Everything in [`Run::prior`] is still on screen and stays there. The
-    /// whole target list is probed again — nothing is skipped — and what is
+    /// whole target list is probed again, nothing is skipped, and what is
     /// found either rewrites the row it is about or joins it, which is the
     /// difference between a scan and a record of a network over time.
     pub keep: bool,
 }
 
 impl Run {
+    /// A run with nothing behind it. The interface always says what it means
+    /// A run that keeps what earlier ones found is keeping from the first one,
+    /// whose table is empty, so this is for the tests, which drive a
+    /// tool on its own.
+    #[cfg(test)]
     pub fn fresh(cancel: Cancel, params: Params) -> Run {
         Run {
             cancel,
@@ -159,7 +164,7 @@ pub trait Tool: Send + Sync + 'static {
     fn columns(&self) -> Vec<Column>;
     /// Whether an interrupted run can be picked up where it stopped.
     ///
-    /// True for the tools that work through a list — a subnet, a port range —
+    /// True for the tools that work through a list, a subnet or a port range,
     /// and can be told which entries are already accounted for. A tool that
     /// measures one thing over time has nothing to resume.
     fn resumable(&self) -> bool {
@@ -183,7 +188,7 @@ pub trait Tool: Send + Sync + 'static {
     /// The key of the switch that says a run should add to what earlier runs
     /// of the same job found, if the tool has one.
     ///
-    /// The interface reads this rather than knowing which tools accumulate:
+    /// The interface reads this and does not know which tools accumulate:
     /// a tool declares the switch and gets the behaviour, the same way it
     /// declares a target and gets the hand-offs.
     fn keep_key(&self) -> Option<&'static str> {

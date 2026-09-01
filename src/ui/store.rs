@@ -3,8 +3,8 @@
 //! A workspace is a directory and every tool in it is a file, so what the
 //! application shows is a view of something you can also open in Finder, back
 //! up, or delete by hand. Closing a tool deletes its file; closing a workspace
-//! deletes its directory. Everything else — the results, the notes, the names
-//! and colours — is written as it changes and read back at startup.
+//! deletes its directory. Everything else (the results, the notes, the names
+//! and colours) is written as it changes and read back at startup.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ impl Tag {
         }
     }
 
-    /// The swatch, which is also what tints a row in the rail.
+    /// The swatch, and the tint on a row in the rail.
     pub fn color(self) -> Option<gpui::Hsla> {
         let rgb = match self {
             Tag::None => return None,
@@ -74,7 +74,7 @@ pub struct JobRecord {
     #[serde(default)]
     pub favorite: bool,
     /// Whether it had a tab in the editor. A tool with no tab is still in the
-    /// workspace and still on disk — it is just not in front of you.
+    /// workspace and still on disk, just not in front of you.
     #[serde(default = "yes")]
     pub open: bool,
     pub params: Params,
@@ -129,7 +129,7 @@ pub struct WorkspaceRecord {
     pub name: String,
     #[serde(default)]
     pub tag: Tag,
-    /// Notes keyed by the thing they are about — an address, a hostname, a
+    /// Notes keyed by the thing they are about: an address, a hostname, a
     /// `host:port`. A note follows its subject between tools, so a remark made
     /// while reading a sweep is still there in the port scan.
     #[serde(default)]
@@ -142,7 +142,7 @@ pub struct WorkspaceRecord {
     /// read.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub vars: BTreeMap<String, StoredVar>,
-    /// What has been said about the documents and workflows, by file stem —
+    /// What has been said about the documents and workflows, by file stem:
     /// a colour and whether it is a favourite.
     ///
     /// A tool keeps this in its own file; a document is a markdown file and a
@@ -154,11 +154,9 @@ pub struct WorkspaceRecord {
 
 /// One variable of a workspace.
 ///
-/// Either a piece of text, or a formula — an expression worked out against the
-/// runs and the other variables every time it is read. The difference is the
-/// difference between a fact somebody wrote down and one that stays current:
-/// `set` in a workflow freezes what was true at that step, and a formula does
-/// not.
+/// Either a piece of text, or a formula: an expression worked out against the
+/// runs and the other variables every time it is read. A `set` step in a
+/// workflow freezes what was true at that step; a formula stays current.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Var {
     /// The text, or the expression when this is a formula.
@@ -225,13 +223,13 @@ impl Mark {
 }
 
 /// Rows and log lines are capped so a 65,000-port scan does not write a file
-/// nobody can open. What is kept is what fits on a screen many times over.
+/// too large to open. What is kept still fills a screen many times over.
 const MAX_SAVED_ROWS: usize = 50_000;
 const MAX_SAVED_LOG: usize = 2_000;
 
 /// Where workspaces live.
 ///
-/// `~/Documents/ntls` rather than a hidden application-support folder,
+/// `~/Documents/ntls` instead of a hidden application-support folder,
 /// because a workspace being a real directory is only useful if you can find
 /// it.
 pub fn root() -> PathBuf {
@@ -270,8 +268,8 @@ pub fn slugify(name: &str) -> String {
         }
     }
     // A run of dots is how a path climbs out of its directory. One dot is a
-    // legitimate part of a name — `192.168.1.0-24` — so runs are collapsed
-    // rather than the character being banned.
+    // legitimate part of a name (`192.168.1.0-24`), so runs get collapsed
+    // instead of the character being banned.
     let mut out = out.trim_matches(['-', '.']).to_string();
     while out.contains("..") {
         out = out.replace("..", ".");
@@ -304,8 +302,8 @@ pub fn read_workspace(dir: &Path) -> Option<WorkspaceRecord> {
 
 /// Where a tool's file lives: in the workspace, or in a folder inside it.
 ///
-/// A folder is one level deep and is only a way of grouping — the stage a tool
-/// is at is still what orders it, inside the folder rather than instead of it.
+/// A folder is one level deep and only a way of grouping. The stage a tool is
+/// at still orders it, inside the folder and not across the workspace.
 pub fn job_path_in(dir: &Path, folder: Option<&str>, stem: &str) -> PathBuf {
     match folder {
         Some(folder) => {
@@ -352,10 +350,10 @@ fn write_job_at(path: &Path, record: &JobRecord) -> std::io::Result<()> {
 }
 
 /// Retires a tool: its file is moved into the workspace's own `.closed`
-/// folder rather than deleted.
+/// folder, not deleted.
 ///
 /// A tool is a file, and a file is not something a click should destroy. It is
-/// moved rather than left in place so that reopening the workspace does not
+/// moved and not left in place, so reopening the workspace does not
 /// bring back everything ever removed from it.
 pub fn remove_job_in(dir: &Path, folder: Option<&str>, stem: &str) {
     let path = job_path_in(dir, folder, stem);
@@ -379,10 +377,10 @@ pub fn remove_job_in(dir: &Path, folder: Option<&str>, stem: &str) {
     let _ = std::fs::rename(&path, &destination);
 }
 
-/// Retires any other file a workspace holds — a document, a workflow — the
-/// same way, and to the same place.
+/// Retires any other file a workspace holds (a document, a workflow) the same
+/// way, and to the same place.
 ///
-/// The same rule as a tool: it is moved into `.closed` rather than deleted,
+/// The same rule as a tool: it is moved into `.closed`, not deleted,
 /// because a file is not something one click should destroy, and reopening the
 /// workspace must not bring back everything ever removed from it.
 pub fn remove_file(path: &Path, dir: &Path) {
@@ -417,20 +415,144 @@ fn yes() -> bool {
     true
 }
 
-/// Settings that belong to the application rather than to any one workspace.
+/// Which of the two cuts of the palette to use, or neither.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ThemeChoice {
+    /// Whatever the desktop is set to, and it changes when the desktop does.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeChoice {
+    pub const ALL: [ThemeChoice; 3] = [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeChoice::System => "System",
+            ThemeChoice::Light => "Light",
+            ThemeChoice::Dark => "Dark",
+        }
+    }
+}
+
+/// Settings that belong to the application instead of to any one workspace.
 ///
 /// It lives in the workspace root as a hidden file, so a workspace directory
-/// stays a directory of tools and nothing else.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// stays a directory of tools and nothing else. Everything in it has a
+/// `serde` default, so a file written by an earlier version opens and a file
+/// written by a later one does not stop this one starting.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppState {
     /// Workspace directories that have been closed. They are still on disk and
     /// untouched; they are simply not opened at startup. Opening the folder
     /// again removes it from this list.
     #[serde(default)]
     pub closed: Vec<String>,
-    /// The interface new tools start on, when one has been chosen.
-    #[serde(default)]
+    /// The interface new tools started on, as versions before the settings
+    /// page wrote it. Read once and folded into `defaults`, where it
+    /// lives now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iface: Option<String>,
+    /// What a new tool starts with, by the key of the field it fills in.
+    ///
+    /// A settings page that named the tools it configured would need editing
+    /// every time one was added. This names fields instead: anything that
+    /// declares an `iface` starts on the chosen interface, anything that
+    /// declares a `method` starts on the chosen method, and a tool that
+    /// declares neither is unaffected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub defaults: BTreeMap<String, String>,
+    #[serde(default)]
+    pub theme: ThemeChoice,
+    /// Whether the interface moves when it changes. Off is for people who
+    /// would rather it did not, and for machines that would rather not.
+    #[serde(default = "yes")]
+    pub animate: bool,
+    /// Whether a run that has finished says so in the corner. Failures always
+    /// do.
+    #[serde(default = "yes")]
+    pub notify_runs: bool,
+    /// Whether anything shows itself in the corner at all. With this off the
+    /// bell still counts, and the list still holds everything.
+    #[serde(default = "yes")]
+    pub toasts: bool,
+    /// How long one stays there.
+    #[serde(default = "default_toast_seconds")]
+    pub toast_seconds: u64,
+    /// Whether a table that is scrolled to one end stays there as rows arrive.
+    #[serde(default = "yes")]
+    pub follow_results: bool,
+    /// Whether the output panel opens itself when a run fails.
+    #[serde(default = "yes")]
+    pub open_panel_on_failure: bool,
+    /// Whether the side bar comes back the way it was left.
+    #[serde(default = "yes")]
+    pub remember_layout: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_open: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<f32>,
+}
+
+impl Default for AppState {
+    fn default() -> AppState {
+        AppState {
+            closed: Vec::new(),
+            iface: None,
+            defaults: BTreeMap::new(),
+            theme: ThemeChoice::default(),
+            animate: true,
+            notify_runs: true,
+            toasts: true,
+            toast_seconds: default_toast_seconds(),
+            follow_results: true,
+            open_panel_on_failure: true,
+            remember_layout: true,
+            sidebar_open: None,
+            sidebar_width: None,
+        }
+    }
+}
+
+impl AppState {
+    /// Moves anything an older version wrote to where it is read from now.
+    fn migrated(mut self) -> AppState {
+        if let Some(iface) = self.iface.take()
+            && !iface.is_empty()
+        {
+            self.defaults.entry("iface".to_string()).or_insert(iface);
+        }
+        self
+    }
+
+    /// What a field starts on, when the settings have an opinion about it.
+    pub fn default_for(&self, key: &str) -> Option<&str> {
+        self.defaults.get(key).map(String::as_str).filter(|v| !v.is_empty())
+    }
+
+    /// Sets what a field starts on, or stops having an opinion about it.
+    pub fn set_default(&mut self, key: &str, value: Option<&str>) {
+        match value.filter(|v| !v.is_empty()) {
+            Some(v) => {
+                self.defaults.insert(key.to_string(), v.to_string());
+            }
+            None => {
+                self.defaults.remove(key);
+            }
+        }
+    }
+
+    pub fn toast_for(&self) -> Duration {
+        Duration::from_secs(self.toast_seconds.clamp(2, 60))
+    }
+}
+
+/// Long enough to read a line without looking up in a hurry, short enough not
+/// to sit over the results.
+fn default_toast_seconds() -> u64 {
+    6
 }
 
 fn state_path() -> PathBuf {
@@ -438,7 +560,7 @@ fn state_path() -> PathBuf {
 }
 
 pub fn read_state() -> AppState {
-    read_json(&state_path()).unwrap_or_default()
+    read_json::<AppState>(&state_path()).unwrap_or_default().migrated()
 }
 
 pub fn write_state(state: &AppState) {
@@ -490,14 +612,14 @@ pub fn load_all() -> Vec<Loaded> {
 /// Reads the tools in a workspace directory, including any folders inside it.
 ///
 /// It is separate from [`load_all`] because a directory can be opened as a
-/// workspace on its own — including one ntls did not write, which has tool
+/// workspace on its own, including one ntls did not write, which has tool
 /// files and no workspace file.
 pub fn load_jobs(dir: &Path) -> Vec<(Option<String>, String, JobRecord)> {
     let mut jobs = Vec::new();
     scan_jobs(dir, None, &mut jobs);
 
     // The workspace file remembers the order; anything it does not mention was
-    // added by hand — or dropped in — and goes at the end.
+    // added by hand or dropped in, and goes at the end.
     let order = read_workspace(dir).map(|r| r.order).unwrap_or_default();
     jobs.sort_by_key(|(_, stem, _)| order.iter().position(|s| s == stem).unwrap_or(usize::MAX));
     jobs
@@ -645,9 +767,8 @@ mod tests {
 
     #[test]
     fn a_removed_tool_is_moved_aside_and_not_destroyed() {
-        // A tool is a file, and a click that destroys a file is a click too
-        // powerful. Removing one puts it in the workspace's own `.closed`
-        // folder, where it is out of the way and still there.
+        // A tool is a file. Removing one puts it in the workspace's own
+        // `.closed` folder, out of the way and still there.
         let dir = super::root().join("ntls-remove-test");
         std::fs::create_dir_all(&dir).expect("the directory");
         std::fs::write(super::job_path(&dir, "001-ping"), "{}").expect("a file");
@@ -729,6 +850,39 @@ mod tests {
         assert_eq!(back.rows.len(), 1);
         assert_eq!(back.rows[0].target, "1.1.1.1");
         assert_eq!(back.charts[0].values, vec![1.0]);
+    }
+
+    #[test]
+    fn the_interface_an_older_version_chose_is_still_the_one_new_tools_start_on() {
+        // It used to have a field of its own; it is one of the field defaults
+        // now, and somebody who chose it last week should not have to choose
+        // it again.
+        let json = br#"{"closed":[],"iface":"en1"}"#;
+        let state: AppState = serde_json::from_slice(json).unwrap();
+        let state = state.migrated();
+        assert_eq!(state.default_for("iface"), Some("en1"));
+        assert_eq!(state.iface, None, "it is not written in two places");
+    }
+
+    #[test]
+    fn settings_a_file_does_not_mention_are_the_sensible_ones() {
+        let state: AppState = serde_json::from_slice(b"{}").unwrap();
+        assert!(state.toasts && state.notify_runs && state.remember_layout && state.animate);
+        assert_eq!(state.theme, ThemeChoice::System);
+        assert_eq!(state.toast_for(), Duration::from_secs(6));
+        assert_eq!(state.default_for("iface"), None);
+    }
+
+    #[test]
+    fn a_field_default_can_be_set_and_taken_away_again() {
+        let mut state = AppState::default();
+        state.set_default("method", Some("arp"));
+        assert_eq!(state.default_for("method"), Some("arp"));
+        state.set_default("method", None);
+        assert_eq!(state.default_for("method"), None);
+        // An empty value is not a choice, it is the absence of one.
+        state.set_default("method", Some(""));
+        assert_eq!(state.default_for("method"), None);
     }
 
     #[test]

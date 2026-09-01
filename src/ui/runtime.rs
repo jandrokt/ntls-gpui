@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 /// The runtime every tool runs on. One multi-threaded pool serves every open
-/// job, so a subnet sweep and a port scan share the same threads rather than
+/// job, so a subnet sweep and a port scan share the same threads and not
 /// each demanding their own.
 pub fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();

@@ -1,7 +1,7 @@
 //! What the editor offers to finish for you.
 //!
 //! A document's expressions and a workflow's steps both name things that exist
-//! — the runs in the workspace, their columns, their summary figures, and the
+//! the runs in the workspace, their columns, their summary figures, and the
 //! functions the expression language has. All of those are known, so none of
 //! them should have to be typed out or remembered.
 
@@ -23,7 +23,7 @@ fn candidate(text: &str, kind: &'static str, detail: impl Into<String>) -> Candi
     Candidate { text: text.to_string(), kind, detail: detail.into() }
 }
 
-/// What a list — which is what a column is — can be asked.
+/// What a list can be asked. A column is a list.
 const METHODS: [(&str, &str); 14] = [
     ("avg", "the mean"),
     ("min", "the smallest"),
@@ -106,7 +106,7 @@ pub fn context(language: Language, line: &str, at: usize) -> Context {
     }
 
     // A run whose name has a space in it is named in quotes, so the thing
-    // being asked about may be a quoted name rather than a bare word.
+    // being asked about may be a quoted name instead of a bare word.
     if let Some((subject, typed)) = quoted_subject(before) {
         return Context::Field { subject, typed };
     }
@@ -125,7 +125,7 @@ pub fn context(language: Language, line: &str, at: usize) -> Context {
     }
 }
 
-/// `"IP scan".ro` — the name in the quotes, and what has been typed after the
+/// `"IP scan".ro`: the name in the quotes, and what has been typed after the
 /// dot that follows them.
 fn quoted_subject(before: &str) -> Option<(String, String)> {
     let (head, typed) = before.rsplit_once('.')?;
@@ -199,7 +199,7 @@ pub fn candidates(context: &Context, tables: &[Table], vars: &[String]) -> Vec<C
                 .or_else(|| tables.iter().find(|t| t.tool.eq_ignore_ascii_case(subject)));
 
             // A run answers to its fields, its columns and its figures. A
-            // column is a list, and a list only answers to methods — offering
+            // column is a list, and a list only answers to methods. Offering
             // `up` after `Router.rtt.` would be nonsense.
             if let Some(table) = table {
                 for (name, detail) in FIELDS {
@@ -475,7 +475,7 @@ mod tests {
         let found = Context::Field { subject: "Router".into(), typed: String::new() };
         let offered = candidates(&found, &tables(), &[]);
         assert!(!offered.iter().any(|c| c.text == "#"));
-        // It is reached through `col` instead, which is offered.
+        // It is reached through `col` instead, which is.
         assert!(offered.iter().any(|c| c.text == "col"));
     }
 

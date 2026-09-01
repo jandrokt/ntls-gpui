@@ -1,6 +1,6 @@
 //! Turning tokens into an expression tree.
 //!
-//! A Pratt parser, so precedence is a number per operator rather than a
+//! A Pratt parser, so precedence is a number per operator and not a
 //! grammar rule per level.
 
 use super::lex::{Tok, lex};
@@ -13,7 +13,7 @@ pub enum Expr {
     Name(String),
     /// `subject.field`
     Field(Box<Expr>, String),
-    /// `subject[key]` — a list by position, a set of results by column name.
+    /// `subject[key]`: a list by position, a set of results by column name.
     Index(Box<Expr>, Box<Expr>),
     /// `name(args…)`, and `subject.name(args…)` with the subject first.
     Call(String, Vec<Expr>),
@@ -44,7 +44,7 @@ pub fn parse(source: &str) -> Result<Expr, String> {
         // Two names in a row is almost always one name written without its
         // quotes, and saying so beats saying what the parser noticed.
         Tok::Name(_) if matches!(expr, Expr::Name(_) | Expr::Field(..)) => Err(format!(
-            "unexpected {} after the expression — a name with a space in it goes in quotes, like \"IP scan\".rows",
+            "unexpected {} after the expression. A name with a space in it goes in quotes, like \"IP scan\".rows",
             p.peek()
         )),
         other => Err(format!("unexpected {other} after the expression")),

@@ -2,14 +2,14 @@
 //!
 //! A workflow is a tree of steps, and this is where it is built: every step is
 //! a row, selecting one puts its controls on that row, and every control makes
-//! one change to the tree. Nothing here writes the file — the change goes to
+//! one change to the tree. Nothing here writes the file; the change goes to
 //! [`crate::flow::edit`], the tree comes back, and the file is written from
-//! it, which is what keeps a workflow built here and one typed into the file
+//! it. That keeps a workflow built here and one typed into the file
 //! the same thing.
 //!
 //! What became of each step the last time it ran is shown against the step it
 //! happened to, so the thing you are editing and the thing you are watching
-//! are one list rather than two.
+//! are one list, not two.
 
 use gpui::{
     AnyElement, ClickEvent, Context, FontWeight, Hsla, InteractiveElement, IntoElement,
@@ -33,9 +33,9 @@ const INDENT: f32 = 22.;
 ///
 /// Five kinds and one colour each, used for the icon, the word and the card:
 /// what a workflow does is read down the left edge, and colour is what makes
-/// that edge readable at a glance rather than five identical grey lines.
+/// that edge readable at a glance in place of five identical grey lines.
 /// Blue does the work, amber decides, green goes round again, grey waits, red
-/// ends it — which is the same vocabulary the rest of the interface uses for
+/// ends it. That is the same vocabulary the rest of the interface uses for
 /// running, ambiguous, good, idle and stopped.
 fn hue(step: &Step, theme: &Theme) -> (Hsla, Hsla) {
     match step {
@@ -77,12 +77,12 @@ fn parts(step: &Step) -> (&'static str, String) {
 }
 
 /// The lengths the wait control steps through. A pause is chosen from the ones
-/// anybody means rather than typed to the second.
+/// anybody means, not typed to the second.
 const WAITS: [f64; 9] = [5., 10., 30., 60., 120., 300., 600., 1800., 3600.];
 
 /// One row of the editor.
 enum Line {
-    /// A step, its place in the tree, and its number depth-first — which is
+    /// A step, its place in the tree, and its number depth-first, which
     /// how a run reports back which step it is on.
     Step { spot: Spot, id: usize, step: Step, depth: usize },
     /// The word between the two halves of a branch.
@@ -93,8 +93,8 @@ enum Line {
 
 /// Flattens the tree into the rows it is drawn as.
 ///
-/// The numbering is depth-first, which is the order [`crate::flow::compile`]
-/// gives the steps when it compiles them — so a row and the report of what
+/// The numbering is depth-first: the order [`crate::flow::compile`]
+/// gives the steps when it compiles them, so a row and the report of what
 /// happened to it agree without either knowing about the other.
 fn lay_out(
     steps: &[Step],
@@ -145,8 +145,8 @@ impl App {
         let rename_input = self.rename_input.clone();
         let editor = self.editor_for(item).cloned();
         let dirty = editor.as_ref().is_some_and(|e| e.read(cx).dirty);
-        // Every run in the workspace and what each one can be asked, which is
-        // all the condition controls offer — no rows are read, so this costs
+        // Every run in the workspace and what each one can be asked, which
+        // all the condition controls offer. No rows are read, so this costs
         // the same whether a scan found four hosts or sixty-five thousand.
         let tables = crate::ui::notes::shapes(self.workspace());
         let value_input = self.step_input.clone();
@@ -171,8 +171,8 @@ impl App {
         let scroll = sheet.scroll.clone();
         let parsed = sheet.flow();
         let cursor = sheet.cursor.clone();
-        // A file with a line in it nobody can read is not one to rewrite; a
-        // step that is half-built is only half-built.
+        // A file with an unreadable line in it should not be rewritten, and
+        // a half-built step is only half-built.
         let readable = !parsed.lossy;
 
         let mut lines = Vec::new();
@@ -312,7 +312,7 @@ impl App {
                         )
                     })
                     // Adding a step is the one thing a workflow with nothing
-                    // in it needs, so it is a button rather than a menu item.
+                    // in it needs, so it is a button instead of a menu item.
                     .when(readable, |d| {
                         d.child(
                             button("flow-add", "Add step", Kind::Normal, theme).on_click(
@@ -374,9 +374,8 @@ impl App {
                     // Clicking past the steps is how you stop editing one.
                     // Every step and every card takes its own click first.
                     .on_click(cx.listener(move |app, _, _, cx| app.select_step(id, None, cx)))
-                    // A file with a line in it nobody can read is not one to
-                    // rewrite: the controls would throw that line away without
-                    // asking, so they are put away until it is fixed.
+                    // The controls would throw an unreadable line away
+                    // without asking, so they are put away until it is fixed.
                     .when(!readable, |d| {
                         d.child(
                             div()
@@ -389,7 +388,7 @@ impl App {
                                 .text_small()
                                 .text_color(theme.warn)
                                 .child(
-                                    "Some of this file cannot be read, so the controls are put away rather than rewrite it. Text opens what is there.",
+                                    "Some of this file cannot be read, so the controls are put away and do not rewrite it. Text opens what is there.",
                                 ),
                         )
                     })
@@ -651,7 +650,7 @@ fn open_step(
                         }),
                     ],
                 })
-                // What the expression comes to right now, which is what the
+                // What the expression comes to right now, which the
                 // step would keep if it ran this second.
                 .children(preview.map(|answer| match answer {
                     Ok(value) => div()
@@ -730,8 +729,8 @@ fn open_step(
 /// The controls that build a condition: one field of one run, against one
 /// value.
 ///
-/// A condition too involved for that is shown as it was written rather than
-/// pretended about — the language is bigger than the controls, and a workflow
+/// A condition too involved for that is shown as it was written and not
+/// pretended about: the language is bigger than the controls, and a workflow
 /// that used the rest of it is still a workflow.
 #[allow(clippy::too_many_arguments)]
 fn condition_row(
@@ -760,7 +759,7 @@ fn condition_row(
                 .child(if branch { "if" } else { "only if" }),
         );
 
-    // Nothing chosen yet: one word to start, rather than four empty controls
+    // Nothing chosen yet: one word to start, not four empty controls
     // on every step that could have a condition and does not.
     if condition.trim().is_empty() {
         let first = tables.first().map(|t| t.name.clone());
@@ -779,7 +778,7 @@ fn condition_row(
                     div()
                         .text_meta()
                         .text_color(theme.faint)
-                        .child("— a condition is about a run, and there are none here yet"),
+                        .child("A condition is about a run, and there are none here yet"),
                 )
             })
             .into_any_element();
@@ -1048,8 +1047,8 @@ fn small_icon(
 /// The controls that build what a `set` step keeps.
 ///
 /// The same three questions the condition controls ask, minus the comparison:
-/// which run or variable, which of its figures, and — because a column is a
-/// list — how to make one value out of it.
+/// which run or variable, which of its figures, and, since a column is a
+/// list, how to make one value out of it.
 #[allow(clippy::too_many_arguments)]
 fn value_controls(
     flow: usize,
@@ -1147,7 +1146,7 @@ fn value_controls(
         return out;
     }
 
-    // Only a column is a list, and only a list needs summarising — but the
+    // Only a column is a list, and only a list needs summarising. But the
     // control is harmless where it is not needed and unmissable where it is.
     let summaries: Vec<Item> = crate::flow::edit::SUMMARIES
         .iter()
@@ -1324,7 +1323,7 @@ mod tests {
         assert_eq!(nearer(30., 1), 60);
         assert_eq!(nearer(30., -1), 10);
         // Something typed into the file that is not one of them moves to the
-        // nearest one in that direction rather than snapping about.
+        // nearest one in that direction, with no snapping about.
         assert_eq!(nearer(45., 1), 60);
         assert_eq!(nearer(45., -1), 30);
         // And it stops at either end.

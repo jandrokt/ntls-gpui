@@ -29,8 +29,8 @@ Runs on macOS, Linux and Windows, on Intel and ARM. Written in Rust using
 Ping and the IP scan can work over ICMP or ARP. ICMP reaches anything routable.
 ARP only works on your own link, but it finds devices that ignore pings, and
 it's the only way to get a real hardware address out of one. Both are spoken
-directly rather than by shelling out to `ping` or `arp`, so a /24 sweep runs on
-a single socket.
+directly instead of shelling out to `ping` or `arp`, so a /24 sweep runs on a
+single socket.
 
 ### HTTP checks
 
@@ -40,8 +40,8 @@ or form. It can go through a proxy, follow redirects or not, force HTTP/1.1,
 and skip certificate checking for the appliance in the rack with a self-signed
 cert.
 
-Two fields make it a check rather than just a request. **Expect** says what a
-good answer is: `any`, `2xx`, `404`, `200-204`, or a list. Anything else turns
+Two fields turn a request into a check. **Expect** says what a good answer
+is: `any`, `2xx`, `404`, `200-204`, or a list. Anything else turns
 the row red and says what you asked for. **Capture** pulls one value out of
 every response into its own column, either a path into the JSON (`data.queue`,
 `items[0].id`), a header (`header:X-Request-Id`), the status, or the raw body.
@@ -53,8 +53,8 @@ you've got a monitor.
 
 ## Installing
 
-CI builds every platform on every push, and tagging `v*` publishes a release
-with:
+Every commit becomes a release. CI builds every platform, publishes what it
+built, and tags it `build-<n>`:
 
 - **macOS** `ntls.app` in a zip, one universal build for Intel and Apple
   silicon.
@@ -63,8 +63,27 @@ with:
 - **Linux** a tarball with the binary, an icon, a `.desktop` file and an
   `install.sh` that drops them under `~/.local`. x86-64 and aarch64.
 
-The macOS build is ad-hoc signed rather than notarised, so the first launch
-needs a right-click, then Open. Or:
+## Builds, not versions
+
+ntls doesn't have a version number. It has a build number, and every commit
+gets the next one. It's the CI pipeline's own count, so it goes up by one each
+time and never repeats. It gets stamped into the binary at compile time, it's
+what the program calls itself on the welcome screen and in Settings, it names
+every artifact, and it's the tag on the release those artifacts hang off. Build
+412 is one commit, one pipeline, one set of binaries.
+
+A build you make yourself has no number and says `local build`. A binary
+claiming to be build 412 should be the one CI made. To stamp one in by hand:
+
+```
+NTLS_BUILD=412 cargo build --release
+```
+
+The `version` in `Cargo.toml` is `0.0.0` and stays there. Cargo insists the
+field exists; nothing reads it.
+
+The macOS build is ad-hoc signed, not notarised, so the first launch needs a
+right-click, then Open. Or:
 
 ```
 xattr -dr com.apple.quarantine ntls.app
@@ -76,7 +95,7 @@ Or build it yourself, see [Building](#building).
 
 A workspace is one investigation. It holds the tools you opened, what they
 found, and any notes or workflows you wrote about them. The tabs across the top
-switch between investigations rather than between tools.
+switch investigations, not tools.
 
 Press `⌘K` (`Ctrl+K` off macOS) for the command bar. Type a tool's name and hit
 return to get its form, or type the whole thing and skip the form entirely:
@@ -112,24 +131,69 @@ the tool and the row.
 
 `⌘R` runs, `⌘.` stops. Stopping keeps what was found, and the buttons become
 Resume and Restart. The IP scan and DNS lookup also have a *Keep earlier
-results* switch: with it on, a new run adds to the table instead of replacing
-it, so a host that's gone quiet keeps its row, and an address that a different
-device has taken over gets a second row next to the first.
+results* switch, which turns a scan into a record of a network over time: a new
+run adds to the table instead of replacing it, every row gets a SEEN column
+saying which scan last found it, a host that's gone quiet keeps its row and is
+marked amber and dated (`1 scan ago`, `2 scans ago`), and an address a
+different device has taken over gets a second row next to the first. Rows about
+addresses outside the range you just swept are left alone; scanning one host
+says nothing about the rest of the subnet.
+
+While a scan is running, a table you're already at the end of stays there as
+rows arrive, at the bottom or the top, whichever end you're reading. Scroll
+away and it leaves you where you are.
 
 Click a column heading to sort, drag its edge to resize, `⌘F` to filter. Every
-row has a NOTE you can type into. Notes are attached to the workspace rather
-than to the run, so something you jotted down while reading a sweep is still
-there in the port scan you do next. Select a row and a Send bar appears: pick a
+row has a NOTE you can type into. Notes belong to the workspace, not to the
+run, so something you jotted down while reading a sweep is still there in the
+port scan you do next. Select a row and a Send bar appears: pick a
 host out of a sweep, one click, and it's in the port scanner with the port
 filled in.
 
 There's also *Compare with…* in a run's menu, which diffs it against another
 run of the same tool (appeared, went, changed), and *Export as CSV…*, which
-writes out exactly what's on screen, filter and sort order included.
+writes out what's on screen, filter and sort order included.
 
 Right-click things. Workspaces, tools, documents, workflows, group headings,
 result rows, interfaces, the background. The menu is about whatever is under
 the pointer.
+
+Runs keep going in workspaces you aren't looking at, so when one finishes it
+says so in the corner and the bell in the status bar counts what you haven't
+read. A failure (a run, a file that wouldn't write) stays there until you
+dismiss it, and clicking a notice opens the run it's about. `⌘⇧M` opens the
+list.
+
+## Pages
+
+The rail down the left edge is everywhere the window goes: workspaces, tools,
+variables and this machine at the top, the gear at the foot. Click one to go
+there. Hover one for its name.
+
+Workspaces and tools are lists, so they fill the side bar. **Variables**, **This
+machine** and **Settings** are pages, and take the whole window: none of them
+is a thing inside the workspace, so a list of tools beside them would just be
+in the way.
+
+**Variables** shows what each one comes to, the formula underneath, what kind
+of thing a formula answers with, where the value came from, what reads it and
+what it reads. Click any part of a row to edit it in place; hover for copy,
+copy-as-`{{ reference }}`, duplicate and remove. A filter box narrows a long
+list, and the header counts the ones that aren't working.
+
+**This machine** lists every interface: the network each address sits in, its
+broadcast address, how many hosts it holds, the hardware and who made it, which
+one carries the default route, and which one new tools send from. Each network
+has a Sweep button next to it.
+
+**Settings** (`⌘,`) holds the theme (system, light or dark), whether the
+interface animates, whether the side bar comes back the way you left it, which
+interface, reachability method, timeout and concurrency new tools start on,
+whether they resolve names and identify hardware, whether a table follows new
+rows, what the corner says and for how long, and where the workspaces are on
+disk. Scanning settings are stored per *field*, not per tool, so every tool
+with an interface setting starts on the one you chose, including one added
+later.
 
 ## Files on disk
 
@@ -149,7 +213,11 @@ A workspace is a directory. Everything in it is a file:
 
 Writes happen as things change and everything is read back at startup, so last
 week's results are still there, rows and log and charts included. Copy a
-workspace somewhere, delete one by hand, whatever you like.
+workspace somewhere, delete one by hand, whatever you like. A write that fails
+says so in the corner.
+
+Settings live beside the workspaces in `.ntls.json`, which keeps a workspace
+directory to tools and nothing else.
 
 The side bar lists folders first, then whatever is loose in the workspace,
 grouped by where each tool has got to (Not run, Running, Results) with the
@@ -158,17 +226,17 @@ one you clicked rather than every heading with that name.
 
 The page button at the top of that side bar flips it into a file view: the same
 workspace listed the way the filesystem has it, with real names and sizes,
-folders, and `.closed`, which is where anything you remove ends up. Nothing
-here is deleted by a single click. Clicking a file opens whatever it is, and
-files ntls doesn't recognise get handed to your file manager.
+folders, and `.closed`, where anything you remove ends up. A single click
+deletes nothing. Clicking a file opens whatever it is, and files ntls doesn't
+recognise get handed to your file manager.
 
 ## Documents
 
 *New document* makes an empty `.md` file next to the tools and opens it split:
 source on one side, rendered on the other, updating as you type.
 
-The useful part is that anything in double braces is an expression, evaluated
-against the tools in the same workspace every time the document is displayed.
+Anything in double braces is an expression, evaluated against the tools in the
+same workspace every time the document is displayed.
 
 ![A document with its expressions filled in from the runs beside it](docs/document.png)
 
@@ -189,9 +257,9 @@ averaging **{{ fixed(Uplink.rtt.avg(), 2) }} ms**.
 > Verdict: {{ if Uplink.rtt.avg() < 5 then "healthy" else "gateway is slow" }}.
 ```
 
-A tool that hasn't run yet evaluates to nothing rather than an error, so you
-can write the document before the scan. An expression that's genuinely wrong is
-left in place, in red, with the reason.
+A tool that hasn't run yet evaluates to nothing instead of an error, so you can
+write the document before the scan. An expression that's genuinely wrong stays
+where it is, in red, with the reason.
 
 The editor highlights as you type and completes what it knows about: runs in
 this workspace, variables, the columns and summary figures of whatever run you
@@ -199,7 +267,7 @@ named before the dot, and the language's functions. Tab accepts, arrows walk
 the list, escape dismisses.
 
 *Open in another editor…* hands the file to whatever you normally write
-markdown in. That's the only thing that does.
+markdown in.
 
 ## Workflows
 
@@ -252,10 +320,10 @@ stop if Sweep.down > 20
 | `stop` | Ends the workflow |
 
 `run` and `stop` can carry their own `if`. Conditions are evaluated when the
-step is reached, not when the workflow starts, which is the entire point: a
-step gets to see what the steps before it found. A step whose condition is
-false is skipped and says so. A run that fails stops the workflow, since
-carrying on would mean acting on results that don't exist.
+step is reached, not when the workflow starts, so a step sees what the steps
+before it found. A step whose condition is false is skipped and says so. A run
+that fails stops the workflow; carrying on would mean acting on results that
+don't exist.
 
 ## Expressions
 
@@ -300,38 +368,37 @@ Plus `if … then … else …`, the usual arithmetic and comparisons, and `&&`,
 
 ## Variables
 
-Variables belong to the workspace rather than to any run in it, and everything
-in the workspace can read them by name. They come in two flavours: plain text,
-and formulas. A formula holds an expression that gets evaluated every time it's
+Variables belong to the workspace, not to any run in it, and everything in the
+workspace can read them by name. They come in two flavours: plain text, and
+formulas. A formula holds an expression that gets evaluated every time it's
 read, so `gateway = Sweep.host.first()` follows the sweep, while the same thing
 stored as text is whatever the sweep said on the day you wrote it down.
 
-The Variables section in the side bar is where they live. Each row shows the
-name, what it currently comes to (a formula shows its answer with the
-expression underneath), and a line about where the value came from and what
-reads it:
+The Variables page lists them. Each row is the name, what it currently comes
+to, and a second line with the formula on the left and everything else known
+about it on the right:
 
 ```
-gateway     10.0.0.1                       =  ×
-            = Sweep.host.first()
-            read by Office LAN, 10.0.0.0/24
+gateway     10.0.0.1
+            = Sweep.host.first()          text · read by Office LAN
 
-hosts_up    10                             =  ×
-            set by Nightly check · 8 min ago
+hosts_up    10                            set by Nightly check · 8 min ago
 
-subnet      10.0.0.0/24                    =  ×
-            the network this workspace is about
+subnet      10.0.0.0/24
+            the network this is about     read by gateway
 ```
 
-Click the name to rename, the value to retype it, the bottom line to write a
-note about what it's for, and `=` to switch between text and formula. The text
-is kept either way, so an expression you typed as text starts working the
-moment you flip it. A formula that can't be evaluated shows the reason in red
-where its answer would go. One that refers to itself, directly or in a circle,
-comes back empty rather than hanging.
+Click the name to rename, the value to retype it, the second line to write a
+note about what it's for. Hovering a row brings up buttons to switch it between
+text and formula, copy the value, copy it as `{{ a reference }}`, duplicate it
+and remove it. The text is kept when you switch, so an expression you typed as
+text starts working the moment you flip it. A formula that can't be evaluated
+shows the reason in red where its answer would go. One that refers to itself,
+directly or in a circle, comes back empty instead of hanging.
 
 "Read by" is worked out from the documents, workflows and other formulas that
-actually mention the name, so a variable nothing uses says so.
+mention the name, so a variable nothing uses says so. "Reads" is the same list
+the other way round.
 
 ### Workflows write them
 
@@ -344,8 +411,8 @@ set hosts_up = Sweep.up
 run "Ports on the NAS" if hosts_up > 0
 ```
 
-You don't have to type any of that. The name comes from the variables you
-already have, and the value is picked the same way a condition is: which run,
+None of that has to be typed. The name comes from the variables you already
+have, and the value is picked the same way a condition is: which run,
 which figure, and how to reduce a column of many rows to one value (`as it is`,
 `avg`, `max`, `count`, `first`, and so on). The step shows what it would keep
 while you're building it:
@@ -359,7 +426,7 @@ written*. When the workflow runs, the trail against that step says what it set,
 and the variable remembers which workflow wrote it and when.
 
 Conditions can be about a variable as easily as about a run. Pick a variable as
-the subject and the "which figure" control disappears, because a variable is
+the subject and the "which figure" control disappears, since a variable is
 already a value: `if [hosts_up] [is more than] [0]`.
 
 If a run and a variable share a name, the run wins.
@@ -373,10 +440,10 @@ Written the macOS way. On Windows and Linux every ⌘ is Ctrl.
 | Adding | `⌘K` command bar, `⌘1`–`⌘9` add that tool directly |
 | Workspaces | `⌘T` new, `⌘⇧W` close, `⌘⇧[` / `⌘⇧]` previous/next |
 | Tools | `⌘[` / `⌘]` previous/next, `⌘W` close the tab (tool stays) |
-| A run | `⌘R` run, `⌘.` stop, `⌘E` settings, `⌘I` rename, `⌘G` big graph |
+| A run | `⌘R` run, `⌘.` stop, `⌘E` its form, `⌘I` rename, `⌘G` big graph |
 | Layout | `⌘B` side bar, `⌘J` output panel, `⇧⌘O` workspaces, `⇧⌘E` tools |
 | Results | `↑↓` select, `pgup`/`pgdn` page, `⌘↑`/`⌘↓` first/last, `⌘F` filter, `⌘⇧N` note, `⏎` send onward |
-| Anywhere | `⌘D` light/dark, `esc` back out, `⌘Q` quit |
+| Anywhere | `⌘,` settings, `⌘⇧M` notifications, `⌘D` light/dark, `esc` back out, `⌘Q` quit |
 
 ## Permissions
 
@@ -430,8 +497,18 @@ machine, and a real port scan and ping against loopback.
 Packaging lives in `packaging/`: `icon/make-icons.py` draws the icon and writes
 out every format the three platforms want, `macos/bundle.sh` wraps a binary in
 a `.app`, `windows/ntls.iss` is the Inno Setup script, and `linux/` has the
-`.desktop` file and the tarball's installer. `.github/workflows/build.yml`
-drives all of it.
+`.desktop` file and the tarball's installer. `.gitlab-ci.yml` drives all of it:
+a test job, a build job per platform, and a release job that collects what they
+made.
+
+Each build job uploads its artifacts to the project's generic package registry
+and writes down the URL; the release job hangs those URLs off the release. That
+way a release keeps working after the job artifacts expire.
+
+The pipeline names the runners it wants: Docker for the two Linux jobs, one of
+them arm64, plus the SaaS macOS and Windows runners. Delete the job for any
+platform you have no runner for. The release waits for the whole build stage,
+and a job no runner can take never finishes.
 
 ## Adding a tool
 
@@ -453,7 +530,7 @@ pub trait Tool: Send + Sync + 'static {
 
 A run emits events (a row, a log line, a summary figure, progress, a numeric
 sample) and the UI turns those into a table, an output panel, a stat bar, a
-progress bar and a live graph on its own. Write the impl in `src/tools/`, add a
+progress bar and a live graph by itself. Write the impl in `src/tools/`, add a
 line to `register`, and the picker, command bar, form, validation, hand-offs,
 saving, resuming, CSV export and expression language all come with it.
 

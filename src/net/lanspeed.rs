@@ -1,7 +1,7 @@
 //! The speed of the local network itself, between two machines running ntls.
 //!
 //! An internet speed test tells you what your line does. This tells you what
-//! your own cabling, switches and wireless do, which is usually the thing
+//! your own cabling, switches and wireless do, usually the thing
 //! actually limiting a file copy. The two ends speak a deliberately tiny
 //! protocol: enough to agree on a direction and a duration, and nothing else.
 
@@ -28,7 +28,7 @@ const DISCOVERY_QUERY: &[u8] = b"NTLSDISC?1";
 const DISCOVERY_REPLY: &[u8] = b"NTLSDISC!1";
 
 /// Identifies this process among everything that might answer a broadcast.
-/// Discovery filters on it rather than on the source address, so a server
+/// Discovery filters on it instead of on the source address, so a server
 /// never answers its own search but two instances on one machine can still
 /// find each other.
 pub fn instance_id() -> [u8; 8] {

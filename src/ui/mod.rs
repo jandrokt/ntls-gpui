@@ -11,6 +11,7 @@ pub mod icons;
 pub mod job;
 pub mod menu;
 pub mod notes;
+pub mod notify;
 pub mod palette;
 pub mod picker;
 pub mod runtime;

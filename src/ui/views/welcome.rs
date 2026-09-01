@@ -11,7 +11,7 @@ use gpui::{
 };
 
 use crate::core::Tool;
-use crate::ui::app::{App, View};
+use crate::ui::app::{App, Page};
 use crate::ui::icons::icon;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{Type, keycap, space};
@@ -63,8 +63,8 @@ impl App {
                                     .text_small()
                                     .text_color(theme.dim)
                                     .child(format!(
-                                        "Network diagnostics and transfers · version {}",
-                                        env!("CARGO_PKG_VERSION")
+                                        "Network diagnostics and transfers · {}",
+                                        crate::sys::build_label()
                                     )),
                             ),
                     )
@@ -115,7 +115,7 @@ impl App {
                                         "",
                                         theme,
                                         cx.listener(|app, _, window, cx| {
-                                            app.show_view(View::Machine, window, cx)
+                                            app.show_page(Page::Interfaces, window, cx)
                                         }),
                                     ))
                                     .child(shortcut(

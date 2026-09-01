@@ -1,13 +1,13 @@
 //! A multi-line text editor.
 //!
 //! GPUI gives you the platform's input handling but not a widget, so this is
-//! the widget — the same shape as [`super::text_input`], grown to many lines:
+//! the widget, the same shape as [`super::text_input`] grown to many lines:
 //! a shaped line per visual row, a caret, a selection, soft wrapping, syntax
 //! colouring and a completion list.
 //!
 //! The document is one `String` and every position is a byte offset into it.
-//! That is the simplest thing that can work, and for the files this edits —
-//! notes and workflows, kilobytes rather than megabytes — reshaping the
+//! That is the simplest thing that can work, and for the files this edits
+//! (notes and workflows, kilobytes not megabytes) reshaping the
 //! visible lines on each keystroke is not something anyone can perceive.
 
 use std::ops::Range;
@@ -91,8 +91,8 @@ pub fn bind_keys(cx: &mut App) {
 /// One source line, shaped and wrapped, with where it sits.
 ///
 /// GPUI does the wrapping and can map between a byte index and a point inside
-/// a wrapped line, so a line is the unit here rather than a visual row — and
-/// the caret arithmetic is the text system's rather than mine.
+/// a wrapped line, so a line is the unit here instead of a visual row, and
+/// the caret arithmetic belongs to the text system, not to this.
 struct Placed {
     wrapped: gpui::WrappedLine,
     /// Where the line starts in the document.
@@ -142,7 +142,7 @@ pub struct Editor {
     /// What the offer would replace, worked out when it was made.
     offer_context: Where,
 
-    /// The runs in the workspace, refreshed by the owner, which is what the
+    /// The runs in the workspace, refreshed by the owner, which the
     /// completions are drawn from.
     pub tables: Vec<crate::expr::Table>,
     /// The variables of the workspace this is being written in, which are
@@ -260,7 +260,7 @@ impl Editor {
         &self.text
     }
 
-    /// Replaces everything, as when the file changed underneath — or when the
+    /// Replaces everything, as when the file changed underneath, or when the
     /// same workflow was changed with the controls beside it.
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.text == text {
@@ -299,7 +299,7 @@ impl Editor {
         start..end
     }
 
-    /// The line the caret is on, and where in it, which is what completion
+    /// The line the caret is on, and where in it, which completion
     /// works from.
     fn caret_in_line(&self) -> (String, usize) {
         let range = self.line_at(self.cursor());
@@ -416,7 +416,7 @@ impl Editor {
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
         // The first press goes to the first thing on the line, the second to
-        // the very start — the indent is usually not where you meant.
+        // the very start: the indent is usually not where you meant.
         let line = self.line_at(self.cursor());
         let text = &self.text[line.clone()];
         let indented = line.start + text.len() - text.trim_start().len();
@@ -651,8 +651,8 @@ impl Editor {
     /// Where a byte offset sits within the element.
     ///
     /// The layout is from the last paint, so an offset typed since then falls
-    /// past the end of it. That is not a reason to have no answer — the caret
-    /// is a character away from where it will be — so the last line answers
+    /// past the end of it. The caret is a character away from where it will
+    /// be, so rather than answer with nothing, the last line answers
     /// for anything beyond it.
     fn point_for(&self, offset: usize) -> Option<Point<Pixels>> {
         let placed = self
@@ -703,7 +703,7 @@ impl Editor {
 
     /// Moves the caret one visual row up or down, keeping roughly the column.
     ///
-    /// It is done in pixels rather than in characters because a wrapped line
+    /// It is done in pixels instead of in characters because a wrapped line
     /// has no characters at its row boundaries to count.
     fn vertical(&self, delta: isize) -> usize {
         let at = self.cursor();
@@ -734,7 +734,7 @@ impl Editor {
     /// Shapes and wraps the document to a width, returning how many visual
     /// rows it came to.
     ///
-    /// Called from layout — which needs the height — and again from prepaint,
+    /// Called from layout, which needs the height, and again from prepaint,
     /// which needs the positions. Shaping is cached by the text system, so
     /// the second call is a lookup.
     fn wrap(&mut self, width: Pixels, window: &mut Window) -> usize {
@@ -749,7 +749,7 @@ impl Editor {
         let (mut at, mut top, mut rows) = (0usize, px(0.), 0usize);
 
         // `lines()` drops a trailing newline, which would take the last line
-        // — the one you are usually typing on — off the screen.
+        // (the one you are usually typing on) off the screen.
         let mut source: Vec<&str> = self.text.split('\n').collect();
         if source.is_empty() {
             source.push("");
@@ -925,7 +925,7 @@ impl gpui::Element for Body {
         _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         // How tall the document is depends on how wide it is allowed to be, so
-        // the height is measured rather than declared.
+        // the height is measured, not declared.
         let editor = self.editor.clone();
         let mut style = Style::default();
         style.size.width = relative(1.).into();
@@ -1128,7 +1128,7 @@ impl Render for Editor {
         div()
             .key_context("Editor")
             .track_focus(&self.focus_handle)
-            // The editor sets its own face rather than inheriting one: source
+            // The editor sets its own face and does not inherit one: source
             // is read column by column, and a proportional font makes an
             // indent or an alignment impossible to see.
             .font_family(super::theme::MONO)

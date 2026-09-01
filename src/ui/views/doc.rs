@@ -208,7 +208,7 @@ pub(super) fn source_pane(
                 .child(editor.clone()),
         )
         // The list follows the caret, so it reads as belonging to what is
-        // being typed rather than to the pane.
+        // being typed instead of to the pane.
         .children(offer.map(|origin| {
             div()
                 .absolute()
@@ -278,7 +278,7 @@ fn block(block: &Block, theme: &Theme) -> AnyElement {
                 .mb(px(6.))
                 .text_size(size)
                 // A heading is a line of its own, so it may have a line box of
-                // its own — the rule is about runs sharing a row, and every
+                // its own. The rule is about runs sharing a row, and every
                 // run in this one shares this.
                 .line_height(size * 1.35)
                 .font_weight(weight)
@@ -367,7 +367,7 @@ fn block(block: &Block, theme: &Theme) -> AnyElement {
 ///
 /// GPUI lays a `div` out as a block, so a bold run in the middle of a sentence
 /// would start a new line. The sentence is therefore split into words, each
-/// its own child of a wrapping row, which is what puts the emphasis back
+/// its own child of a wrapping row, which puts the emphasis back
 /// inside the line it belongs to.
 fn line(spans: &[Span], theme: &Theme) -> gpui::Div {
     let words: Vec<AnyElement> =
@@ -378,7 +378,7 @@ fn line(spans: &[Span], theme: &Theme) -> gpui::Div {
 /// Splits a line into the pieces that lay out: one per word of plain text, one
 /// per emphasised run, each knowing whether a space follows it.
 ///
-/// The space has to be worked out across the whole line rather than inside one
+/// The space has to be worked out across the whole line and not inside one
 /// run, because `**5** of 6` puts the space at the start of the run *after*
 /// the bold one.
 fn words(spans: &[Span]) -> Vec<(Span, bool)> {
@@ -404,8 +404,8 @@ fn words(spans: &[Span]) -> Vec<(Span, bool)> {
     out
 }
 
-/// One run inside a line. Every run keeps the line's size and family — only
-/// weight, slant and colour vary — so a bold word does not sit at a different
+/// One run inside a line. Every run keeps the line's size and family, and only
+/// weight, slant and colour vary, so a bold word does not sit at a different
 /// height from the words around it.
 fn run(span: &Span, spaced: bool, theme: &Theme) -> AnyElement {
     let mut element = div().when(span.bold, |d| d.font_weight(FontWeight::SEMIBOLD));

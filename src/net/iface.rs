@@ -20,7 +20,7 @@ pub struct Iface {
     /// Marks the interface carrying the default route.
     pub default: bool,
     /// Marks an interface with no hardware address, which in practice means a
-    /// tunnel rather than a physical port.
+    /// tunnel instead of a physical port.
     pub virtual_: bool,
 }
 
@@ -84,7 +84,7 @@ fn mask_bits(mask: Ipv4Addr) -> u8 {
 }
 
 /// Reports whether a prefix contains other hosts to look for. A /31 or /32
-/// does not, which is what a VPN tunnel usually hands out.
+/// does not, the usual shape of a VPN tunnel.
 fn scannable(p: &Prefix) -> bool {
     p.addr.is_ipv4() && p.bits <= 30
 }
@@ -178,29 +178,68 @@ pub fn resolve_interface(name: &str) -> Result<Option<Ipv4Addr>, String> {
     }
 }
 
+/// What this machine's own addressing looks like: the networks it is attached
+/// to, and the addresses it holds on them.
+#[derive(Clone, Default)]
+struct Own {
+    prefixes: Vec<Prefix>,
+    addrs: Vec<IpAddr>,
+}
+
+/// How long that answer stands before it is worked out again.
+///
+/// [`interfaces`] asks the kernel for the interface list, every hardware
+/// address on it and the outbound route, every time it is called. The results
+/// table asks which addresses are this machine's on every frame it draws, and
+/// a subnet sweep asks whether each of 254 targets is on this link. Neither
+/// is worth that, and an interface that came up half a second ago is not worth
+/// paying it for either.
+const OWN_FOR: std::time::Duration = std::time::Duration::from_millis(1000);
+
+static OWN: std::sync::Mutex<Option<(std::time::Instant, Own)>> = std::sync::Mutex::new(None);
+
+fn own() -> Own {
+    let mut held = OWN.lock().expect("the interface snapshot");
+    if let Some((at, snapshot)) = held.as_ref()
+        && at.elapsed() < OWN_FOR
+    {
+        return snapshot.clone();
+    }
+    let list = interfaces();
+    let snapshot = Own {
+        prefixes: list.iter().flat_map(|i| i.addrs.iter().map(|p| p.masked())).collect(),
+        addrs: list.iter().flat_map(|i| i.addrs.iter().map(|p| p.addr)).collect(),
+    };
+    *held = Some((std::time::Instant::now(), snapshot.clone()));
+    snapshot
+}
+
+/// Forgets the snapshot, for the places that have just been told the machine's
+/// addressing has changed.
+pub fn forget_snapshot() {
+    *OWN.lock().expect("the interface snapshot") = None;
+}
+
 /// Every IPv4 network this host is directly attached to, skipping loopback.
 /// It is how the ARP prober decides whether a target is on the local link.
 pub fn local_prefixes() -> Vec<Prefix> {
-    interfaces()
-        .into_iter()
-        .flat_map(|i| i.addrs.into_iter().map(|p| p.masked()))
-        .collect()
+    own().prefixes
 }
 
 /// Reports whether `addr` sits in one of this host's directly attached
 /// networks, and so can be reached with ARP.
 pub fn is_local_link(addr: IpAddr) -> bool {
-    addr.is_ipv4() && local_prefixes().iter().any(|p| p.contains(addr))
+    addr.is_ipv4() && own().prefixes.iter().any(|p| p.contains(addr))
 }
 
 /// Every IPv4 address assigned to this host.
 pub fn local_addrs() -> Vec<IpAddr> {
-    interfaces().into_iter().flat_map(|i| i.addrs.into_iter().map(|p| p.addr)).collect()
+    own().addrs
 }
 
 /// Reports whether `addr` belongs to this host.
 pub fn is_local_addr(addr: IpAddr) -> bool {
-    local_addrs().contains(&addr)
+    own().addrs.contains(&addr)
 }
 
 /// This host's hardware address on the interface serving `addr`, empty when

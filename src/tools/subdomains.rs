@@ -88,7 +88,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
     let source = ct::Source::parse(&p.str("source"));
 
     // A pasted URL is reduced to the domain that will actually be queried, so
-    // the log and the summary say what was asked rather than what was typed.
+    // the log and the summary say what was asked instead of what was typed.
     let domain = ct::normalize_domain(&p.str("target")).map_err(anyhow::Error::msg)?;
     emit.info(format!("asking {} for certificates naming {domain}", source.id()));
 
@@ -118,7 +118,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                 last_certs.store(certs, Ordering::Relaxed);
             }
             // The total is unknown until the response ends, so this is the
-            // stat bar rather than the progress bar: a rising count says more
+            // stat bar instead of the progress bar: a rising count says more
             // than a bar stuck at zero.
             let mut line = vec![kv("downloaded", format_bytes(bytes))];
             let seen = last_certs.load(Ordering::Relaxed);

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-/// How many recent samples the summary keeps, which is as many as a small
+/// How many recent samples the summary keeps: as many as a small
 /// graph has room to draw.
 pub const RECENT: usize = 48;
 
@@ -100,7 +100,7 @@ pub fn pct(v: f64) -> String {
     if v == v.trunc() { format!("{v:.0}%") } else { format!("{v:.1}%") }
 }
 
-/// Rounds an elapsed time to a tenth of a second, which is all the precision a
+/// Rounds an elapsed time to a tenth of a second, all the precision a
 /// summary line can honestly claim.
 pub fn elapsed(d: Duration) -> String {
     let secs = d.as_secs_f64();

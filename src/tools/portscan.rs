@@ -39,7 +39,7 @@ impl Tool for PortScan {
             target_field(
                 "Target",
                 "192.168.1.10, example.com, 10.0.0.0/28",
-                "One host, or a network to scan every host in — tab expands a network into its range",
+                "One host, or a network to scan every host in. Tab expands a network into its range",
             ),
             Field::select(
                 "proto",
@@ -55,7 +55,7 @@ impl Tool for PortScan {
             Field::text(
                 "ports",
                 "Ports",
-                "all = 1-65535, top = ~90 popular ports, common = the usual suspects — tab expands to explicit numbers",
+                "all = 1-65535, top = ~90 popular ports, common = the usual suspects. Tab expands to explicit numbers",
             )
             .placeholder("all, top, common, 22, 1-1024, 80,443,8000-8100")
             .default("all")
@@ -73,7 +73,7 @@ impl Tool for PortScan {
             Field::text(
                 "concurrency",
                 "Concurrency",
-                "Ports probed at the same time — the main speed knob; lower it if your network drops probes",
+                "Ports probed at the same time. The main speed knob; lower it if your network drops probes",
             )
             .default("1024")
             .validate(Validator::IntRange(1, 8192)),
@@ -161,7 +161,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
             for proto in &protos {
                 // A resumed run skips the ports the interrupted one reached.
                 // Only open ports leave a row behind, so this resumes from the
-                // furthest port already reported rather than from a set.
+                // furthest port already reported instead of from a set.
                 jobs.push((*host, *port, *proto));
             }
         }

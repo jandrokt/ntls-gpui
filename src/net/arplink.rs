@@ -1,13 +1,13 @@
 //! Real ARP, over a raw link-layer socket.
 //!
 //! Recent macOS withholds the neighbour table and every hardware address the
-//! ordinary APIs would report — `arp -an` comes back empty and `getifaddrs`
+//! ordinary APIs would report: `arp -an` comes back empty and `getifaddrs`
 //! hands out `02:00:00:00:00:00`. None of that applies on the wire: an ARP
 //! request broadcast over BPF is answered by the host itself, with its real
 //! address in the reply.
 //!
-//! BPF needs either root or membership of `access_bpf`, which is what
-//! installing Wireshark's ChmodBPF grants. When neither is available the
+//! BPF needs either root or membership of `access_bpf`, which installing
+//! Wireshark's ChmodBPF grants. When neither is available the
 //! caller falls back to reading the neighbour table.
 
 #![cfg(any(
@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
-// The BPF ioctls, spelled out rather than pulled from a binding crate: there
+// The BPF ioctls, spelled out and not pulled from a binding crate: there
 // are five of them and they have not changed in thirty years.
 const BIOCSBLEN: libc::c_ulong = 0xc004_4266;
 const BIOCSETF: libc::c_ulong = 0x8010_4267;
@@ -37,6 +37,7 @@ const BIOCIMMEDIATE: libc::c_ulong = 0x8004_4270;
 const BIOCSHDRCMPLT: libc::c_ulong = 0x8004_4275;
 const BIOCGBLEN: libc::c_ulong = 0x4004_4266;
 const BIOCSRTIMEOUT: libc::c_ulong = 0x8010_426d;
+const BIOCSSEESENT: libc::c_ulong = 0x8004_4277;
 
 const ETHERTYPE_ARP: u16 = 0x0806;
 const ARP_REQUEST: u16 = 1;
@@ -45,6 +46,8 @@ const ARP_REPLY: u16 = 2;
 const ARP_FRAME: usize = 14 + 28;
 /// The shortest frame Ethernet will carry.
 const MIN_FRAME: usize = 60;
+/// How often a request is repeated while an answer is being waited for.
+const RETRY: Duration = Duration::from_millis(180);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -61,21 +64,21 @@ struct BpfProgram {
     insns: *const BpfInsn,
 }
 
-/// Everything that is not an ARP frame is dropped in the kernel, which is what
-/// keeps a busy link from filling the buffer with traffic we do not want.
+/// Everything that is not an ARP frame is dropped in the kernel, so a busy
+/// link cannot fill the buffer with traffic we do not want.
 const ARP_FILTER: [BpfInsn; 4] = [
-    // ldh [12] — the EtherType
+    // ldh [12]: the EtherType
     BpfInsn { code: 0x28, jt: 0, jf: 0, k: 12 },
-    // jeq #0x0806 — ARP?
+    // jeq #0x0806: ARP?
     BpfInsn { code: 0x15, jt: 0, jf: 1, k: ETHERTYPE_ARP as u32 },
-    // ret #262144 — take the whole frame
+    // ret #262144: take the whole frame
     BpfInsn { code: 0x06, jt: 0, jf: 0, k: 262_144 },
-    // ret #0 — drop
+    // ret #0: drop
     BpfInsn { code: 0x06, jt: 0, jf: 0, k: 0 },
 ];
 
 /// The BPF header in front of every captured frame. `hdrlen` is read back
-/// rather than assumed, since the padding differs between platforms.
+/// and not assumed, since the padding differs between platforms.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct BpfHdr {
@@ -86,8 +89,52 @@ struct BpfHdr {
     hdrlen: u16,
 }
 
+/// One resolved hardware address, and whether the wire said so just now.
+#[derive(Clone, Copy, Debug)]
+pub struct Answer {
+    pub mac: [u8; 6],
+    pub rtt: Duration,
+    /// False for an address remembered from an earlier run and not
+    /// answered for now. It is still the right address as far as anything
+    /// knows; it is just not proof the host is still there.
+    pub fresh: bool,
+}
+
 struct Waiter {
+    /// Which waiter this is, so a caller that gives up takes its own
+    /// registration away and not everybody else's.
+    id: u64,
     tx: oneshot::Sender<[u8; 6]>,
+}
+
+static NEXT_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Every hardware address this process has heard on the wire, and when.
+///
+/// A BPF handle lives as long as the run that opened it, so without this every
+/// scan starts knowing nothing and has to ask the link again for every host,
+/// and a host that answers slowly, which over Wi-Fi is most of them, is missed
+/// as often as not. Remembering what has already been established makes the
+/// second scan of a network at least as complete as the first.
+static REMEMBERED: Mutex<Option<HashMap<Ipv4Addr, ([u8; 6], Instant)>>> = Mutex::new(None);
+
+/// How long a remembered address is still worth offering. Long enough to cover
+/// a session of scanning the same network, short enough that a device swapped
+/// out this morning is not still being reported this afternoon.
+const REMEMBER_FOR: Duration = Duration::from_secs(600);
+
+fn remember(ip: Ipv4Addr, mac: [u8; 6]) {
+    let mut held = REMEMBERED.lock().unwrap();
+    let table = held.get_or_insert_with(HashMap::new);
+    table.insert(ip, (mac, Instant::now()));
+}
+
+/// What we last heard from this address, if it was recent enough to repeat.
+fn remembered(ip: Ipv4Addr) -> Option<[u8; 6]> {
+    let mut held = REMEMBERED.lock().unwrap();
+    let table = held.as_mut()?;
+    table.retain(|_, (_, at)| at.elapsed() < REMEMBER_FOR);
+    table.get(&ip).map(|(mac, _)| *mac)
 }
 
 struct Inner {
@@ -147,37 +194,58 @@ impl ArpLink {
     /// A host that has already answered somebody else's request is returned
     /// straight from what we overheard, which is why a subnet sweep gets
     /// steadily faster as it goes.
-    pub async fn resolve(&self, dst: Ipv4Addr, timeout: Duration) -> Option<([u8; 6], Duration)> {
+    pub async fn resolve(&self, dst: Ipv4Addr, timeout: Duration) -> Option<Answer> {
         let start = Instant::now();
         if let Some(mac) = self.inner.learned.lock().unwrap().get(&dst).copied() {
-            return Some((mac, Duration::ZERO));
+            return Some(Answer { mac, rtt: Duration::ZERO, fresh: true });
         }
 
+        let id = NEXT_WAITER.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.inner.waiters.lock().unwrap().entry(dst).or_default().push(Waiter { tx });
+        self.inner.waiters.lock().unwrap().entry(dst).or_default().push(Waiter { id, tx });
 
-        // Two requests: the first often arrives while the far end is still
-        // waking its own stack up, and a lost broadcast is not worth a whole
-        // timeout.
-        let _ = self.send_request(dst);
-        let half = timeout / 2;
+        // The request is repeated for as long as we are waiting, not
+        // once or twice: a broadcast that nothing answered may simply have
+        // been lost, and a reply over Wi-Fi can take a couple of hundred
+        // milliseconds to arrive.
+        let asking = async {
+            loop {
+                let _ = self.send_request(dst);
+                tokio::time::sleep(RETRY).await;
+            }
+        };
+        let waiting = async {
+            tokio::select! {
+                got = rx => got.ok(),
+                // Never finishes; it is here to run alongside the wait.
+                _ = asking => None,
+            }
+        };
 
-        if let Ok(Ok(mac)) = tokio::time::timeout(half, rx).await {
-            return Some((mac, start.elapsed()));
+        if let Ok(Some(mac)) = tokio::time::timeout(timeout, waiting).await {
+            remember(dst, mac);
+            return Some(Answer { mac, rtt: start.elapsed(), fresh: true });
         }
+
+        self.forget_waiter(dst, id);
         if let Some(mac) = self.inner.learned.lock().unwrap().get(&dst).copied() {
-            return Some((mac, start.elapsed()));
+            remember(dst, mac);
+            return Some(Answer { mac, rtt: start.elapsed(), fresh: true });
         }
+        // Nothing answered now. What this address was last seen to be is
+        // better than an empty column, as long as it is offered as history
+        // instead of as an observation.
+        remembered(dst).map(|mac| Answer { mac, rtt: start.elapsed(), fresh: false })
+    }
 
-        let (tx, rx) = oneshot::channel();
-        self.inner.waiters.lock().unwrap().entry(dst).or_default().push(Waiter { tx });
-        let _ = self.send_request(dst);
-
-        match tokio::time::timeout(timeout - half, rx).await {
-            Ok(Ok(mac)) => Some((mac, start.elapsed())),
-            _ => {
-                self.inner.waiters.lock().unwrap().remove(&dst);
-                self.inner.learned.lock().unwrap().get(&dst).copied().map(|m| (m, start.elapsed()))
+    /// Takes one caller's registration away, leaving anybody else waiting on
+    /// the same address still waiting.
+    fn forget_waiter(&self, dst: Ipv4Addr, id: u64) {
+        let mut waiters = self.inner.waiters.lock().unwrap();
+        if let Some(list) = waiters.get_mut(&dst) {
+            list.retain(|w| w.id != id);
+            if list.is_empty() {
+                waiters.remove(&dst);
             }
         }
     }
@@ -249,7 +317,7 @@ fn configure(fd: RawFd, interface: &str) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
 
-        // Hand packets over as they arrive rather than when the buffer fills.
+        // Hand packets over as they arrive, not when the buffer fills.
         let on: libc::c_uint = 1;
         if libc::ioctl(fd, BIOCIMMEDIATE, &on) < 0 {
             return Err(io::Error::last_os_error());
@@ -261,6 +329,14 @@ fn configure(fd: RawFd, interface: &str) -> io::Result<()> {
 
         let program = BpfProgram { len: ARP_FILTER.len() as libc::c_uint, insns: ARP_FILTER.as_ptr() };
         libc::ioctl(fd, BIOCSETF, &program);
+
+        // Do not hand our own frames back to us. A sweep sends one broadcast
+        // per address, and capturing all of them fills the buffer with
+        // questions instead of answers, and the replies we are waiting
+        // for are then dropped, and a scan comes back with no hardware
+        // addresses at all.
+        let off: libc::c_uint = 0;
+        libc::ioctl(fd, BIOCSSEESENT, &off);
 
         // A read timeout, so a reader blocked on a quiet link still comes back
         // often enough to notice it should stop.
@@ -328,6 +404,7 @@ fn dispatch(inner: &Inner, data: &[u8]) {
 
         if let Some((ip, mac)) = parse_reply(&data[off + hdrlen..off + hdrlen + caplen]) {
             inner.learned.lock().unwrap().insert(ip, mac);
+            remember(ip, mac);
             if let Some(waiters) = inner.waiters.lock().unwrap().remove(&ip) {
                 for w in waiters {
                     let _ = w.tx.send(mac);
@@ -372,7 +449,7 @@ fn parse_reply(frame: &[u8]) -> Option<(Ipv4Addr, [u8; 6])> {
 ///
 /// `getifaddrs` reports `02:00:00:00:00:00` on recent macOS, which is useless
 /// as the sender of an ARP request, so the configuration database is asked
-/// instead — it still tells the truth.
+/// instead, which still tells the truth.
 pub fn real_mac(interface: &str) -> Option<[u8; 6]> {
     #[cfg(target_os = "macos")]
     if let Some(mac) = mac_from_networksetup(interface) {
@@ -459,6 +536,24 @@ mod tests {
         assert!(parse_reply(&reply_frame([192, 168, 1, 5], [0; 6])).is_none());
 
         assert!(parse_reply(&[0u8; 20]).is_none());
+    }
+
+    #[test]
+    fn what_the_wire_said_is_remembered_between_runs() {
+        // A BPF handle lives as long as one scan, so without this the second
+        // scan of a network starts knowing nothing and has to ask again for
+        // every host, which left the hardware column half empty.
+        let addr = Ipv4Addr::new(198, 51, 100, 7);
+        assert_eq!(remembered(addr), None);
+        remember(addr, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(remembered(addr), Some([1, 2, 3, 4, 5, 6]));
+
+        // And forgotten once it is old enough to be about a different device.
+        REMEMBERED.lock().unwrap().as_mut().expect("the table").insert(
+            addr,
+            ([1, 2, 3, 4, 5, 6], Instant::now() - REMEMBER_FOR - Duration::from_secs(1)),
+        );
+        assert_eq!(remembered(addr), None);
     }
 
     #[test]

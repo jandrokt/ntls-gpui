@@ -15,7 +15,8 @@ use crate::ui::job::Job;
 use crate::ui::store::Tag;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{
-    Kind, Type, button, dot, figure, icon_button, pill, progress_bar, space, text,
+    Kind, Segment, Segments, Type, button, dot, figure, icon_button, pill, progress_bar, space,
+    switch, text,
 };
 
 use super::chrome::status_pill;
@@ -28,7 +29,7 @@ const GUTTER: f32 = space::GUTTER;
 /// around it without the text moving.
 const ROW_INSET: f32 = 3.;
 /// One character of the table's monospace face, near enough for column
-/// widths. Cells are clipped rather than wrapped, so a small error costs a
+/// widths. Cells are clipped, not wrapped, so a small error costs a
 /// little padding and nothing else.
 const CHAR_W: f32 = 7.3;
 
@@ -74,7 +75,7 @@ impl App {
             .children(table)
             .children(handoff)
             // With no table to take the slack, the form floats at the top
-            // rather than stretching down the pane.
+            // and does not stretch down the pane.
             .when(!show_table, |d| d.child(div().flex_1()))
             .into_any_element()
     }
@@ -133,13 +134,13 @@ impl App {
                     .when(renaming, |d| {
                         // Naming a run and colouring it are one act, so the
                         // box, the colours and the way out sit together where
-                        // the name was — not in a second row with the button
+                        // the name was, not in a second row with the button
                         // that ends it pushed to the far side of the window.
                         d.child(
                             div()
                                 .id("rename-group")
                                 // Clicking away keeps the name and closes the
-                                // box, which is what every other editor does.
+                                // box, as every other editor does.
                                 .on_mouse_down_out(cx.listener(|app, _, window, cx| {
                                     app.end_rename(window, cx)
                                 }))
@@ -294,8 +295,8 @@ impl App {
             .into_any_element()
     }
 
-    /// Run, or — for a tool that was interrupted with results already in hand
-    /// — resume where it stopped, or start over.
+    /// Run, or for a tool interrupted with results already in hand, resume
+    /// where it stopped, or start over.
     fn run_controls(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(job) = self.selected_job() else { return Vec::new() };
         if job.state.is_running() {
@@ -307,7 +308,7 @@ impl App {
         }
 
         // Resuming only means anything for a tool that can be told what it
-        // already covered — and only while there is something left. A run
+        // already covered, and only while there is something left. A run
         // whose own progress says it finished has nothing to carry on with,
         // so it offers to start again instead.
         let finished = matches!(job.progress, Some((done, total, _)) if total > 0 && done >= total);
@@ -343,7 +344,7 @@ impl App {
     ///
     /// The target is the question and everything else is a preference, so the
     /// target gets a line of its own at full width and the rest sit in a grid
-    /// beneath it. The help for a field appears when the field does — under
+    /// beneath it. The help for a field appears when the field does, under
     /// the caret, or under the mistake.
     fn form(
         &mut self,
@@ -400,9 +401,12 @@ impl App {
                         .child(input.clone())
                         .into_any_element()
                 }
-                FieldKind::Bool => switch(i, job.params.bool(field.key), theme, cx).into_any_element(),
+                FieldKind::Bool => {
+                    field_switch(i, job.params.bool(field.key), theme, cx).into_any_element()
+                }
                 FieldKind::Select => {
-                    segmented(field, &job.params.str(field.key), theme, cx).into_any_element()
+                    let current = job.params.str(field.key);
+                    segmented(self, field, &current, theme, cx)
                 }
             };
 
@@ -428,7 +432,7 @@ impl App {
                     // The hint has a reserved line, so a field does not jump
                     // when its help appears. It is exactly one line box tall:
                     // anything shorter clips the text it is reserving room
-                    // for, which is how a hint turns into an ellipsis.
+                    // for, and the hint turns into an ellipsis.
                     div()
                         .w_full()
                         .h(text::LINE)
@@ -568,11 +572,11 @@ impl App {
     }
 
     fn table(&mut self, columns: Vec<Column>, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        // The note column is always there. A note you can only add through a
-        // separate box is a note nobody adds, so the column is a place to
-        // type rather than a place notes appear once they exist.
+        // The note column is always there: a note you could only add through
+        // a separate box would not get used, so the column itself is where
+        // you type.
         let notes = self.workspace().notes.clone();
-        // Whichever row is this machine gets said so plainly, rather than
+        // Whichever row is this machine gets said so plainly, and not
         // hidden in a sentence at the end of the line.
         let local: Vec<String> = iface::local_addrs().iter().map(|a| a.to_string()).collect();
 
@@ -625,12 +629,7 @@ impl App {
                             .cursor_pointer()
                             .hover(|s| s.text_color(theme.accent))
                             .child(format!("{}{arrow}", c.title))
-                            .on_click(cx.listener(move |app, _, _, cx| {
-                                if let Some(job) = app.selected_job_mut() {
-                                    job.set_sort(i);
-                                    cx.notify();
-                                }
-                            })),
+                            .on_click(cx.listener(move |app, _, _, cx| app.sort_results(i, cx))),
                     )
                     // The grip sits on the column's right edge. Dragging it
                     // sets a width; double-clicking hands the column back to
@@ -713,13 +712,7 @@ impl App {
                 match sort {
                     Some(_) => vec![
                         button("clear-sort", "Clear sort", Kind::Ghost, theme)
-                            .on_click(cx.listener(|app, _, _, cx| {
-                                if let Some(job) = app.selected_job_mut() {
-                                    job.sort = None;
-                                    job.set_filter(job.filter.clone());
-                                    cx.notify();
-                                }
-                            }))
+                            .on_click(cx.listener(|app, _, _, cx| app.clear_sort(cx)))
                             .into_any_element(),
                     ],
                     None => Vec::new(),
@@ -791,7 +784,7 @@ impl App {
     }
 
     /// The row of tools a selected result can be sent to. Enter sends it to
-    /// the first one, which is the move worth knowing.
+    /// the first one, the move worth knowing.
     /// The row above a table: the filter box, a count, and whatever the view
     /// puts beside them.
     fn filter_row(
@@ -850,7 +843,7 @@ impl App {
     /// One run read against another, in place of the table.
     ///
     /// The rows are matched on their targets, so what comes out is what
-    /// appeared, what went, and what changed — which is the question a scan
+    /// appeared, what went, and what changed. That is the question a scan
     /// run twice is asking.
     fn comparison(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let job = self.selected_job()?;
@@ -1007,8 +1000,8 @@ impl App {
 
     /// The bar under the table: what is selected, and where it can be sent.
     ///
-    /// A result is rarely the end of a question — a host from a sweep goes
-    /// into a port scan, a name from a certificate log goes into a lookup — so
+    /// A result is rarely the end of a question. A host from a sweep goes into
+    /// a port scan, a name from a certificate log goes into a lookup, so
     /// the row you are on carries the tools it can become.
     fn handoff_bar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let job = self.selected_job_mut()?;
@@ -1116,7 +1109,7 @@ impl App {
     /// The panel under the editor: what the run had to say, and how far
     /// through it is.
     ///
-    /// It is one panel rather than one per tool, the way an editor has one
+    /// It is one panel instead of one per tool, the way an editor has one
     /// terminal drawer: whatever is in front of you is what it is showing.
     pub(super) fn panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let job = self.selected_job()?;
@@ -1242,53 +1235,34 @@ impl App {
 /// the options behind a click; there are never more than a handful here, so
 /// showing them costs a row and saves the click.
 fn segmented(
+    app: &mut App,
     field: &crate::core::Field,
     current: &str,
     theme: &Theme,
     cx: &mut Context<App>,
-) -> impl IntoElement {
-    let options: Vec<AnyElement> = field
+) -> AnyElement {
+    let at = field.options.iter().position(|o| o.value == current).unwrap_or(0);
+    let from = app.segment_from(&format!("field-{}", field.key), at);
+    let options = field
         .options
         .iter()
         .map(|o| {
-            let selected = o.value == current;
             let (key, value) = (field.key, o.value.clone());
-            div()
-                .id(SharedString::from(format!("opt-{}-{}", field.key, o.value)))
-                .flex()
-                .items_center()
-                .h(px(22.))
-                .px(px(space::SNUG))
-                .rounded(px(4.))
-                .text_small()
-                .whitespace_nowrap()
-                .cursor_pointer()
-                .when(selected, |d| d.bg(theme.accent).text_color(theme.on_accent))
-                .when(!selected, |d| d.text_color(theme.dim).hover(|s| s.bg(theme.hover)))
-                .child(o.label.clone())
-                .on_click(cx.listener(move |app, _, _, cx| app.set_field(key, &value, cx)))
-                .into_any_element()
+            Segment::new(
+                o.label.clone(),
+                cx.listener(move |app: &mut App, _, _, cx| app.set_field(key, &value, cx)),
+            )
         })
         .collect();
-
-    div()
-        .flex()
-        .flex_wrap()
-        .gap(px(2.))
-        .p(px(2.))
-        .rounded(px(6.))
-        .bg(theme.raised)
-        .border_1()
-        .border_color(theme.border)
-        .children(options)
+    Segments { id: format!("opt-{}", field.key), options, current: at, from }.render(theme)
 }
 
-fn switch(field_index: usize, on: bool, theme: &Theme, cx: &mut Context<App>) -> impl IntoElement {
-    let (track, knob) = if on {
-        (theme.accent, theme.on_accent)
-    } else {
-        (theme.track, theme.faint)
-    };
+fn field_switch(
+    field_index: usize,
+    on: bool,
+    theme: &Theme,
+    cx: &mut Context<App>,
+) -> impl IntoElement {
     div()
         .id(SharedString::from(format!("switch-{field_index}")))
         .flex()
@@ -1296,18 +1270,7 @@ fn switch(field_index: usize, on: bool, theme: &Theme, cx: &mut Context<App>) ->
         .h(px(28.))
         .cursor_pointer()
         .on_click(cx.listener(move |app, _, _, cx| app.cycle_field(field_index, 1, cx)))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .w(px(32.))
-                .h(px(18.))
-                .p(px(2.))
-                .rounded_full()
-                .bg(track)
-                .when(on, |d| d.justify_end())
-                .child(div().size(px(14.)).rounded_full().bg(knob)),
-        )
+        .child(switch(&format!("field-{field_index}"), on, theme))
 }
 
 /// One colour a thing can be tagged with.
@@ -1348,6 +1311,19 @@ pub(super) fn swatch(
 
 /// The width the note column takes once there is anything in it.
 const NOTE_WIDTH: Pixels = px(200.);
+
+/// What the row for this machine's own address is called, in the words the
+/// system it is running on uses for itself.
+const SELF_LABEL: &str = if cfg!(target_os = "macos") {
+    "this Mac"
+} else if cfg!(target_os = "windows") {
+    "this PC"
+} else {
+    "this host"
+};
+
+/// The room the marker on that row needs at the right-hand end.
+const SELF_BADGE: Pixels = px(72.);
 
 /// What the table needs to know about a row beyond the tool's own cells.
 struct RowStyle {
@@ -1519,6 +1495,11 @@ fn table_row(
 
     div()
         .id(display_index)
+        // The marker on this machine's own row is drawn over the row rather
+        // than added to it: as another child it took its width out of the
+        // flexible column, and that one row's columns then lined up with
+        // nothing else in the table.
+        .relative()
         .flex()
         .w_full()
         .items_center()
@@ -1536,7 +1517,7 @@ fn table_row(
             }
         }))
         // Right-clicking a result selects it first, so the menu is about the
-        // row under the pointer rather than about whatever was selected
+        // row under the pointer and not about whatever was selected
         // before.
         .on_mouse_down(
             gpui::MouseButton::Right,
@@ -1566,6 +1547,9 @@ fn table_row(
                 .w(NOTE_WIDTH)
                 .flex_shrink_0()
                 .px(px(5.))
+                // The marker is drawn over the end of this cell, so the box
+                // typed into stops short of it and does not run under it.
+                .when(is_self, |d| d.pr(SELF_BADGE))
                 .on_mouse_down_out(cx.listener(|app, _, window, cx| app.end_note(window, cx)))
                 .child(
                     div()
@@ -1588,6 +1572,10 @@ fn table_row(
                 .w(NOTE_WIDTH)
                 .flex_shrink_0()
                 .px(px(7.))
+                // The marker is drawn over the end of this cell, so the note
+                // stops short of it and does not run underneath it. The
+                // cell keeps its width either way.
+                .when(is_self, |d| d.pr(SELF_BADGE))
                 .text_small()
                 .text_color(if note.is_some() { theme.dim } else { theme.faint.opacity(0.5) })
                 .whitespace_nowrap()
@@ -1608,9 +1596,13 @@ fn table_row(
         .when(is_self, |d| {
             d.child(
                 div()
-                    .pr(px(7.))
-                    .flex_shrink_0()
-                    .child(pill("this Mac", theme.accent, theme.accent_soft)),
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(px(ROW_INSET + 7.))
+                    .flex()
+                    .items_center()
+                    .child(pill(SELF_LABEL, theme.accent, theme.accent_soft)),
             )
         })
         .into_any_element()
@@ -1622,7 +1614,7 @@ fn table_row(
 /// to the widest thing actually in it, so an address column does not reserve
 /// room for text that is never there, and a column holding nothing but its
 /// heading stays that narrow. The one column declared flexible takes whatever
-/// is left, which is where a banner or a hostname gets its room.
+/// is left, where a banner or a hostname gets its room.
 fn column_widths(
     columns: &[Column],
     content: &[usize],
@@ -1647,7 +1639,7 @@ fn column_widths(
         .collect()
 }
 
-/// The description of whichever option a select is currently on, which is
+/// The description of whichever option a select is currently on, which
 /// where the real explanation of a choice lives.
 fn selected_desc(field: &crate::core::Field, job: Option<&Job>) -> String {
     let Some(job) = job else { return field.help.to_string() };
@@ -1656,7 +1648,7 @@ fn selected_desc(field: &crate::core::Field, job: Option<&Job>) -> String {
     }
     let current = job.params.str(field.key);
     match field.options.iter().find(|o| o.value == current) {
-        Some(o) if !o.desc.is_empty() => format!("{} — {}", field.help, o.desc),
+        Some(o) if !o.desc.is_empty() => format!("{}. {}", field.help, o.desc),
         _ => field.help.to_string(),
     }
 }

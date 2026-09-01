@@ -1,8 +1,8 @@
 //! Colouring the source of a document or a workflow.
 //!
 //! A tokeniser per language, run over one line at a time and producing spans a
-//! line of text can be shaped from. It is deliberately shallow — enough to see
-//! the shape of what you are writing, not a parser — because the parsers that
+//! line of text can be shaped from. It is deliberately shallow: enough to see
+//! the shape of what you are writing, not a parser. The parsers that
 //! matter already exist: [`crate::doc::render`] reads the markdown and
 //! [`crate::flow`] reads the workflow.
 
@@ -68,8 +68,8 @@ const EXPR_WORDS: [&str; 10] = [
 
 /// Colours a whole document, one list of spans per line.
 ///
-/// The spans of a line are line-relative, in order, and **cover it exactly** —
-/// the gaps between the interesting parts come back as [`Kind::Text`] — so the
+/// The spans of a line are line-relative, in order, and **cover it exactly**:
+/// the gaps between the interesting parts come back as [`Kind::Text`], so the
 /// renderer shapes a line by walking its spans once and never has to work out
 /// what it missed.
 pub fn highlight(language: Language, source: &str) -> Vec<Vec<Span>> {
@@ -331,7 +331,7 @@ fn expression(text: &str, offset: usize) -> Vec<Span> {
     spans
 }
 
-/// A heading — or anything else that is one colour — with the expressions in
+/// A heading, or anything else that is one colour, with the expressions in
 /// it picked out.
 fn with_expressions(line: &str, around: Kind) -> Vec<Span> {
     let mut spans = Vec::new();
@@ -360,8 +360,8 @@ mod tests {
         spans.iter().map(|s| s.kind).collect()
     }
 
-    /// The coloured runs of a line, ignoring the plain text between them,
-    /// which is what these tests are about.
+    /// The coloured runs of a line, ignoring the plain text between them.
+    /// That is what these tests check.
     fn marked<'a>(line: &'a str, spans: &'a [Span]) -> Vec<(Kind, &'a str)> {
         spans
             .iter()

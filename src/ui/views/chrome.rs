@@ -5,21 +5,21 @@
 //! and a lot of output underneath. So there is an activity bar of views down
 //! the far edge, a side bar listing what this workspace holds, a tab per open
 //! tool across the top of the editor, an output panel beneath it, and a status
-//! bar along the bottom. Nothing here knows what a tool does — a tab, a tree
+//! bar along the bottom. Nothing here knows what a tool does: a tab, a tree
 //! row and a breadcrumb are built from the same `Job` the pane is.
 
 use gpui::{
-    AnyElement, AppContext, Context, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    AnimationExt, AnyElement, AppContext, Context, FontWeight, Hsla, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
-use crate::ui::app::{App, VarPart, View};
+use crate::ui::app::{App, Dest, Page, View};
 use crate::ui::chart::spark;
 use crate::ui::icons::icon;
 use crate::ui::job::{Job, State};
-use crate::ui::theme::{Mode, Theme};
-use crate::ui::widgets::{Kind, Type, button, dot, keycap, pill, ring, space, text};
+use crate::ui::theme::Theme;
+use crate::ui::widgets::{Kind, Type, button, dot, keycap, motion, once, pill, ring, space, text};
 use crate::ui::workspace::{Group, Item, Stage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +62,35 @@ impl Render for DragPreview {
     }
 }
 
+/// What a wordless control is, shown when the pointer rests on it.
+///
+/// The rail is icons and nothing else, which keeps it narrow, and a
+/// row of actions on a variable is the same bargain; a name on hover is what
+/// stops either being a guessing game.
+pub(super) struct Tip {
+    pub label: &'static str,
+    pub theme: Theme,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .h(px(22.))
+            .px(px(space::SNUG))
+            .rounded(px(5.))
+            .bg(self.theme.panel)
+            .border_1()
+            .border_color(self.theme.border)
+            .shadow_lg()
+            .text_small()
+            .text_color(self.theme.text)
+            .whitespace_nowrap()
+            .child(self.label)
+    }
+}
+
 /// How a row says it will take what is being dragged.
 ///
 /// One answer everywhere: the same tint and the same outline, so a drop
@@ -77,7 +106,11 @@ fn takes_a_drop(style: gpui::StyleRefinement, tint: Hsla, edge: Hsla) -> gpui::S
 /// macOS puts them inside the window and ntls draws its own strip behind
 /// them; Windows and Linux put theirs at the right, in a titlebar the system
 /// draws itself, so there is nothing to leave room for.
-const TRAFFIC_LIGHTS: Pixels = if cfg!(target_os = "macos") { px(84.) } else { px(8.) };
+const TRAFFIC_LIGHTS: Pixels = if cfg!(target_os = "macos") {
+    px(crate::sys::TITLEBAR_INSET)
+} else {
+    px(8.)
+};
 /// The rail of view icons.
 const ACTIVITY_WIDTH: Pixels = px(48.);
 /// One row of a tree, a tab strip, or the status bar. Three heights for the
@@ -110,7 +143,7 @@ impl App {
             })
             .flex()
             .items_center()
-            .h(px(35.))
+            .h(px(crate::sys::TITLEBAR_HEIGHT))
             .flex_shrink_0()
             .pl(TRAFFIC_LIGHTS)
             .pr(px(space::SNUG))
@@ -198,26 +231,23 @@ impl App {
                         chrome_button("toggle-panel", "panel", panel_open, theme)
                             .on_click(cx.listener(|app, _, _, cx| app.toggle_panel(cx))),
                     )
-                    .child(
-                        chrome_button(
-                            "toggle-theme",
-                            if theme.mode == Mode::Dark { "sun" } else { "moon" },
-                            false,
-                            theme,
-                        )
-                        .on_click(cx.listener(|app, _, _, cx| app.toggle_theme(cx))),
-                    ),
+                    ,
             )
             .into_any_element()
     }
 
     // --- the activity bar -------------------------------------------------
 
-    /// The rail of views, and the way to reach the palette from the mouse.
+    /// The rail: everywhere the window goes, and the way to reach the palette
+    /// from the mouse.
+    ///
+    /// Views and pages are drawn by the same function on purpose. Behind the
+    /// icon they are different things (one fills the side bar, one fills the
+    /// window) but in front of it they are all just places, and a rail whose
+    /// icons disagree about their own size and colour reads as two rails.
     pub(super) fn activity_bar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let (current, open) = (self.view, self.sidebar_open);
-        // A badge says something is happening in a view you are not looking
-        // at. A count of things that merely exist is noise on every icon.
+        // A badge says something is happening somewhere you are not looking.
+        // A count of things that merely exist is noise on every icon.
         let elsewhere = self
             .workspaces
             .iter()
@@ -225,9 +255,17 @@ impl App {
             .filter(|(i, w)| *i != self.active && w.is_busy())
             .count();
         let here = self.workspace().jobs.iter().filter(|j| j.state.is_running()).count();
-        // One per view, in the same order: only the two that can have
-        // something happening in them ever show a badge.
-        let counts = [elsewhere, here, 0, 0];
+        let count_for = |dest: Dest| match dest {
+            Dest::View(View::Workspaces) => elsewhere,
+            Dest::View(View::Tools) => here,
+            _ => 0,
+        };
+        let places: Vec<AnyElement> = Dest::RAIL
+            .into_iter()
+            .map(|dest| rail_icon(dest, self.showing(dest), count_for(dest), theme, cx))
+            .collect();
+        let settings = Dest::Page(Page::Settings);
+        let settings = rail_icon(settings, self.showing(settings), 0, theme, cx);
 
         div()
             .flex()
@@ -239,9 +277,7 @@ impl App {
             .bg(theme.activity)
             .border_r_1()
             .border_color(theme.border)
-            .children(View::ALL.into_iter().zip(counts).map(|(view, count)| {
-                activity_icon(view, open && view == current, count, theme, cx)
-            }))
+            .children(places)
             .child(div().flex_1())
             .child(
                 div()
@@ -249,13 +285,16 @@ impl App {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(40.))
-                    .rounded(px(6.))
+                    .size(px(44.))
+                    .flex_shrink_0()
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.hover))
-                    .child(icon("plus", px(18.), theme.dim))
+                    .child(icon("plus", px(20.), theme.dim))
                     .on_click(cx.listener(|app, _, window, cx| app.open_palette(window, cx))),
             )
+            // The application's own settings sit at the foot, under everything
+            // they are the settings for.
+            .child(settings)
             .into_any_element()
     }
 
@@ -263,12 +302,14 @@ impl App {
 
     pub(super) fn sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let view = self.view;
-        let width = self.sidebar_width;
+        let width = self.sidebar_at();
+        // Closing it is a slide, so the contents keep their own width while
+        // the panel narrows past them and does not reflow into a column an
+        // inch wide on the way out.
+        let inner = self.sidebar_width;
         let body = match view {
             View::Workspaces => self.workspaces_view(theme, cx),
             View::Tools => self.tools_view(theme, cx),
-            View::Variables => self.variables_view(theme, cx),
-            View::Machine => self.machine_view(theme, cx),
         };
 
         div()
@@ -277,6 +318,7 @@ impl App {
             .flex_col()
             .w(px(width))
             .flex_shrink_0()
+            .overflow_hidden()
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.border)
@@ -284,7 +326,9 @@ impl App {
                 div()
                     .flex()
                     .items_center()
-                    .h(px(35.))
+                    .w(px(inner))
+                    .flex_shrink_0()
+                    .h(px(crate::sys::TITLEBAR_HEIGHT))
                     .pl(px(space::ROOMY))
                     .pr(px(space::TIGHT))
                     .flex_shrink_0()
@@ -301,42 +345,21 @@ impl App {
                                     .text_color(theme.dim)
                                     .flex_shrink_0()
                                     .child(view.title().to_uppercase()),
-                            )
-                            // Which workspace you are in is the question the
-                            // tools list cannot answer for itself, so its
-                            // header answers it.
-                            .when(view == View::Tools, |d| {
-                                d.child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(space::TIGHT / 2.))
-                                        .min_w_0()
-                                        .child(icon("chevron-right", px(11.), theme.faint))
-                                        .children(
-                                            self.workspace().tag.color().map(|c| {
-                                                div()
-                                                    .size(px(7.))
-                                                    .rounded_full()
-                                                    .bg(c)
-                                                    .flex_shrink_0()
-                                            }),
-                                        )
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .text_caps()
-                                                .text_color(theme.text)
-                                                .truncate()
-                                                .child(self.workspace().name()),
-                                        ),
-                                )
-                            }),
+                            ),
                     )
                     .children(self.sidebar_actions(view, theme, cx)),
             )
-            .child(div().flex().flex_col().flex_1().min_h_0().child(body))
-            // The edge is a grab handle four pixels wide, which is enough to
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .w(px(inner))
+                    .flex_shrink_0()
+                    .child(body),
+            )
+            // The edge is a grab handle four pixels wide: enough to
             // hit and narrow enough not to look like a scrollbar.
             .child(
                 div()
@@ -378,16 +401,6 @@ impl App {
                     .into_any_element(),
                 chrome_button("add-tool", "plus", false, theme)
                     .on_click(cx.listener(|app, _, w, cx| app.open_palette(w, cx)))
-                    .into_any_element(),
-            ],
-            View::Variables => vec![
-                chrome_button("new-var", "plus", false, theme)
-                    .on_click(cx.listener(|app, _, w, cx| app.new_var(w, cx)))
-                    .into_any_element(),
-            ],
-            View::Machine => vec![
-                chrome_button("refresh-ifaces", "refresh", false, theme)
-                    .on_click(cx.listener(|app, _, _, cx| app.refresh_interfaces(cx)))
                     .into_any_element(),
             ],
         }
@@ -686,7 +699,7 @@ impl App {
         let mut rows: Vec<AnyElement> = Vec::new();
 
         // Folders first, each with what is inside it, and what is loose in
-        // the workspace after them — the way a file manager lists a directory,
+        // the workspace after them, the way a file manager lists a directory,
         // so the shape of the workspace is the first thing the panel says.
         let mut places: Vec<Option<String>> =
             self.workspace().folders().into_iter().map(Some).collect();
@@ -729,8 +742,8 @@ impl App {
                     }
                     let section_key = format!("section:{}:{}", folder.unwrap_or("root"), stage.title());
                     let section_collapsed = self.is_collapsed(&section_key);
-                    // Every heading, wherever it is, can be emptied — and
-                    // empties the heading that was clicked rather than every
+                    // Every heading, wherever it is, can be emptied, and
+                    // empties the heading that was clicked and not every
                     // group of that name in the workspace.
                     let group = Group::Stage(stage);
                     let here = (group, folder.map(str::to_string));
@@ -865,8 +878,8 @@ impl App {
                 // Everything the folder holds is drawn against one continuous
                 // rule at the folder's own indent, so a long folder still
                 // reads as one thing and the row after it plainly is not in
-                // it. The rule is drawn over the rows rather than beside
-                // them, which is what keeps the indent the same as it was.
+                // it. The rule is drawn over the rows and not beside
+                // them, so the indent stays where it was.
                 if !inside.is_empty() {
                     rows.push(
                         div()
@@ -972,417 +985,8 @@ impl App {
             .into_any_element()
     }
 
-    /// What this machine is attached to, which is worth having open while a
+    /// What this machine is attached to, useful to have open while a
     /// scan runs.
-    /// The workspace's variables.
-    ///
-    /// A variable is either a piece of text or a formula — an expression
-    /// worked out afresh every time it is read — and both are shown as what
-    /// they come to, with the formula underneath. Every row says where its
-    /// value came from and what reads it, because a variable nobody reads and
-    /// a variable a workflow rewrote every night look identical until it says
-    /// so.
-    fn variables_view(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        use crate::ui::app::VarPart;
-
-        let editing = self.editing_var.clone();
-        if editing.is_some() {
-            style_input(&self.var_input, theme, cx);
-        }
-        let input = self.var_input.clone();
-        let names: Vec<String> = self.workspace().vars.keys().cloned().collect();
-
-        let rows: Vec<AnyElement> = names
-            .into_iter()
-            .map(|name| {
-                let var = self.workspace().var(&name).cloned().unwrap_or_default();
-                let worked_out = self.var_value(&name);
-                let used_by = self.var_used_by(&name);
-                let editing_name = editing.as_ref() == Some(&(name.clone(), VarPart::Name));
-                let editing_value = editing.as_ref() == Some(&(name.clone(), VarPart::Value));
-                let editing_about = editing.as_ref() == Some(&(name.clone(), VarPart::About));
-                self.variable_row(
-                    &name,
-                    &var,
-                    worked_out,
-                    &used_by,
-                    (editing_name, editing_value, editing_about),
-                    input.clone(),
-                    theme,
-                    cx,
-                )
-            })
-            .collect();
-
-        let empty = rows.is_empty();
-        let count = rows.len();
-        div()
-            .id("variables")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .when(!empty, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(space::TIGHT))
-                        .px(px(space::ROOMY))
-                        .pt(px(space::TIGHT))
-                        .pb(px(space::TIGHT))
-                        .text_meta()
-                        .text_color(theme.faint)
-                        .child(format!(
-                            "{count} variable{}, read by every document and condition here",
-                            if count == 1 { "" } else { "s" }
-                        )),
-                )
-            })
-            .when(empty, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(space::SNUG))
-                        .px(px(space::ROOMY))
-                        .py(px(space::ROOMY))
-                        .child(div().text_small().text_color(theme.dim).child(
-                            "Nothing here yet. A variable is a piece of text with a name — or a formula that works one out — read by every document and condition in this workspace, and a workflow can set one as it runs.",
-                        ))
-                        .child(
-                            button("var-add", "Add a variable", Kind::Primary, theme)
-                                .w_full()
-                                .on_click(cx.listener(|app, _, w, cx| app.new_var(w, cx))),
-                        ),
-                )
-            })
-            .children(rows)
-            .into_any_element()
-    }
-
-    /// One variable: what it is called, what it comes to, and everything that
-    /// is true about it underneath.
-    #[allow(clippy::too_many_arguments)]
-    fn variable_row(
-        &self,
-        name: &str,
-        var: &crate::ui::store::Var,
-        worked_out: Result<String, String>,
-        used_by: &[String],
-        editing: (bool, bool, bool),
-        input: gpui::Entity<crate::ui::text_input::TextInput>,
-        theme: &Theme,
-        cx: &mut Context<App>,
-    ) -> AnyElement {
-        let (editing_name, editing_value, editing_about) = editing;
-        let (for_name, for_value, for_about, for_formula, for_close) = (
-            name.to_string(),
-            name.to_string(),
-            name.to_string(),
-            name.to_string(),
-            name.to_string(),
-        );
-
-        let (shown, wrong) = match &worked_out {
-            Ok(value) if value.is_empty() => ("\u{2014}".to_string(), false),
-            Ok(value) => (value.clone(), false),
-            Err(why) => (why.clone(), true),
-        };
-        // A formula says what it is as well as what it comes to; text is just
-        // itself, and repeating it underneath would say nothing.
-        let under = if var.formula {
-            Some(format!("= {}", var.value))
-        } else {
-            None
-        };
-        let provenance = match (&var.set_by, var.at) {
-            (Some(by), Some(at)) => Some(format!("set by {by} {}", ago(at))),
-            (Some(by), None) => Some(format!("set by {by}")),
-            _ => None,
-        };
-        let reads = match used_by.len() {
-            0 => "nothing reads it yet".to_string(),
-            1 => format!("read by {}", used_by[0]),
-            n => format!("read by {} and {} more", used_by[0], n - 1),
-        };
-
-        div()
-            .id(SharedString::from(format!("var-{name}")))
-            .group("var")
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .px(px(space::ROOMY))
-            .py(px(space::TIGHT))
-            .hover(|s| s.bg(theme.hover))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(space::TIGHT))
-                    .h(px(20.))
-                    .child(if editing_name {
-                        boxed_input(input.clone(), px(110.), theme).into_any_element()
-                    } else {
-                        div()
-                            .id("var-name")
-                            .w(px(110.))
-                            .flex_shrink_0()
-                            .mono()
-                            .text_small()
-                            .text_color(theme.accent)
-                            .truncate()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |app, _, window, cx| {
-                                app.edit_var(for_name.clone(), VarPart::Name, window, cx);
-                            }))
-                            .child(name.to_string())
-                            .into_any_element()
-                    })
-                    .child(if editing_value {
-                        boxed_input(input.clone(), px(0.), theme).into_any_element()
-                    } else {
-                        div()
-                            .id("var-value")
-                            .flex_1()
-                            .min_w_0()
-                            .mono()
-                            .text_small()
-                            .text_color(if wrong {
-                                theme.down
-                            } else if shown == "\u{2014}" {
-                                theme.faint
-                            } else {
-                                theme.text
-                            })
-                            .truncate()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |app, _, window, cx| {
-                                app.edit_var(for_value.clone(), VarPart::Value, window, cx);
-                            }))
-                            .child(shown)
-                            .into_any_element()
-                    })
-                    // Text or formula, switched where the difference shows.
-                    .child(
-                        div()
-                            .id("var-formula")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(20.))
-                            .h(px(18.))
-                            .flex_shrink_0()
-                            .rounded(px(4.))
-                            .mono()
-                            .text_meta()
-                            .cursor_pointer()
-                            .when(var.formula, |d| d.bg(theme.accent_soft).text_color(theme.accent))
-                            .when(!var.formula, |d| d.text_color(theme.faint))
-                            .hover(|s| s.bg(theme.hover))
-                            .child("=")
-                            .on_click(cx.listener(move |app, _, _, cx| {
-                                app.toggle_var_formula(&for_formula, cx);
-                            })),
-                    )
-                    .child(close_button(format!("var-close-{name}"), theme).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |app, _, _, cx| {
-                            app.remove_var(&for_close, cx);
-                            cx.stop_propagation();
-                        }),
-                    )),
-            )
-            .children(under.map(|under| {
-                div()
-                    .pl(px(118.))
-                    .mono()
-                    .text_meta()
-                    .text_color(theme.dim)
-                    .truncate()
-                    .child(under)
-            }))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(space::TIGHT))
-                    .pl(px(118.))
-                    .child(if editing_about {
-                        boxed_input(input, px(0.), theme).into_any_element()
-                    } else {
-                        div()
-                            .id("var-about")
-                            .flex_1()
-                            .min_w_0()
-                            .text_meta()
-                            .text_color(theme.faint)
-                            .truncate()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |app, _, window, cx| {
-                                app.edit_var(for_about.clone(), VarPart::About, window, cx);
-                            }))
-                            .child(if var.about.is_empty() {
-                                match &provenance {
-                                    Some(said) => format!("{said} \u{b7} {reads}"),
-                                    None => reads.clone(),
-                                }
-                            } else {
-                                var.about.clone()
-                            })
-                            .into_any_element()
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn machine_view(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let chosen = self.default_iface.clone();
-        let rows: Vec<AnyElement> = self
-            .ifaces
-            .iter()
-            .map(|i| {
-                let picked = chosen.as_deref() == Some(i.name.as_str());
-                let routed = i.default && chosen.is_none();
-                let colour = if i.default { theme.up } else { theme.faint };
-                let (name, addrs) = (i.name.clone(), i.addrs.clone());
-                let copyable = addrs.first().map(|a| a.to_string());
-                let pick = name.clone();
-                div()
-                    .id(SharedString::from(format!("iface-{name}")))
-                    .cursor_pointer()
-                    .when(picked, |d| d.bg(theme.selected))
-                    // Choosing one here is what every tool's Interface setting
-                    // starts on, which beats choosing it in every form.
-                    .on_click(cx.listener(move |app, _, _, cx| {
-                        let next = (!picked).then(|| pick.clone());
-                        app.set_default_iface(next, cx);
-                    }))
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.))
-                    .px(px(space::ROOMY))
-                    .py(px(space::TIGHT))
-                    .hover(|s| s.bg(theme.hover))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |app, e: &gpui::MouseDownEvent, _, cx| {
-                            let mut items =
-                                vec![crate::ui::menu::Item::choice(
-                                    format!("Copy {name}"),
-                                    "link",
-                                    crate::ui::menu::Act::CopyText(name.clone()),
-                                )];
-                            if let Some(address) = &copyable {
-                                items.push(crate::ui::menu::Item::choice(
-                                    format!("Copy {address}"),
-                                    "link",
-                                    crate::ui::menu::Act::CopyText(address.clone()),
-                                ));
-                            }
-                            app.open_menu(e.position, items, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    // One family and one size across the row: the dot and the
-                    // pill carry the difference instead.
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(space::TIGHT))
-                            .child(dot(colour))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_small()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.text)
-                                    .truncate()
-                                    .child(i.name.clone()),
-                            )
-                            .when(picked, |d| {
-                                d.child(pill("using", theme.accent, theme.accent_soft))
-                            })
-                            .when(routed, |d| {
-                                d.child(pill("default route", theme.up, theme.up_soft))
-                            })
-                            .when(i.default && !routed, |d| {
-                                d.child(pill("route", theme.dim, theme.track))
-                            }),
-                    )
-                    .children(i.addrs.iter().map(|a| {
-                        div()
-                            .pl(px(14.))
-                            .mono()
-                            .text_meta()
-                            .text_color(theme.dim)
-                            .child(a.to_string())
-                    }))
-                    .into_any_element()
-            })
-            .collect();
-
-        let explanation = match &self.default_iface {
-            Some(name) => format!("New tools use {name}."),
-            None => "New tools use the default route. Select one to override.".to_string(),
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .child(
-                div()
-                    .id("machine")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(rows),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(space::TIGHT))
-                    .px(px(space::ROOMY))
-                    .py(px(space::SNUG))
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(theme.rule)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_meta()
-                            .text_color(theme.faint)
-                            .child(explanation),
-                    )
-                    .when(self.default_iface.is_some(), |d| {
-                        d.child(
-                            div()
-                                .id("iface-clear")
-                                .px(px(space::TIGHT))
-                                .text_meta()
-                                .text_color(theme.dim)
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(theme.text))
-                                .child("Clear")
-                                .on_click(cx.listener(|app, _, _, cx| {
-                                    app.set_default_iface(None, cx)
-                                })),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
     // --- the editor's tab strip -------------------------------------------
 
     /// A tab per open tool, in the order the keyboard walks them.
@@ -1527,6 +1131,7 @@ impl App {
         let others = self.ifaces.len().saturating_sub(1);
         let busy = self.workspaces.iter().filter(|w| w.is_busy()).count();
         let results = self.selected_job().map(|j| j.rows.len());
+        let unread = self.notices.unread();
         let on = theme.status_fg;
 
         div()
@@ -1555,7 +1160,7 @@ impl App {
                             .unwrap_or_else(|| "no address".into())
                     )))
                     .when(others > 0, |d| d.child(div().text_meta().child(format!("+{others}"))))
-                    .on_click(cx.listener(|app, _, w, cx| app.show_view(View::Machine, w, cx)))
+                    .on_click(cx.listener(|app, _, w, cx| app.show_page(Page::Interfaces, w, cx)))
             }))
             .child(div().flex_1())
             .when(busy > 0, |d| {
@@ -1577,6 +1182,14 @@ impl App {
                     .child(div().text_meta().child("Output"))
                     .on_click(cx.listener(|app, _, _, cx| app.toggle_panel(cx))),
             )
+            // What the application has to say for itself, and how much of it
+            // has not been read.
+            .child(
+                status_item("status-notices", theme)
+                    .child(icon("bell", px(11.), on))
+                    .when(unread > 0, |d| d.child(div().text_meta().child(unread.to_string())))
+                    .on_click(cx.listener(|app, _, _, cx| app.toggle_notices(cx))),
+            )
             .child(
                 status_item("status-add", theme)
                     .child(div().text_meta().child(crate::sys::shortcut_label("cmd-k")))
@@ -1591,7 +1204,7 @@ impl App {
 /// Points a text editor at the current theme. Every inline editor in the
 /// frame wants exactly this, and forgetting one leaves an invisible caret.
 /// How long ago something happened, in the words a person would use.
-fn ago(at: std::time::SystemTime) -> String {
+pub(super) fn ago(at: std::time::SystemTime) -> String {
     let Ok(since) = at.elapsed() else { return "just now".into() };
     let seconds = since.as_secs();
     match seconds {
@@ -1603,7 +1216,7 @@ fn ago(at: std::time::SystemTime) -> String {
 }
 
 /// A text box the size of the thing it stands in for.
-fn boxed_input(
+pub(super) fn boxed_input(
     input: gpui::Entity<crate::ui::text_input::TextInput>,
     width: Pixels,
     theme: &Theme,
@@ -1624,7 +1237,7 @@ fn boxed_input(
         .child(input)
 }
 
-fn style_input(input: &gpui::Entity<crate::ui::text_input::TextInput>, theme: &Theme, cx: &mut Context<App>) {
+pub(super) fn style_input(input: &gpui::Entity<crate::ui::text_input::TextInput>, theme: &Theme, cx: &mut Context<App>) {
     input.update(cx, |input, _| {
         input.mono = false;
         input.text_color = theme.text;
@@ -1679,21 +1292,23 @@ fn chrome_button(
         .child(icon(name, px(14.), fg))
 }
 
-/// One view in the activity bar, lit down its inner edge while it is the one
-/// showing.
-fn activity_icon(
-    view: View,
+/// One place in the rail, lit down its inner edge while it is the one showing.
+///
+/// The indicator grows into place instead of appearing, which makes
+/// moving between two of them read as one thing moving.
+fn rail_icon(
+    dest: Dest,
     active: bool,
     count: usize,
     theme: &Theme,
     cx: &mut Context<App>,
 ) -> AnyElement {
-    // A badge on the view you are already looking at is noise; on the ones you
-    // are not, it is the only sign there is anything there.
+    // A badge on the place you are already looking at is noise; on the ones
+    // you are not, it is the only sign there is anything there.
     let badge = (!active && count > 0).then_some(count);
     let fg = if active { theme.text } else { theme.dim };
     div()
-        .id(SharedString::from(format!("activity-{}", view.icon())))
+        .id(SharedString::from(format!("rail-{}", dest.icon())))
         .relative()
         .flex()
         .items_center()
@@ -1702,17 +1317,27 @@ fn activity_icon(
         .flex_shrink_0()
         .cursor_pointer()
         .hover(move |s| s.bg(theme.hover))
-        .child(icon(view.icon(), px(20.), fg))
+        .tooltip({
+            let (label, theme) = (dest.title(), *theme);
+            move |_, cx| cx.new(|_| Tip { label, theme }).into()
+        })
+        .child(icon(dest.icon(), px(20.), fg))
         .when(active, |d| {
             d.child(
                 div()
                     .absolute()
                     .left_0()
-                    .top(px(6.))
-                    .bottom(px(6.))
                     .w(px(2.))
                     .rounded_r(px(2.))
-                    .bg(theme.accent),
+                    .bg(theme.accent)
+                    .with_animation(
+                        SharedString::from(format!("rail-mark-{}", dest.icon())),
+                        once(motion::QUICK),
+                        |d, delta| {
+                            let inset = px(6. + 12. * (1. - delta));
+                            d.opacity(delta).top(inset).bottom(inset)
+                        },
+                    ),
             )
         })
         .children(badge.map(|n| {
@@ -1732,12 +1357,11 @@ fn activity_icon(
                 .text_color(theme.on_accent)
                 .child(n.to_string())
         }))
-        .on_click(cx.listener(move |app, _, window, cx| app.show_view(view, window, cx)))
+        .on_click(cx.listener(move |app, _, window, cx| app.go(dest, window, cx)))
         .into_any_element()
 }
 
-/// A collapsible group heading in the side bar. A stage heading carries the
-/// action that empties it, which is the common tidy-up.
+
 fn section(
     count: usize,
     group: (Group, Option<String>),
@@ -1907,7 +1531,7 @@ fn tree_shell(id: String, selected: bool, theme: &Theme) -> gpui::Stateful<gpui:
         .when(!selected, |d| d.hover(|s| s.bg(theme.hover)))
 }
 
-fn close_button(id: String, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+pub(super) fn close_button(id: String, theme: &Theme) -> gpui::Stateful<gpui::Div> {
     div()
         .id(SharedString::from(id))
         .flex()
@@ -2396,7 +2020,7 @@ fn tab_shell(id: String, active: bool, theme: &Theme) -> gpui::Stateful<gpui::Di
 }
 
 /// One editor tab. The one you are on is the editor surface continued upward,
-/// with a lit top edge, which is how every editor says "this one".
+/// with a lit top edge, the way every editor says "this one".
 fn tab(job: &Job, active: bool, theme: &Theme, cx: &mut Context<App>) -> AnyElement {
     let id = job.id;
     let running = job.state.is_running();

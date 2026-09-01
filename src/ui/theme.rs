@@ -1,6 +1,6 @@
 //! One palette, in a light and a dark cut.
 //!
-//! The surfaces are named for their place in the frame rather than for what
+//! The surfaces are named for their place in the frame, not for what
 //! they look like, and the frame is a code editor's: an activity bar of view
 //! icons, a side bar listing what is open, an editor area with a tab per
 //! thing, a panel underneath it, and a status bar along the bottom. Naming
@@ -39,7 +39,7 @@ pub struct Theme {
     pub activity: Hsla,
     /// The list beside it: what this workspace holds.
     pub sidebar: Hsla,
-    /// The titlebar, and anything else that frames rather than holds.
+    /// The titlebar, and anything else that frames but does not hold.
     pub chrome: Hsla,
     /// The editor: the content everything else frames.
     pub bg: Hsla,
@@ -51,7 +51,7 @@ pub struct Theme {
     /// keycap.
     pub track: Hsla,
 
-    /// The tab you are looking at, which is the editor surface continued
+    /// The tab you are looking at. The editor surface continued
     /// upwards.
     pub tab_active: Hsla,
     /// Every other open tab.
@@ -208,7 +208,7 @@ pub fn theme(cx: &App) -> Theme {
 /// Data reads better in a monospace face; the chrome reads better without
 /// one. The text system falls back to whatever it can find.
 ///
-/// Reach for these through [`crate::ui::widgets::Type`] rather than directly:
+/// Reach for these through [`crate::ui::widgets::Type`] and not directly:
 /// a line of text must be all one family and all one size, and the type scale
 /// is what enforces it.
 pub const MONO: &str = "Menlo";

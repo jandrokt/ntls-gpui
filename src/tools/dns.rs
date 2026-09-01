@@ -12,7 +12,7 @@ use crate::tools::stats::ms;
 
 pub struct Dns;
 
-/// Asks for the record that fits the query rather than making the user choose:
+/// Asks for the record that fits the query, so the user does not have to choose:
 /// a PTR for an address, A and AAAA for a name.
 const AUTO_TYPE: &str = "auto";
 
@@ -157,7 +157,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
 
     // Keeping means the answers of earlier lookups are still in the table. An
     // answer that comes back the same rewrites its own row, one that has
-    // changed joins it, and a record that has stopped being returned stays —
+    // changed joins it, and a record that has stopped being returned stays:
     // which is the whole of what a document says about a zone over time.
     let keep = r.keep;
     let before = Answered::of(&r.prior);
@@ -257,10 +257,10 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
 }
 
 /// What earlier lookups of this job put in the table, for a lookup that is
-/// adding to it rather than replacing it.
+/// adding to it, not replacing it.
 struct Answered {
     /// Every answer already there, by what makes it that answer, against what
-    /// the row holding it calls itself — which for the rows of lookups made
+    /// the row holding it calls itself, which for the rows of lookups made
     /// before this switch existed is their target.
     rows: std::collections::HashMap<String, String>,
     /// The name and type of every answer already there, so an answer that is
@@ -296,8 +296,8 @@ impl Answered {
         self.rows.get(key).cloned()
     }
 
-    /// Whether this name was already answering for this type, which is what
-    /// makes a new row a change rather than an addition.
+    /// Whether this name was already answering for this type, which makes a
+    /// new row a change instead of an addition.
     fn knows(&self, name: &str, rtype: &str) -> bool {
         self.subjects.contains(&(name.to_lowercase(), rtype.to_uppercase()))
     }
@@ -360,7 +360,7 @@ mod tests {
         let before = Answered::of(&[row("example.com", "A", "5m", "1.2.3.4", None)]);
         let moved = cells!["example.com", "A", "5m", "answer", "5.6.7.8"];
         assert_eq!(before.row_for(&record_key(&moved)), None, "it is a row of its own");
-        // And it is a change rather than an addition, because the name was
+        // And it is a change instead of an addition, because the name was
         // already answering for this type.
         assert!(before.knows("example.com", "A"));
         assert!(!before.knows("example.com", "MX"));

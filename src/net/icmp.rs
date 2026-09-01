@@ -106,7 +106,7 @@ fn permission_hint() -> &'static str {
 /// On Unix it is registered with the reactor, so the reader sleeps until the
 /// socket is readable. Windows has no such registration for a socket the
 /// runtime did not create, so there the reader is a blocking thread with a
-/// read timeout — the same shape, one thread rather than none.
+/// read timeout: the same shape, with one thread instead of none.
 #[cfg(unix)]
 fn reader_handle(conn: &Conn) -> Option<AsyncFd<OwnedFd>> {
     let dup = conn.socket.try_clone().ok()?;
@@ -155,7 +155,7 @@ impl Waiters {
 struct Conn {
     socket: Socket,
     /// Serialises the TTL setting with the write that depends on it, since the
-    /// TTL is a property of the socket rather than the packet.
+    /// TTL is a property of the socket instead of the packet.
     send: Mutex<u8>,
     raw: bool,
     v6: bool,
@@ -168,8 +168,8 @@ impl Conn {
 
         // Try the unprivileged datagram socket first; only fall back to raw,
         // which needs root, when the kernel refuses. Windows has no datagram
-        // ICMP socket at all, so there it is raw or nothing — and raw needs
-        // Administrator, which is what the caller reports when this fails.
+        // ICMP socket at all, so there it is raw or nothing, and raw needs
+        // Administrator. The caller reports that when this fails.
         let (socket, raw) = if cfg!(windows) {
             (Socket::new(domain, Type::RAW, Some(proto))?, true)
         } else {
@@ -195,8 +195,8 @@ impl Conn {
         socket.bind(&SocketAddr::new(bind_to, 0).into())?;
 
         // Ask for the TTL alongside each datagram. Best effort: if the
-        // platform will not report it we leave the column blank rather than
-        // failing the ping — which is what happens on Windows, where a
+        // platform will not report it we leave the column blank and do not
+        // failing the ping. That happens on Windows, where a
         // datagram socket does not carry it.
         #[cfg(unix)]
         unsafe {
@@ -495,7 +495,7 @@ fn spawn_reader(inner: Weak<Inner>, v6: bool, socket: Socket) -> tokio::task::Jo
                     let Some(inner) = inner.upgrade() else { return };
                     let from = from.as_socket().map(|s| s.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                     // No ancillary data here, so no TTL: the column is left
-                    // blank rather than filled in with a guess.
+                    // blank, not filled in with a guess.
                     dispatch(&inner, &buf[..n], from, 0);
                 }
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
@@ -545,7 +545,7 @@ unsafe fn cmsg_hop(cmsg: *const libc::cmsghdr, len: usize) -> u8 {
 /// Reads one datagram along with the TTL of the packet that carried it.
 ///
 /// `recvmsg` is what makes the TTL reachable: it arrives as ancillary data
-/// rather than in the payload, and on a datagram ICMP socket there is no IP
+/// instead of in the payload, and on a datagram ICMP socket there is no IP
 /// header to read it out of.
 #[cfg(unix)]
 fn recv_with_ttl(fd: RawFd, buf: &mut [u8]) -> io::Result<Option<(usize, IpAddr, u8)>> {
@@ -778,7 +778,7 @@ mod tests {
         assert!(!is_hop_cmsg(libc::IPPROTO_IP, libc::IP_TOS));
 
         // A cmsg built the way the kernel builds one, so the reading is
-        // tested against the real layout rather than against an assumption.
+        // tested against the real layout and not against an assumption.
         fn hop(payload: &[u8]) -> u8 {
             unsafe {
                 let mut buf = [0u8; 64];

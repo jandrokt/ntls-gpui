@@ -29,7 +29,7 @@ pub enum Role {
     /// A port specification, so a row that names a port can be handed into it.
     Ports,
     /// The switch that says a run adds to what earlier runs of the same job
-    /// found instead of replacing it. The interface keeps the table rather
+    /// found and does not replace it. The interface keeps the table rather
     /// than clearing it, and the tool is told the rows that are already there.
     Keep,
 }
@@ -112,7 +112,7 @@ impl Validator {
 /// Resolves shorthand in a field's value into something explicit and editable.
 /// Tab runs it: a target of "auto" becomes the concrete subnet, then the
 /// concrete range. It sees the other field values too, so an expansion can
-/// depend on them — "auto" means a different network once an interface is
+/// depend on them: "auto" means a different network once an interface is
 /// chosen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Expand {

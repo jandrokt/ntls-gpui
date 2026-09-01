@@ -37,7 +37,11 @@ actions!(
         AddTool,
         Run,
         Stop,
+        /// The selected tool's form. The application's own settings are
+        /// `Preferences`, the name every other desktop uses.
         Settings,
+        Preferences,
+        ShowNotices,
         FocusFilter,
         FocusNote,
         ToggleProperties,
@@ -88,6 +92,9 @@ pub fn bind_keys(cx: &mut GpuiApp) {
         KeyBinding::new(&crate::sys::shortcut("cmd-r"), Run, Some("Ntls")),
         KeyBinding::new(&crate::sys::shortcut("cmd-."), Stop, Some("Ntls")),
         KeyBinding::new(&crate::sys::shortcut("cmd-e"), Settings, Some("Ntls")),
+        KeyBinding::new(&crate::sys::shortcut("cmd-,"), Preferences, Some("Ntls")),
+        KeyBinding::new(&crate::sys::shortcut("cmd-,"), Preferences, None),
+        KeyBinding::new(&crate::sys::shortcut("cmd-shift-m"), ShowNotices, Some("Ntls")),
         KeyBinding::new(&crate::sys::shortcut("cmd-f"), FocusFilter, Some("Ntls")),
         KeyBinding::new(&crate::sys::shortcut("cmd-shift-n"), FocusNote, Some("Ntls")),
         KeyBinding::new(&crate::sys::shortcut("cmd-i"), ToggleProperties, Some("Ntls")),
@@ -154,6 +161,12 @@ pub struct App {
     /// Whether the side bar is showing at all, and how wide it is.
     pub sidebar_open: bool,
     pub sidebar_width: f32,
+    /// When the side bar started opening or closing, so it can be drawn part
+    /// of the way there.
+    ///
+    /// A panel that is gone on the next frame takes the layout with it in one
+    /// jump. Sliding keeps the rest of the window still.
+    sidebar_moved: Option<(std::time::Instant, bool)>,
     /// Whether the output panel under the editor is showing.
     pub panel_open: bool,
 
@@ -163,9 +176,15 @@ pub struct App {
 
     /// One editor, re-pointed at whichever result is selected.
     pub note_input: Entity<TextInput>,
-    pub note_for: Option<String>,
-    /// The row whose note is being typed into.
+    /// The line of the table whose note is being typed into, and which row
+    /// that line stood for when the typing started.
+    ///
+    /// The line is where the editor is drawn; the row is where the words go.
+    /// Sorting and filtering reorder the lines, and a running scan adds rows
+    /// underneath, so the two drift apart. Keeping both stops a note about one
+    /// host being written onto another.
     pub editing_note: Option<usize>,
+    editing_note_row: Option<(usize, String)>,
     note_revision: usize,
     /// Folded/collapsed sections and folders in the sidebar.
     pub collapsed: std::collections::HashSet<String>,
@@ -174,7 +193,7 @@ pub struct App {
     pub rename_for: Option<usize>,
     rename_revision: usize,
     /// And one for the value in the condition of whichever workflow step is
-    /// selected — the one part of a condition that is typed rather than
+    /// selected. That is the only part of a condition that is typed instead of
     /// chosen from what exists.
     pub step_input: Entity<TextInput>,
     step_value_for: Option<(usize, Spot)>,
@@ -188,7 +207,7 @@ pub struct App {
     ws_rename_for: Option<usize>,
     ws_rename_revision: usize,
     /// Whether the tools side bar is listing the workspace directory as it is
-    /// on disk, rather than grouping what is open by the stage it is at.
+    /// on disk, and does not group what is open by the stage it is at.
     pub files_view: bool,
     /// What that directory held when it was last read, and when.
     files_seen: Option<(std::path::PathBuf, Instant, Vec<FileRow>)>,
@@ -197,6 +216,10 @@ pub struct App {
     pub var_input: Entity<TextInput>,
     pub editing_var: Option<(String, VarPart)>,
     var_revision: usize,
+    /// The box that narrows the variables page down, and what is in it.
+    pub var_filter_input: Entity<TextInput>,
+    pub var_filter: String,
+    var_filter_revision: usize,
     /// The document or workflow whose name is being edited in its pane.
     pub renaming_item: Option<super::workspace::Item>,
     item_rename_revision: usize,
@@ -219,12 +242,28 @@ pub struct App {
     last_edit_revision: usize,
     /// A stage whose "clear" has been pressed once. Pressing it again does it;
     /// pressing anything else forgets it.
-    /// The heading whose "Delete all" is armed, and the folder it is in — a
-    /// group inside a folder empties that folder rather than the workspace.
+    /// The heading whose "Delete all" is armed, and the folder it is in. A
+    /// group inside a folder empties that folder, not the workspace.
     pub clearing: Option<(Group, Option<String>)>,
-    /// The interface new tools are pointed at, when the user has picked one.
-    /// Empty means "let the routing table decide", which is what `auto` does.
-    pub default_iface: Option<String>,
+    /// Everything the application remembers about itself between sessions:
+    /// what new tools start on, how it looks, what it says and when. The
+    /// settings page is a view of this, and it is written as it changes.
+    pub settings: store::AppState,
+    /// What the application has to say for itself: runs that finished while
+    /// you were elsewhere, and anything that went wrong.
+    pub notices: super::notify::Notices,
+    /// The page in front of the workspace, if any. Unlike a view, a page takes
+    /// the whole window, side bar and tabs included: what it is about does not
+    /// live inside the workspace.
+    pub page: Option<Page>,
+    /// Where each row of choices is sliding from and to, by the control's own
+    /// name.
+    ///
+    /// An element cannot remember what it was showing a moment ago, and a
+    /// light that slides has to know where it started. The next frame sees the
+    /// light already at its destination, so without both ends it would cut the
+    /// slide short.
+    pub segment_from: std::collections::HashMap<String, (usize, usize)>,
     /// Set while files are being dragged over the window, so it can say it
     /// will take them.
     pub drop_hover: bool,
@@ -244,7 +283,7 @@ pub struct Resize {
 ///
 /// Workspaces sits above tools because it is the wider choice: which
 /// investigation you are in, and then what is inside it.
-/// Whether a piece of text names something, as a word rather than as a run of
+/// Whether a piece of text names something, as a word instead of as a run of
 /// letters inside another word.
 fn mentions(text: &str, name: &str) -> bool {
     if name.is_empty() {
@@ -296,23 +335,13 @@ pub enum View {
     /// Everything open in the current workspace, grouped by what stage it is
     /// at.
     Tools,
-    /// What this machine is connected to.
-    Machine,
-    /// The workspace's variables: what has been written down, and what the
-    /// workflows have worked out.
-    Variables,
 }
 
 impl View {
-    pub const ALL: [View; 4] =
-        [View::Workspaces, View::Tools, View::Variables, View::Machine];
-
     pub fn title(self) -> &'static str {
         match self {
             View::Workspaces => "Workspaces",
             View::Tools => "Tools",
-            View::Variables => "Variables",
-            View::Machine => "This machine",
         }
     }
 
@@ -320,8 +349,74 @@ impl View {
         match self {
             View::Workspaces => "folder-open",
             View::Tools => "explorer",
-            View::Variables => "gear",
-            View::Machine => "globe",
+        }
+    }
+}
+
+/// A page: something the window is given over to entirely.
+///
+/// The difference from a [`View`] is what it is about. A view lists what is
+/// inside the workspace, so it sits beside it in the side bar. A page is about
+/// something else: the workspace's own named values, the application's own
+/// settings. A list of tools next to either would just be in the way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Page {
+    /// The workspace's variables: what has been written down, and what the
+    /// workflows have worked out.
+    Variables,
+    /// What this machine is attached to, in full.
+    Interfaces,
+    /// Everything the application remembers about itself.
+    Settings,
+}
+
+impl Page {
+    pub fn title(self) -> &'static str {
+        match self {
+            Page::Variables => "Variables",
+            Page::Interfaces => "This machine",
+            Page::Settings => "Settings",
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Page::Variables => "variables",
+            Page::Interfaces => "globe",
+            Page::Settings => "gear",
+        }
+    }
+}
+
+/// Somewhere the rail goes. Views and pages are different things behind the
+/// icon, and deliberately identical in front of it: they are all just places.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dest {
+    View(View),
+    Page(Page),
+}
+
+impl Dest {
+    /// The rail, top to bottom. Everything about the workspace is in this
+    /// group; the application's own settings sit apart, at the foot.
+    pub const RAIL: [Dest; 4] = [
+        Dest::View(View::Workspaces),
+        Dest::View(View::Tools),
+        Dest::Page(Page::Variables),
+        Dest::Page(Page::Interfaces),
+    ];
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Dest::View(v) => v.icon(),
+            Dest::Page(p) => p.icon(),
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Dest::View(v) => v.title(),
+            Dest::Page(p) => p.title(),
         }
     }
 }
@@ -331,10 +426,24 @@ pub const SIDEBAR_DEFAULT: gpui::Pixels = gpui::px(268.);
 pub const SIDEBAR_MIN: f32 = 180.;
 pub const SIDEBAR_MAX: f32 = 520.;
 
+/// Where a row that was at `at` is now.
+///
+/// A note is written to a row while the table it is in may be changing: a
+/// scan that is still going adds rows, and one that is keeping what earlier
+/// runs found can insert one beside another. So the position is checked
+/// against what the row said it was, and the row is looked up by that if it
+/// has moved.
+fn locate_row(rows: &[crate::core::Row], at: usize, identity: &str) -> Option<usize> {
+    match rows.get(at) {
+        Some(row) if row.identity() == identity => Some(at),
+        _ => rows.iter().position(|r| r.identity() == identity),
+    }
+}
+
 /// Whether a target is worth carrying into the next tool opened.
 ///
 /// A host, an address or a subnet is; a placeholder that means "work it out
-/// for me" is not, and neither is a pasted link — a downloader's target is a
+/// for me" is not, and neither is a pasted link: a downloader's target is a
 /// URL, and a URL in a port scanner's target box is only ever a mistake.
 fn is_carryable(target: &str) -> bool {
     !target.is_empty()
@@ -370,7 +479,12 @@ fn new_filter_input(cx: &mut Context<App>) -> Entity<TextInput> {
 
 impl App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> App {
-        cx.set_global(Theme::of(Mode::from_appearance(window.appearance())));
+        let saved = store::read_state();
+        cx.set_global(Theme::of(match saved.theme {
+            store::ThemeChoice::System => Mode::from_appearance(window.appearance()),
+            store::ThemeChoice::Light => Mode::Light,
+            store::ThemeChoice::Dark => Mode::Dark,
+        }));
 
         let _ = store::ensure_root();
         let mut app = App {
@@ -392,6 +506,7 @@ impl App {
             view: View::Tools,
             sidebar_open: true,
             sidebar_width: f32::from(SIDEBAR_DEFAULT),
+            sidebar_moved: None,
             panel_open: false,
             rail_scroll: ScrollHandle::new(),
             tab_scroll: ScrollHandle::new(),
@@ -401,8 +516,8 @@ impl App {
                 input.mono = false;
                 input
             }),
-            note_for: None,
             editing_note: None,
+            editing_note_row: None,
             note_revision: 0,
             collapsed: std::collections::HashSet::new(),
             rename_input: cx.new(|cx| {
@@ -419,6 +534,13 @@ impl App {
             var_input: cx.new(|cx| TextInput::new(cx, "", "value")),
             editing_var: None,
             var_revision: 0,
+            var_filter_input: cx.new(|cx| {
+                let mut input = TextInput::new(cx, "", "Filter");
+                input.mono = false;
+                input
+            }),
+            var_filter: String::new(),
+            var_filter_revision: 0,
             step_input: cx.new(|cx| {
                 let mut input = TextInput::new(cx, "", "a value");
                 input.mono = true;
@@ -448,9 +570,24 @@ impl App {
             flow_pending: None,
             last_edit_revision: 0,
             clearing: None,
-            default_iface: store::read_state().iface,
+            settings: saved,
+            notices: super::notify::Notices::default(),
+            page: None,
+            segment_from: std::collections::HashMap::new(),
             drop_hover: false,
         };
+
+        super::widgets::set_motion(app.settings.animate);
+
+        // The side bar comes back the way it was left, when it was asked to.
+        if app.settings.remember_layout {
+            if let Some(open) = app.settings.sidebar_open {
+                app.sidebar_open = open;
+            }
+            if let Some(width) = app.settings.sidebar_width {
+                app.sidebar_width = width.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+            }
+        }
 
         app.load_from_disk(cx);
         if app.workspaces.is_empty() {
@@ -463,8 +600,8 @@ impl App {
     /// Reads every workspace directory back in at startup.
     ///
     /// A workspace is a directory and every tool in it is a file, so the state
-    /// the application starts in is whatever is on disk — including the
-    /// results of runs from previous sessions.
+    /// the application starts in is whatever is on disk, including the results
+    /// of runs from previous sessions.
     fn load_from_disk(&mut self, cx: &mut Context<Self>) {
         for (dir, record, jobs) in store::load_all() {
             let mut ws = Workspace::new(self.next_ws_id, dir);
@@ -512,21 +649,52 @@ impl App {
     // --- writing back -----------------------------------------------------
 
     /// Writes a workspace's own file: its name, colour, notes and order.
-    pub fn save_workspace(&self, index: usize) {
+    ///
+    /// A write that fails is said out loud. Everything here is written as it
+    /// changes, so a full disk or a directory that has been moved away under
+    /// the application would otherwise lose a session's work without anything
+    /// on screen ever mentioning it.
+    pub fn save_workspace(&mut self, index: usize) {
         let Some(ws) = self.workspaces.get(index) else { return };
-        let _ = store::write_workspace(&ws.dir, &ws.record());
+        let (dir, name) = (ws.dir.clone(), ws.name());
+        if let Err(e) = store::write_workspace(&dir, &ws.record()) {
+            self.cannot_write(&format!("the workspace {name}"), &dir, &e);
+        }
     }
 
     /// Writes one tool's file.
-    pub fn save_job(&self, ws_index: usize, job_id: usize) {
+    pub fn save_job(&mut self, ws_index: usize, job_id: usize) {
         let Some(ws) = self.workspaces.get(ws_index) else { return };
         let Some(job) = ws.job(job_id) else { return };
-        let _ = store::write_job_in(&ws.dir, job.folder.as_deref(), &job.stem, &job.record());
+        let (dir, folder, stem, name) =
+            (ws.dir.clone(), job.folder.clone(), job.stem.clone(), job.name());
+        if let Err(e) = store::write_job_in(&dir, folder.as_deref(), &stem, &job.record()) {
+            let path = store::job_path_in(&dir, folder.as_deref(), &stem);
+            self.cannot_write(&name, &path, &e);
+        }
     }
 
-    /// Writes the current workspace and the job in front of the user, which is
-    /// what almost every change touches.
-    pub fn save_current(&self) {
+    /// Says that something could not be written, once.
+    ///
+    /// Once, because a save happens on every keystroke and a disk that is full
+    /// is full for all of them; a hundred identical notices would bury the
+    /// first one.
+    fn cannot_write(&mut self, what: &str, path: &std::path::Path, e: &std::io::Error) {
+        let title = format!("Cannot save {what}");
+        if self.notices.newest_first().any(|n| n.title == title) {
+            return;
+        }
+        self.notify(
+            crate::core::Level::Error,
+            title,
+            format!("{}: {e}", path.display()),
+            Some(super::notify::About::File(path.to_path_buf())),
+        );
+    }
+
+    /// Writes the current workspace and the job in front of the user. Almost
+    /// every change touches one or both.
+    pub fn save_current(&mut self) {
         self.save_workspace(self.active);
         if let Some(id) = self.workspace().selected {
             self.save_job(self.active, id);
@@ -534,11 +702,17 @@ impl App {
     }
 
     /// Writes everything, for shutdown.
-    pub fn save_all(&self) {
-        for (i, ws) in self.workspaces.iter().enumerate() {
+    pub fn save_all(&mut self) {
+        let all: Vec<(usize, Vec<usize>)> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(i, ws)| (i, ws.jobs.iter().map(|j| j.id).collect()))
+            .collect();
+        for (i, jobs) in all {
             self.save_workspace(i);
-            for job in &ws.jobs {
-                self.save_job(i, job.id);
+            for id in jobs {
+                self.save_job(i, id);
             }
         }
     }
@@ -568,6 +742,10 @@ impl App {
 
     /// Finds a job anywhere, since events arrive for workspaces that are not
     /// on screen.
+    pub fn job_anywhere(&self, id: usize) -> Option<&Job> {
+        self.workspaces.iter().find_map(|w| w.job(id))
+    }
+
     pub fn job_anywhere_mut(&mut self, id: usize) -> Option<&mut Job> {
         self.workspaces.iter_mut().find_map(|w| w.job_mut(id))
     }
@@ -621,8 +799,7 @@ impl App {
         self.clearing = None;
         if index < self.workspaces.len() {
             self.stop_editing(cx);
-            self.editing_note = None;
-            self.note_for = None;
+            self.end_note_edit();
             self.active = index;
             self.rename_for = None;
             self.ws_rename_for = None;
@@ -637,7 +814,7 @@ impl App {
     }
 
     /// Closes a workspace and everything in it. There is always one left: an
-    /// application with no window to work in is not a state worth having.
+    /// application with no window to work in has nothing to show.
     pub fn close_workspace(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.workspaces.len() {
             return;
@@ -647,11 +824,10 @@ impl App {
         // Closing takes a workspace out of the application and nothing else:
         // the directory stays exactly where it is, and is recorded so that it
         // is not opened again at startup.
-        let mut state = store::read_state();
         let dir = gone.dir.display().to_string();
-        if !state.closed.contains(&dir) {
-            state.closed.push(dir);
-            store::write_state(&state);
+        if !self.settings.closed.contains(&dir) {
+            self.settings.closed.push(dir);
+            self.save_settings();
         }
         self.settle_after_close(cx);
     }
@@ -659,8 +835,8 @@ impl App {
     /// Deletes a workspace and its directory, after asking.
     ///
     /// This is the one action in the program that destroys something, so it is
-    /// the one that asks first — and it says what it is about to remove rather
-    /// than asking whether you are sure.
+    /// the one that asks first. It says what it is about to remove instead of
+    /// asking whether you are sure.
     pub fn delete_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.workspaces.get(index) else { return };
         let (name, dir, tools) = (ws.name(), ws.dir.clone(), ws.jobs.len());
@@ -691,8 +867,13 @@ impl App {
                 app.workspaces.remove(at);
                 if let Err(e) = store::delete_workspace(&dir) {
                     // Nothing useful can be done about a directory that will
-                    // not go, but the user should not be told it did.
-                    eprintln!("ntls: cannot delete {}: {e}", dir.display());
+                    // not go, but the user must not be told it went.
+                    app.notify(
+                        crate::core::Level::Error,
+                        "Cannot delete the workspace",
+                        format!("{}: {e}", dir.display()),
+                        Some(super::notify::About::File(dir.clone())),
+                    );
                 }
                 app.settle_after_close(cx);
             })
@@ -731,7 +912,7 @@ impl App {
         let fields = tool.fields();
         let mut params = Params::defaults(&fields);
 
-        // Defaults that mean something — auto, discover — are left alone, and
+        // Defaults that mean something (auto, discover) are left alone, and
         // a field the tool is currently hiding is not a place to put an
         // address.
         if let Some(field) = fields.iter().find(|f| f.role == Role::Target)
@@ -754,11 +935,12 @@ impl App {
         }
 
         // A machine with two networks on it has one you meant, and saying so
-        // once beats choosing it in every form.
-        if let Some(iface) = &self.default_iface
-            && fields.iter().any(|f| f.key == "iface")
-        {
-            params.set("iface", iface);
+        // once in the settings beats choosing it in every form. It is matched
+        // by field instead of by tool, so a tool added later gets it too.
+        for field in &fields {
+            if let Some(value) = self.settings.default_for(field.key) {
+                params.set(field.key, value);
+            }
         }
 
         let inputs = build_inputs(&fields, &params, cx);
@@ -800,10 +982,13 @@ impl App {
     }
 
     /// Shows a tool. Picking one from the side bar puts it back in the tab
-    /// strip, which is what makes closing a tab reversible.
+    /// strip, so closing a tab can be undone.
     pub fn select_job(&mut self, id: usize, cx: &mut Context<Self>) {
         self.clearing = None;
-        self.editing_note = None;
+        // Asking for a tool is asking to be shown it, so a page in front of
+        // the workspace gets out of the way.
+        self.page = None;
+        self.end_note_edit();
         // Reopening writes the flag back, so the tab strip is the same on the
         // next run as it was on this one.
         let reopened = self.workspace_mut().job_mut(id).is_some_and(|job| {
@@ -823,7 +1008,7 @@ impl App {
     pub fn close_tab(&mut self, id: usize, cx: &mut Context<Self>) {
         self.workspace_mut().close_tab(id);
         // The job that closed is the one to write, not whichever is selected
-        // now — which is a different job by this point.
+        // now: by this point those are different jobs.
         self.save_job(self.active, id);
         self.save_workspace(self.active);
         cx.notify();
@@ -846,7 +1031,7 @@ impl App {
         cx.notify();
     }
 
-    /// Closes every tool at a stage — on the second press.
+    /// Closes every tool at a stage, on the second press.
     ///
     /// One click that throws away a morning's scans is one click too few, and
     /// a modal for it would be one dialogue too many; so the word changes to
@@ -1014,9 +1199,9 @@ impl App {
             Some(Item::Tool(id)) => self.select_job(id, cx),
             Some(Item::Doc(id)) => self.select_doc(id, cx),
             Some(Item::Flow(id)) => self.select_flow(id, cx),
-            // A file the workspace does not hold — its own record, something
-            // dropped in by hand — is still a file, and the file manager is
-            // the thing that opens those.
+            // A file the workspace does not hold (its own record, something
+            // dropped in by hand) is still a file, and unrecognised files go
+            // to the file manager.
             None => cx.reveal_path(&row.path),
         }
     }
@@ -1032,8 +1217,7 @@ impl App {
             n += 1;
         }
         self.workspace_mut().set_var(&name, "");
-        self.view = View::Variables;
-        self.sidebar_open = true;
+        self.page = Some(Page::Variables);
         self.save_workspace(self.active);
         self.edit_var(name, VarPart::Name, window, cx);
     }
@@ -1065,6 +1249,18 @@ impl App {
         let handle = self.var_input.read(cx).focus_handle.clone();
         window.focus(&handle);
         cx.notify();
+    }
+
+    /// Reads the variables page's filter box back, as it is typed.
+    pub fn sync_var_filter(&mut self, cx: &mut GpuiApp) {
+        let (revision, value) = {
+            let input = self.var_filter_input.read(cx);
+            (input.revision, input.value().to_string())
+        };
+        if revision != self.var_filter_revision {
+            self.var_filter_revision = revision;
+            self.var_filter = value;
+        }
     }
 
     pub fn end_var_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1130,17 +1326,69 @@ impl App {
     }
 
     /// What a variable comes to right now: the text, or the answer to the
-    /// formula — and what is wrong with the formula when something is.
-    pub fn var_value(&self, name: &str) -> Result<String, String> {
-        let Some(var) = self.workspace().var(name) else { return Ok(String::new()) };
+    /// formula, and what kind of thing that is, so a formula that comes to a
+    /// number can be told from one that comes to text. What is wrong with the
+    /// formula, when something is, comes back instead.
+    ///
+    /// A formula that comes to a number and one that comes to text look
+    /// identical once they are written out, and the difference is what decides
+    /// whether a condition can compare it or a chart can plot it.
+    pub fn var_answer(&self, name: &str) -> Result<(String, &'static str), String> {
+        let Some(var) = self.workspace().var(name) else { return Ok((String::new(), "text")) };
         if !var.formula {
-            return Ok(var.value.clone());
+            return Ok((var.value.clone(), "text"));
         }
         if var.value.trim().is_empty() {
-            return Ok(String::new());
+            return Ok((String::new(), "nothing"));
         }
         let data = super::notes::Data::of(self.workspace());
-        crate::expr::run(&var.value, &data).map(|value| value.show()).map_err(|e| e.to_string())
+        crate::expr::run(&var.value, &data)
+            .map(|value| (value.show(), value.kind()))
+            .map_err(|e| e.to_string())
+    }
+
+    /// What a formula reads: the other variables and the runs it names.
+    ///
+    /// The inverse of [`App::var_used_by`], and the other half of being able
+    /// to see what a rename or a deletion will break.
+    pub fn var_reads(&self, name: &str) -> Vec<String> {
+        let ws = self.workspace();
+        let Some(var) = ws.var(name).filter(|v| v.formula) else { return Vec::new() };
+        let mut out = Vec::new();
+        for other in ws.vars.keys() {
+            if !other.eq_ignore_ascii_case(name) && mentions(&var.value, other) {
+                out.push(other.clone());
+            }
+        }
+        for job in &ws.jobs {
+            let title = job.name();
+            if mentions(&var.value, &title) && !out.contains(&title) {
+                out.push(title);
+            }
+        }
+        out
+    }
+
+    /// Copies a variable, name and all, under a name that is not taken.
+    pub fn duplicate_var(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(var) = self.workspace().var(name).cloned() else { return };
+        let mut copy = format!("{name}_copy");
+        let mut n = 2;
+        while self.workspace().vars.contains_key(&copy) {
+            copy = format!("{name}_copy{n}");
+            n += 1;
+        }
+        self.workspace_mut().put_var(&copy, var);
+        self.page = Some(Page::Variables);
+        self.save_workspace(self.active);
+        self.edit_var(copy, VarPart::Name, window, cx);
+    }
+
+    /// Puts text on the clipboard and says so.
+    pub fn copy_text(&mut self, what: &str, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.notify(crate::core::Level::Info, format!("{what} copied"), "", None);
+        cx.notify();
     }
 
     /// Where a variable is spoken of: the documents and workflows that name
@@ -1177,14 +1425,213 @@ impl App {
         cx.notify();
     }
 
-    /// Points new tools at one interface, or back at whatever the routing
-    /// table prefers.
-    pub fn set_default_iface(&mut self, name: Option<String>, cx: &mut Context<Self>) {
-        self.default_iface = name.clone();
-        let mut state = store::read_state();
-        state.iface = name;
-        store::write_state(&state);
+    /// The interface new tools start on, when one has been chosen.
+    pub fn default_iface(&self) -> Option<&str> {
+        self.settings.default_for("iface")
+    }
+
+    /// Says what a field starts on in every tool that has one, or stops
+    /// saying anything about it.
+    pub fn set_field_default(&mut self, key: &str, value: Option<&str>, cx: &mut Context<Self>) {
+        self.settings.set_default(key, value);
+        self.save_settings();
         cx.notify();
+    }
+
+    /// Writes the settings file. It is small and written rarely, so it is
+    /// written whole every time, not kept in step by hand.
+    pub fn save_settings(&self) {
+        store::write_state(&self.settings);
+        super::widgets::set_motion(self.settings.animate);
+    }
+
+    /// Where a row of choices should slide its light from.
+    pub fn segment_from(&mut self, id: &str, current: usize) -> usize {
+        let slot = self.segment_from.entry(id.to_string()).or_insert((current, current));
+        if slot.1 != current {
+            *slot = (slot.1, current);
+        }
+        slot.0
+    }
+
+    /// Opens every workspace that was closed, and stops recording them as
+    /// closed. Their directories were never touched, so this is only a matter
+    /// of reading them again.
+    pub fn reopen_closed(&mut self, cx: &mut Context<Self>) {
+        let closed = std::mem::take(&mut self.settings.closed);
+        self.save_settings();
+        for dir in closed {
+            let dir = std::path::PathBuf::from(dir);
+            if dir.exists() {
+                self.open_workspace_dir(&dir, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    // --- pages ---------------------------------------------------------------
+
+    /// Goes to a page, or comes back from it when it is the one already
+    /// showing. There is no third state and nothing to confirm: a page is
+    /// somewhere you are, not something you opened.
+    pub fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        self.page = (self.page != Some(page)).then_some(page);
+        if self.page.is_some() {
+            self.end_note_edit();
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
+    }
+
+    /// Goes back to the workspace, from wherever.
+    pub fn close_page(&mut self, cx: &mut Context<Self>) {
+        if self.page.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Goes wherever the rail was clicked.
+    pub fn go(&mut self, dest: Dest, window: &mut Window, cx: &mut Context<Self>) {
+        match dest {
+            // Asking for a list of what is in the workspace is asking to be
+            // back in the workspace.
+            Dest::View(view) => self.show_view(view, window, cx),
+            Dest::Page(page) => self.show_page(page, window, cx),
+        }
+    }
+
+    /// Whether the rail should light this one up.
+    pub fn showing(&self, dest: Dest) -> bool {
+        match dest {
+            Dest::View(view) => self.page.is_none() && self.sidebar_open && self.view == view,
+            Dest::Page(page) => self.page == Some(page),
+        }
+    }
+
+    // --- what the application has to say -----------------------------------
+
+    /// Records something worth telling the user, and shows it in the corner.
+    ///
+    /// Anything that went wrong stays there until it is dismissed; anything
+    /// else fades. Everything, either way, stays in the list behind the bell,
+    /// so news that was missed can still be found.
+    pub fn notify(
+        &mut self,
+        level: crate::core::Level,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        about: Option<super::notify::About>,
+    ) {
+        let bad = matches!(level, crate::core::Level::Error);
+        let keep_for = if bad { None } else { Some(self.settings.toast_for()) };
+        let id = self.notices.push(level, title, body, about, keep_for);
+        // With the corner turned off the bell still counts: the setting is
+        // about what interrupts you, not about what you are told.
+        if !self.settings.toasts && !bad {
+            self.notices.dismiss(id);
+        }
+    }
+
+    pub fn notify_error(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        self.notify(crate::core::Level::Error, title, body, None);
+    }
+
+    /// Takes one out of the corner. It stays in the list.
+    pub fn dismiss_notice(&mut self, id: usize, cx: &mut Context<Self>) {
+        self.notices.dismiss(id);
+        cx.notify();
+    }
+
+    /// Opens or closes the list of what has happened. Opening it is reading
+    /// it, so the bell stops counting.
+    pub fn toggle_notices(&mut self, cx: &mut Context<Self>) {
+        self.notices.open = !self.notices.open;
+        if self.notices.open {
+            self.notices.mark_all_read();
+        }
+        cx.notify();
+    }
+
+    pub fn clear_notices(&mut self, cx: &mut Context<Self>) {
+        self.notices.clear();
+        self.notices.open = false;
+        cx.notify();
+    }
+
+    /// Goes to whatever a notice is about.
+    pub fn open_notice(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let about = self.notices.get(id).and_then(|n| n.about.clone());
+        self.notices.dismiss(id);
+        match about {
+            Some(super::notify::About::Job(job)) => {
+                self.notices.open = false;
+                self.reveal_job(job, window, cx);
+            }
+            Some(super::notify::About::File(path)) => self.reveal_path(&path),
+            None => cx.notify(),
+        }
+    }
+
+    /// Brings a run to the front, wherever it lives.
+    pub fn reveal_job(&mut self, id: usize, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(at) = self.workspaces.iter().position(|w| w.job(id).is_some()) else {
+            cx.notify();
+            return;
+        };
+        if at != self.active {
+            self.select_workspace(at, cx);
+        }
+        self.page = None;
+        self.select_job(id, cx);
+    }
+
+    /// Shows a file where it is, in whatever this system calls its file
+    /// manager. ntls does not decide what should open your files.
+    pub fn reveal_path(&self, path: &std::path::Path) {
+        let (program, args): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+            ("open", vec!["-R".into(), path.display().to_string()])
+        } else if cfg!(target_os = "windows") {
+            ("explorer", vec![format!("/select,{}", path.display())])
+        } else {
+            // Everything else opens the containing directory, the only thing
+            // every desktop agrees on.
+            let dir = path.parent().unwrap_or(path);
+            ("xdg-open", vec![dir.display().to_string()])
+        };
+        let _ = std::process::Command::new(program).args(args).spawn();
+    }
+
+    /// What a run that has just finished has to say for itself.
+    fn notify_finished(&mut self, job_id: usize, state: &State) {
+        let Some(job) = self.job_anywhere(job_id) else { return };
+        let (name, target, digest) = (job.name(), job.target(), job.digest());
+        let elsewhere = self.workspaces.get(self.active).is_none_or(|w| w.job(job_id).is_none());
+        // "Here" means the user watched it finish. Another workspace, another
+        // tab, or a page in front of it all count as somewhere else.
+        let here = !elsewhere && self.page.is_none() && self.workspace().selected == Some(job_id);
+        let about = Some(super::notify::About::Job(job_id));
+
+        match state {
+            // A failure is always worth saying, wherever it happened.
+            State::Failed(e) => {
+                self.notify(crate::core::Level::Error, format!("{name} failed"), e.clone(), about);
+            }
+            _ if !self.settings.notify_runs => {}
+            // A run you are watching finish does not need to be told to you.
+            _ if here => {}
+            State::Done => {
+                let detail = [target, digest]
+                    .into_iter()
+                    .filter(|s| !s.is_empty() && s != "\u{2014}")
+                    .collect::<Vec<_>>()
+                    .join("  \u{b7}  ");
+                self.notify(crate::core::Level::Good, format!("{name} finished"), detail, about);
+            }
+            State::Stopped => {
+                self.notify(crate::core::Level::Info, format!("{name} stopped"), "", about);
+            }
+            _ => {}
+        }
     }
 
     // --- running ----------------------------------------------------------
@@ -1213,7 +1660,7 @@ impl App {
         })
     }
 
-    /// Starts over: the previous results go, and the whole job is done again.
+    /// Starts over: the previous results go and the job runs again from the top.
     ///
     /// This is the one that says so out loud, so it clears the table even for
     /// a tool set to keep what it finds.
@@ -1278,10 +1725,10 @@ impl App {
         // happens to the table that is already there.
         //
         // Restarting throws it away. Resuming keeps it and tells the tool
-        // which targets it need not probe again. Keeping — the tool's own
-        // switch, for a scan meant to build a picture over time — keeps it and
+        // which targets it need not probe again. Keeping is the tool's own
+        // switch, for a scan meant to build a picture over time: it keeps it and
         // probes everything anyway, so what is out there now joins what was
-        // out there before instead of replacing it.
+        // out there before and does not replace it.
         let keeping = from_scratch
             && !clean
             && job.tool.keep_key().is_some_and(|key| job.params.bool(key));
@@ -1316,11 +1763,12 @@ impl App {
             let _ = emit_tx.try_send(Msg::Event(e));
         });
 
-        let run = if done.is_empty() && prior.is_empty() {
-            crate::core::Run::fresh(cancel, params)
-        } else {
-            crate::core::Run { cancel, params, done, prior, keep: keeping }
-        };
+        // Built the long way even when there is nothing to carry: a run that
+        // is keeping what earlier runs found is keeping it from the first one,
+        // whose table is empty. Taking the empty case as "fresh" told the tool
+        // it was not keeping, and the first scan of a record kept over time
+        // came out undated and unidentified.
+        let run = crate::core::Run { cancel, params, done, prior, keep: keeping };
         runtime().spawn(async move {
             let result = tool.run(run, emitter).await;
             let _ = tx.send(Msg::Finished(result.map_err(|e| e.to_string()))).await;
@@ -1363,7 +1811,11 @@ impl App {
         // says it in opens itself.
         let mut open_panel = false;
         let mut just_finished = None;
+        let follow = self.settings.follow_results;
         let Some(job) = self.job_anywhere_mut(job_id) else { return };
+        // Read before the rows arrive: it is where the reader was on the frame
+        // they are about to change.
+        let end = follow.then(|| job.end_in_view()).flatten();
         for msg in batch {
             match msg {
                 Msg::Event(e) => job.apply(e),
@@ -1388,11 +1840,16 @@ impl App {
                 }
             }
         }
+        job.follow(end);
         let finished = !job.state.is_running();
+        let state = job.state.clone();
         if job.log_follow {
             job.log_scroll.scroll_to_bottom();
         }
-        self.panel_open |= open_panel;
+        self.panel_open |= open_panel && self.settings.open_panel_on_failure;
+        if just_finished.is_some() {
+            self.notify_finished(job_id, &state);
+        }
         // A finished run is worth keeping; one still going would mean writing
         // the whole table on every batch.
         if finished {
@@ -1429,7 +1886,7 @@ impl App {
     }
 
     /// Carries on any workflow whose run has finished. Called from the repaint,
-    /// which is where a window is to hand.
+    /// where a window is to hand.
     pub fn resume_flows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((job, failed)) = self.flow_pending.take() else { return };
         self.flow_finished(job, failed, window, cx);
@@ -1441,7 +1898,7 @@ impl App {
     ///
     /// It lands in this workspace, not a new one: chasing a host from a sweep
     /// into a port scan is the same investigation, and keeping them together
-    /// is the whole reason a workspace exists.
+    /// is most of the reason a workspace exists.
     pub fn handoff(&mut self, tool_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(job) = self.selected_job_mut() else { return };
         let Some(row) = job.selected_row() else { return };
@@ -1496,8 +1953,8 @@ impl App {
 
     /// Tab in the palette: fills in whatever it is pointing at.
     ///
-    /// Completing rather than choosing is what makes the command line worth
-    /// typing at — the tool's name, then a setting's name, then one of its
+    /// Completing, not choosing, is what makes the command line worth
+    /// typing at: the tool's name, then a setting's name, then one of its
     /// values, each one press.
     pub fn complete_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (query, cursor) =
@@ -1609,7 +2066,7 @@ impl App {
                 self.select_job(job, cx);
                 self.view = View::Tools;
                 // The row is found by where it sits in the table as it is
-                // filtered and sorted now, which is not where it sat when the
+                // filtered and sorted now, not where it sat when the
                 // search read it.
                 if let Some(open) = self.selected_job_mut() {
                     let at = open.view().iter().position(|&raw| raw == row);
@@ -1639,8 +2096,7 @@ impl App {
                 self.view = View::Tools;
             }
             Hit::Iface { name, .. } => {
-                self.view = View::Machine;
-                self.sidebar_open = true;
+                self.page = Some(Page::Interfaces);
                 let _ = name;
             }
         }
@@ -1836,7 +2292,11 @@ impl App {
         };
         if revision != job.filter_revision {
             job.filter_revision = revision;
+            let changed = job.filter != value;
             job.set_filter(value);
+            if changed {
+                self.end_note_edit();
+            }
         }
     }
 
@@ -1981,25 +2441,33 @@ impl App {
     }
 
     /// Points the note box at whichever result row is selected, and reads it back.
+    ///
+    /// What is being typed into is a line on screen, and the line on screen is
+    /// not the row in the table: sorting and filtering put them in a different
+    /// order, so the note has to be written through the view and not
+    /// straight into `rows`. Otherwise a remark about the host you are looking
+    /// at lands on whichever host happens to occupy that position.
     pub fn sync_note(&mut self, cx: &mut GpuiApp) -> bool {
-        let Some(row_idx) = self.editing_note else { return false };
+        if self.editing_note.is_none() {
+            return false;
+        }
+        let Some((at, identity)) = self.editing_note_row.clone() else { return false };
         let (revision, value) = {
             let input = self.note_input.read(cx);
             (input.revision, input.value().to_string())
         };
-        if revision != self.note_revision {
-            self.note_revision = revision;
-            let note = (!value.trim().is_empty()).then(|| value.trim().to_string());
-            if let Some(job) = self.selected_job_mut() {
-                if let Some(row) = job.rows.get_mut(row_idx) {
-                    row.note = note;
-                    let job_id = job.id;
-                    self.save_job(self.active, job_id);
-                    return true;
-                }
-            }
+        if revision == self.note_revision {
+            return false;
         }
-        false
+        self.note_revision = revision;
+        let note = (!value.trim().is_empty()).then(|| value.trim().to_string());
+        let Some(job) = self.selected_job_mut() else { return false };
+        let Some(idx) = locate_row(&job.rows, at, &identity) else { return false };
+        job.rows[idx].note = note;
+        let job_id = job.id;
+        self.editing_note_row = Some((idx, identity));
+        self.save_job(self.active, job_id);
+        true
     }
 
     /// Starts dragging a column edge.
@@ -2034,7 +2502,9 @@ impl App {
     }
 
     pub fn end_resize(&mut self) {
-        self.resizing = None;
+        if self.resizing.take().is_some_and(|r| r.column.is_none()) {
+            self.remember_layout();
+        }
     }
 
     /// Puts a column back to sizing itself from what is in it.
@@ -2048,9 +2518,12 @@ impl App {
     }
 
     /// Shows a side bar view, or hides the side bar when its own icon is
-    /// clicked again — the way an activity bar behaves everywhere else.
+    /// clicked again, the way an activity bar behaves everywhere else.
     pub fn show_view(&mut self, view: View, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.view == view && self.sidebar_open {
+        // Coming back from a page always lands on a side bar, whichever icon
+        // was clicked: hiding it would look like the click did nothing.
+        let from_page = self.page.take().is_some();
+        if !from_page && self.view == view && self.sidebar_open {
             self.sidebar_open = false;
         } else {
             self.view = view;
@@ -2061,14 +2534,74 @@ impl App {
 
     /// Re-reads the machine's interfaces. They are polled anyway, but a
     /// cable just plugged in is worth not waiting for.
+    /// Opens an IP scan pointed at a network, on the interface it belongs to.
+    ///
+    /// Reading which networks this machine is on and sweeping one of them are
+    /// the same errand, so the answer carries the button.
+    pub fn scan_network(
+        &mut self,
+        network: &str,
+        iface: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tool) = self.registry.get("ipscan") else { return };
+        self.page = None;
+        let id = self.add_tool(tool, Some(network.to_string()), None, window, cx);
+        if let Some(job) = self.workspace_mut().job_mut(id) {
+            job.params.set("iface", iface);
+            if let Some(Some(input)) = job.inputs.iter().enumerate().find_map(|(i, slot)| {
+                job.tool.fields().get(i).filter(|f| f.key == "iface").map(|_| slot.clone())
+            }) {
+                input.update(cx, |input, cx| input.set_value(iface, cx));
+            }
+        }
+        self.save_current();
+        cx.notify();
+    }
+
     pub fn refresh_interfaces(&mut self, cx: &mut Context<Self>) {
+        iface::forget_snapshot();
         self.ifaces = iface::interfaces();
         cx.notify();
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_open = !self.sidebar_open;
+        // A page has no side bar. Asking for one is asking to be back where
+        // there is one, instead of asking for nothing to happen.
+        let want = if self.page.take().is_some() { true } else { !self.sidebar_open };
+        if want != self.sidebar_open {
+            self.sidebar_open = want;
+            self.sidebar_moved = Some((std::time::Instant::now(), want));
+        }
+        self.remember_layout();
         cx.notify();
+    }
+
+    /// How wide the side bar is being drawn right now: its full width, none of
+    /// it, or somewhere in between while it is on the move.
+    pub fn sidebar_at(&self) -> f32 {
+        let full = self.sidebar_width;
+        let shut = if self.sidebar_open { full } else { 0. };
+        if !super::widgets::motion_on() {
+            return shut;
+        }
+        let Some((since, opening)) = self.sidebar_moved else { return shut };
+        let d = super::widgets::motion::SETTLE.as_secs_f32();
+        let t = (since.elapsed().as_secs_f32() / d).clamp(0., 1.);
+        // The same easing the animated elements use, worked out here because
+        // this one drives a layout instead of one element's own style.
+        let eased = if t < 0.5 { 2. * t * t } else { 1. - (-2. * t + 2.).powi(2) / 2. };
+        let fraction = if opening { eased } else { 1. - eased };
+        full * fraction
+    }
+
+    /// Whether the side bar is still on the move, and should be repainted.
+    pub fn sidebar_moving(&self) -> bool {
+        self.sidebar_moved.is_some_and(|(since, _)| {
+            since.elapsed() < super::widgets::motion::SETTLE
+                && super::widgets::motion_on()
+        })
     }
 
     pub fn toggle_panel(&mut self, cx: &mut Context<Self>) {
@@ -2270,11 +2803,10 @@ impl App {
         }
 
         // Opening a folder is the way back in for one that was closed.
-        let mut state = store::read_state();
         let key = dir.display().to_string();
-        if state.closed.contains(&key) {
-            state.closed.retain(|c| *c != key);
-            store::write_state(&state);
+        if self.settings.closed.contains(&key) {
+            self.settings.closed.retain(|c| *c != key);
+            self.save_settings();
         }
 
         let mut ws = Workspace::new(self.next_ws_id, dir.clone());
@@ -2330,7 +2862,7 @@ impl App {
         let Some(job) = self.restore_job(&stem, &record, cx) else { return };
 
         // It is a copy, not the original: it gets a file of its own in this
-        // workspace rather than writing back to wherever it was dragged from.
+        // workspace, not back to wherever it was dragged from.
         let id = job.id;
         let stem = self.workspace_mut().next_stem(&record.tool);
         let mut job = job;
@@ -2344,7 +2876,7 @@ impl App {
 
     /// Copies a tool, its settings and its results into a second entry.
     ///
-    /// Returns the copy, which is what lets the copy be started straight away.
+    /// Returns the copy, so the caller can start it straight away.
     pub fn duplicate_job(
         &mut self,
         id: usize,
@@ -2372,7 +2904,7 @@ impl App {
     /// Copies a tool and starts the copy at once.
     ///
     /// Running a scan again while keeping the one you already have is the
-    /// common case — the settings are right, the results are worth keeping —
+    /// common case (the settings are right, the results are worth keeping)
     /// and doing it in one go is what stops the second half being forgotten.
     pub fn duplicate_and_run_job(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(copy) = self.duplicate_job(id, window, cx) else { return };
@@ -2442,7 +2974,8 @@ impl App {
         let path = match super::notes::create(&dir, &name) {
             Ok(path) => path,
             Err(e) => {
-                eprintln!("ntls: cannot write a document in {}: {e}", dir.display());
+                self.notify_error("Cannot make a document", format!("{}: {e}", dir.display()));
+                cx.notify();
                 return;
             }
         };
@@ -2479,7 +3012,7 @@ impl App {
     }
 
     /// Hands a document to whatever else the system writes markdown with,
-    /// which is only ever done when it is asked for by name.
+    /// only ever done when it is asked for by name.
     pub fn edit_doc(&mut self, id: usize, cx: &mut Context<Self>) {
         if let Some(doc) = self.workspace().doc(id) {
             cx.open_with_system(&doc.path);
@@ -2510,8 +3043,8 @@ impl App {
 
     /// Renames a document or a workflow.
     ///
-    /// What both are called is the first line of the file — a document's
-    /// heading, a workflow's opening comment — so that is what a rename
+    /// What both are called is the first line of the file: a document's
+    /// heading, a workflow's opening comment. That line is what a rename
     /// writes. The file keeps its name on disk, so nothing that points at it
     /// stops pointing at it.
     pub fn rename_item(
@@ -2559,7 +3092,7 @@ impl App {
         cx.notify();
     }
 
-    /// Rewrites the line a file is named by — the first heading — or writes
+    /// Rewrites the line a file is named by, the first heading, or writes
     /// one where there is none.
     fn retitled(source: &str, name: &str) -> String {
         let mut out = String::new();
@@ -2594,7 +3127,7 @@ impl App {
     /// Takes a document out of the workspace.
     ///
     /// The same rule as a tool: the file is moved into the workspace's own
-    /// `.closed` folder rather than destroyed.
+    /// `.closed` folder, not destroyed.
     pub fn delete_doc(&mut self, id: usize, cx: &mut Context<Self>) {
         let dir = self.workspace().dir.clone();
         let Some(path) = self.workspace().doc(id).map(|d| d.path.clone()) else { return };
@@ -2621,7 +3154,8 @@ impl App {
         let path = match super::flows::create(&dir, &name) {
             Ok(path) => path,
             Err(e) => {
-                eprintln!("ntls: cannot write a workflow in {}: {e}", dir.display());
+                self.notify_error("Cannot make a workflow", format!("{}: {e}", dir.display()));
+                cx.notify();
                 return;
             }
         };
@@ -2660,7 +3194,7 @@ impl App {
         }
     }
 
-    /// Takes a workflow out of the workspace, file and all — into `.closed`,
+    /// Takes a workflow out of the workspace, file and all, into `.closed`,
     /// like everything else that is removed.
     pub fn delete_flow(&mut self, id: usize, cx: &mut Context<Self>) {
         let dir = self.workspace().dir.clone();
@@ -2683,10 +3217,10 @@ impl App {
     // --- building a workflow -----------------------------------------------
     //
     // A workflow is edited by changing its tree and writing the file from it,
-    // never by editing the text — which is what makes the same workflow the
+    // never by editing the text, which keeps the same workflow the
     // same thing whether it was built here or typed into the file by hand.
 
-    /// Puts the editor's cursor on a step, which is what puts its controls on
+    /// Puts the editor's cursor on a step, which brings its controls onto
     /// screen.
     pub fn select_step(&mut self, flow: usize, spot: Option<Spot>, cx: &mut Context<Self>) {
         self.select_flow(flow, cx);
@@ -2733,10 +3267,11 @@ impl App {
 
         let Some(sheet) = self.workspace_mut().flow_mut(flow) else { return };
         sheet.cursor = spot;
-        if let Err(e) = sheet.put(&parsed) {
-            eprintln!("ntls: cannot write {}: {e}", sheet.path.display());
-        }
+        let failure = sheet.put(&parsed).err().map(|e| (sheet.path.clone(), e));
         let source = sheet.source.clone();
+        if let Some((path, e)) = failure {
+            self.cannot_write("the workflow", &path, &e);
+        }
 
         // The text is the same workflow, so it says the same thing the moment
         // the controls change it. (The other direction is free: the steps are
@@ -2849,7 +3384,7 @@ impl App {
             .is_some_and(|(_, step)| matches!(step, Step::Set { .. }));
 
         // A different step means the box is about something else, so it is
-        // filled in from that step rather than read as a change to it.
+        // filled in from that step, not read as a change to it.
         if self.step_value_for.as_ref() != Some(&(flow, spot.clone())) {
             self.step_value_for = Some((flow, spot));
             let input = self.step_input.clone();
@@ -2934,7 +3469,7 @@ impl App {
     /// Works through a workflow until it has to wait for something.
     ///
     /// Every condition is decided when it is reached, not when the workflow
-    /// starts, which is the whole point: a step sees what the steps before it
+    /// starts, so a step sees what the steps before it
     /// found.
     fn advance_flow(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         use crate::flow::compile::Event;
@@ -2952,7 +3487,7 @@ impl App {
                     sheet.trail.push(Mark { step, outcome: Outcome::Skipped(why) });
                 }
                 // The expression is worked out here, against what the steps
-                // before it found, and kept for everything after it — the
+                // before it found, and kept for everything after it: the
                 // later steps, the conditions, and every document in the
                 // workspace.
                 Event::Set { step, name, value } => {
@@ -3022,7 +3557,7 @@ impl App {
                             outcome: Outcome::Failed(format!("nothing here is called {name}")),
                         });
                         // A step naming a tool that is not here is a mistake in
-                        // the workflow, not a result: stop rather than carry on
+                        // the workflow, not a result: stop, do not carry on
                         // as if it had happened.
                         sheet.machine = None;
                         sheet.busy = None;
@@ -3098,7 +3633,7 @@ impl App {
     }
 
     /// Re-reads every document whose file has changed. Called on each repaint,
-    /// which is often enough to notice a save in another editor and cheap
+    /// often enough to notice a save in another editor, and cheap
     /// enough that it costs one `stat` per document.
     pub fn refresh_docs(&mut self) -> bool {
         let mut changed = false;
@@ -3560,7 +4095,7 @@ impl App {
         cx.notify();
     }
 
-    /// Puts whatever was dragged into a folder — or back out into the
+    /// Puts whatever was dragged into a folder, or back out into the
     /// workspace, for `None`.
     ///
     /// A tool, a document and a workflow are all files in the same directory,
@@ -3608,14 +4143,23 @@ impl App {
 
     // --- notes -------------------------------------------------------------
 
-    /// Starts typing into a row's note.
-    pub fn begin_note(&mut self, row_index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.editing_note = Some(row_index);
-        let existing = self
-            .selected_job()
-            .and_then(|j| j.rows.get(row_index))
-            .and_then(|r| r.note.clone())
-            .unwrap_or_default();
+    /// Starts typing into the note of the line at `line` on screen.
+    ///
+    /// The index is a position in the table as displayed, the same as every
+    /// other selection in the table. The row it stands for is found
+    /// through the view, so a sorted or filtered table annotates what you
+    /// clicked on.
+    pub fn begin_note(&mut self, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(job) = self.selected_job_mut() else { return };
+        let Some(row_index) = job.view().get(line).copied() else { return };
+        let Some(row) = job.rows.get(row_index) else { return };
+        let (existing, identity) =
+            (row.note.clone().unwrap_or_default(), row.identity().to_string());
+        // A note is edited on the line it is read on, so the selection follows
+        // the caret there.
+        job.select_index(line);
+        self.editing_note = Some(line);
+        self.editing_note_row = Some((row_index, identity));
         let handle = self.note_input.read(cx).focus_handle.clone();
         window.focus(&handle);
         let input = self.note_input.clone();
@@ -3627,13 +4171,44 @@ impl App {
         cx.notify();
     }
 
-    /// Stops typing into it. What was typed is already saved — `sync_note`
-    /// writes on every keystroke — so this only puts the caret back.
+    /// Stops typing into it. `sync_note` writes on every keystroke, so what
+    /// was typed is already saved and this only puts the caret back.
     pub fn end_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing_note.take().is_none() {
+        if !self.end_note_edit() {
             return;
         }
         window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// Puts the note editor away without touching the focus, for the places
+    /// that are already moving it: leaving the workspace, reordering the
+    /// table. Answers whether anything was being edited.
+    ///
+    /// Anything that reorders the table has to end the edit, because the
+    /// editor is drawn on a line and the line would then be a different row.
+    pub fn end_note_edit(&mut self) -> bool {
+        self.editing_note_row = None;
+        self.editing_note.take().is_some()
+    }
+
+    /// Sorts the results on a column. This also ends any note being typed:
+    /// the line the editor sits on is about to be a different row.
+    pub fn sort_results(&mut self, column: usize, cx: &mut Context<Self>) {
+        self.end_note_edit();
+        if let Some(job) = self.selected_job_mut() {
+            job.set_sort(column);
+        }
+        cx.notify();
+    }
+
+    /// Puts the results back into the order they arrived in.
+    pub fn clear_sort(&mut self, cx: &mut Context<Self>) {
+        self.end_note_edit();
+        if let Some(job) = self.selected_job_mut() {
+            job.sort = None;
+            job.set_filter(job.filter.clone());
+        }
         cx.notify();
     }
 
@@ -3718,8 +4293,8 @@ impl App {
         let Some((item, editor)) = self.editing.clone() else { return };
         let colours = super::editor::Colours::of(theme);
         // Completion offers names, columns and figures and never reads a row,
-        // so it is given the shape of each run rather than everything in it —
-        // this runs on every frame the editor is open.
+        // so it is given the shape of each run and not everything in it.
+        // This runs on every frame the editor is open.
         let tables = super::notes::shapes(self.workspace());
 
         let vars: Vec<String> = self.workspace().vars.keys().cloned().collect();
@@ -3737,10 +4312,61 @@ impl App {
         }
     }
 
+    /// Chooses one of the two cuts of the palette, or hands the choice back to
+    /// the desktop.
+    pub fn set_theme_choice(
+        &mut self,
+        choice: store::ThemeChoice,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.theme = choice;
+        self.save_settings();
+        self.apply_theme(window, cx);
+    }
+
+    /// Puts the chosen palette in place. With `System` chosen this follows the
+    /// desktop, so it runs on every repaint and not only when something is
+    /// clicked.
+    pub fn apply_theme(&self, window: &Window, cx: &mut Context<Self>) {
+        let wanted = match self.settings.theme {
+            store::ThemeChoice::System => Mode::from_appearance(window.appearance()),
+            store::ThemeChoice::Light => Mode::Light,
+            store::ThemeChoice::Dark => Mode::Dark,
+        };
+        if super::theme::theme(cx).mode != wanted {
+            cx.set_global(Theme::of(wanted));
+            cx.notify();
+        }
+    }
+
+    /// The theme button and ⌘D: flip to the other cut, and mean it.
+    ///
+    /// Flipping is a choice, so it stops following the desktop. Otherwise the
+    /// next repaint would put it straight back.
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        let next = Theme::of(self.theme(cx).mode.flipped());
-        cx.set_global(next);
+        let next = self.theme(cx).mode.flipped();
+        self.settings.theme = match next {
+            Mode::Light => store::ThemeChoice::Light,
+            Mode::Dark => store::ThemeChoice::Dark,
+        };
+        self.save_settings();
+        cx.set_global(Theme::of(next));
         cx.notify();
+    }
+
+    /// Remembers how the side bar was left, when it was asked to.
+    pub fn remember_layout(&mut self) {
+        if !self.settings.remember_layout {
+            return;
+        }
+        let (open, width) = (self.sidebar_open, self.sidebar_width);
+        if self.settings.sidebar_open == Some(open) && self.settings.sidebar_width == Some(width) {
+            return;
+        }
+        self.settings.sidebar_open = Some(open);
+        self.settings.sidebar_width = Some(width);
+        self.save_settings();
     }
 
     /// Whether a text field currently has the caret, which decides what Enter
@@ -3827,6 +4453,9 @@ fn spawn_iface_poll(cx: &mut Context<App>) -> gpui::Task<()> {
                         });
                     if changed {
                         app.ifaces = fresh;
+                        // Whatever else is asking what this machine's own
+                        // addresses are should stop answering from before.
+                        iface::forget_snapshot();
                         cx.notify();
                     }
                 })
@@ -3845,7 +4474,8 @@ fn spawn_tick(cx: &mut Context<App>) -> gpui::Task<()> {
             cx.background_executor().timer(Duration::from_millis(500)).await;
             if this
                 .update(cx, |app, cx| {
-                    if app.workspaces.iter().any(Workspace::is_busy) {
+                    if app.workspaces.iter().any(Workspace::is_busy) || app.notices.any_fading()
+                    {
                         cx.notify();
                     }
                 })
@@ -3859,7 +4489,52 @@ fn spawn_tick(cx: &mut Context<App>) -> gpui::Task<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_carryable;
+    use super::{is_carryable, locate_row};
+    use crate::core::{Row, Status};
+
+    fn row(target: &str) -> Row {
+        Row {
+            cells: vec![target.to_string()],
+            status: Status::Up,
+            target: target.into(),
+            note: None,
+            key: None,
+        }
+    }
+
+    #[test]
+    fn a_run_that_keeps_what_was_found_says_so_from_the_first_one() {
+        // The first kept run has an empty table to add to, and an empty table
+        // must not be mistaken for "not keeping": the rows it writes have to
+        // be dated and identified like every kept row after them.
+        use crate::core::{Cancel, Params, Run};
+        let keeping = Run {
+            cancel: Cancel::new(),
+            params: Params::new(),
+            done: std::collections::HashSet::new(),
+            prior: Vec::new(),
+            keep: true,
+        };
+        assert!(keeping.keep);
+        assert!(!keeping.resuming(), "keeping is not resuming");
+    }
+
+    #[test]
+    fn a_note_follows_its_row_rather_than_its_position() {
+        let rows = vec![row("10.0.0.1"), row("10.0.0.2"), row("10.0.0.3")];
+        assert_eq!(locate_row(&rows, 1, "10.0.0.2"), Some(1));
+
+        // A row inserted above it does not move the note onto its neighbour.
+        // Indexing by position alone would.
+        let mut grown = rows.clone();
+        grown.insert(0, row("10.0.0.9"));
+        assert_eq!(locate_row(&grown, 1, "10.0.0.2"), Some(2));
+
+        // A row that has gone leaves nothing to write to, and does not write
+        // to whatever took its place.
+        let gone: Vec<Row> = rows.iter().filter(|r| r.target != "10.0.0.2").cloned().collect();
+        assert_eq!(locate_row(&gone, 1, "10.0.0.2"), None);
+    }
 
     #[test]
     fn a_host_is_carried_into_the_next_tool_and_a_link_is_not() {

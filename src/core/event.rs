@@ -46,7 +46,7 @@ pub struct Row {
     ///
     /// A scan that keeps what earlier runs found has two rows about one
     /// address the moment the device behind it changes, and both are about
-    /// that address — so an upsert has to be told what identity means before
+    /// that address, so an upsert has to be told what identity means before
     /// it rewrites one of them. Empty means the target is the identity, which
     /// is what it is for every tool that does not think about this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,8 +79,8 @@ pub enum Event {
     /// Appends a row to the result table.
     Row(Row),
     /// Replaces the row with the same `target`, appending it when there is
-    /// none. A tool that watches one thing change — a transfer, a lease, a
-    /// link — keeps a row per thing instead of a log of every state it passed
+    /// none. A tool that watches one thing change (a transfer, a lease, a
+    /// link) keeps a row per thing instead of a log of every state it passed
     /// through.
     Upsert(Row),
     /// Replaces the whole stat bar.
@@ -114,14 +114,14 @@ impl Event {
         Event::Row(Row { cells, status, target: target.into(), note: None, key: None })
     }
 
-    /// A row that stands for a thing rather than for a moment: emitting it
+    /// A row that stands for a thing, not for a moment: emitting it
     /// again with the same target rewrites it in place.
     pub fn upsert(status: Status, target: impl Into<String>, cells: Vec<String>) -> Event {
         Event::Upsert(Row { cells, status, target: target.into(), note: None, key: None })
     }
 
     /// An upsert whose identity is something other than its target, for a
-    /// table that holds more than one row about the same thing — the two
+    /// table that holds more than one row about the same thing: the two
     /// devices that have answered on one address, the two answers a name has
     /// given.
     pub fn upsert_as(
@@ -148,7 +148,7 @@ impl Event {
     }
 
     /// Progress with the counter replaced by text, for progress measured in
-    /// something other than items — elapsed time, say.
+    /// something other than items, elapsed time say.
     pub fn progress_label(done: usize, total: usize, label: impl Into<String>) -> Event {
         Event::Progress { done, total, label: Some(label.into()) }
     }

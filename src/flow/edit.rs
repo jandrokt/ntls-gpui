@@ -1,16 +1,16 @@
 //! Changing a workflow: what the editor does to the tree.
 //!
 //! The editor never asks the user to type a workflow. Every change it can make
-//! is one [`Change`] applied at one [`Spot`], which is what makes the whole of
-//! it testable here, without a window — and what makes undo, later, a matter of
-//! keeping the trees rather than the keystrokes.
+//! is one [`Change`] applied at one [`Spot`], which makes the whole of
+//! it testable here, without a window, and makes undo, later, a matter of
+//! keeping the trees instead of the keystrokes.
 
 use super::Step;
 
 /// Where a step is.
 ///
-/// `inside` names the blocks to descend through — for each, which step holds
-/// the block and which of that step's blocks it is — and `index` is the step's
+/// `inside` names the blocks to descend through (for each, which step holds
+/// the block and which of that step's blocks it is) and `index` is the step's
 /// place in the innermost one. An empty `inside` means the top level.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Spot {
@@ -99,14 +99,14 @@ pub enum Change {
     SetVarName(String),
     /// The expression a `set` step works out.
     SetVarValue(String),
-    /// One part of a value that is being built rather than typed: which run
+    /// One part of a value that is being built, not typed: which run
     /// or variable, which of its figures, and how to summarise it.
     SetValueSubject(String),
     SetValueField(String),
     SetValueSummary(String),
     SetTimes(usize),
     SetWait(u32),
-    /// Set one part of a condition that is being built rather than typed.
+    /// Set one part of a condition that is being built, not typed.
     SetSubject(String),
     SetField(String),
     SetTest(Test),
@@ -295,13 +295,13 @@ fn set_condition(step: &mut Step, text: String) {
     }
 }
 
-/// Whether a step can carry a condition at all — a wait and a repeat cannot,
+/// Whether a step can carry a condition at all. A wait and a repeat cannot,
 /// so the editor does not offer them one.
 pub fn takes_a_condition(step: &Step) -> bool {
     matches!(step, Step::Run { .. } | Step::Stop { .. } | Step::If { .. })
 }
 
-// --- conditions, built rather than typed --------------------------------------
+// --- conditions, built not typed ---------------------------------------------
 
 /// How two things are compared.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -469,7 +469,7 @@ impl Guide {
     /// workflow is. Every partial form still reads back into the same parts,
     /// so choosing the subject, coming back tomorrow and choosing the value
     /// works. A condition that is not finished is worked out when the step is
-    /// reached, fails there, and skips the step it guards — which is what an
+    /// reached, fails there, and skips the step it guards, which an
     /// unfinished condition should do.
     pub fn write(&self) -> String {
         let (subject, field, value) =
@@ -516,16 +516,16 @@ fn quoted_value(value: &str) -> String {
 }
 
 /// What a `set` step keeps, in the shape the controls can build: one figure of
-/// one run, optionally summarised — or one variable, which is a value already.
+/// one run, optionally summarised, or one variable, which is a value already.
 ///
 /// The same idea as [`Guide`], for the other side of the language. Anything
 /// more involved than this does not fit, and the editor shows it as written
-/// rather than pretending the controls describe it.
+/// and does not pretend the controls describe it.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Recipe {
     pub subject: String,
     pub field: String,
-    /// `avg`, `max`, `count` — how a column of many rows becomes one value.
+    /// `avg`, `max`, `count`: how a column of many rows becomes one value.
     pub summary: String,
 }
 
@@ -552,7 +552,7 @@ impl Recipe {
             return Some(Recipe::default());
         }
 
-        // `Sweep.rtt.avg()` — the summary is the call on the end.
+        // `Sweep.rtt.avg()`: the summary is the call on the end.
         let (rest, summary) = match text.strip_suffix("()") {
             Some(head) => match head.rsplit_once('.') {
                 Some((head, name)) if SUMMARIES.iter().any(|(s, _)| *s == name) => {
@@ -853,7 +853,7 @@ mod tests {
 
     #[test]
     fn a_condition_too_involved_for_the_controls_is_left_as_written() {
-        // The editor shows these as text rather than pretending the controls
+        // The editor shows these as text and does not pretend the controls
         // describe them.
         for condition in
             ["Sweep.up > 0 and Ping.ok", "exists(tool(\"X\"))", "Sweep.rtt.max() > 5", "Sweep.ok"]

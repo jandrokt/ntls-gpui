@@ -71,8 +71,8 @@ impl Tool for Ping {
 
 /// Rebuilds the statistics from the table a stopped run left behind.
 ///
-/// The table is the record — it is what was saved to disk and read back — so a
-/// resumed run reads its own output rather than keeping a second copy of it
+/// The table is the record: it is what was saved to disk and read back, so a
+/// resumed run reads its own output and does not keep a second copy of it
 /// somewhere. The RTT column is the one that matters; a row without a readable
 /// one is a probe that got no reply.
 fn seed(prior: &[crate::core::Row]) -> (usize, RttStats) {
@@ -104,7 +104,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
     let count = p.usize("count", 0);
 
     // Everything the earlier run measured, so the sequence continues and the
-    // summary above the table describes the whole session rather than the
+    // summary above the table describes the whole session and not the
     // latest slice of it.
     let (already, seeded) = seed(&r.prior);
     if already > 0 {
@@ -236,7 +236,7 @@ mod tests {
         // The next probe is number four, not number one.
         assert_eq!(already, 3);
         // And the summary counts all three, including the one that got no
-        // reply — otherwise the loss figure would reset every time.
+        // reply, or the loss figure would reset every time.
         assert_eq!(stats.sent, 3);
         assert_eq!(stats.recv, 2);
         assert_eq!(stats.avg().as_millis(), 15);

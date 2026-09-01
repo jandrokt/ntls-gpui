@@ -32,7 +32,7 @@ pub fn iface_field() -> Field {
     Field::select(
         "iface",
         "Interface",
-        "Which interface to send from — pick one to scan a network you are multi-homed onto",
+        "Which interface to send from. Pick one to scan a network you are multi-homed onto",
         iface::AUTO_INTERFACE,
         opts,
     )
@@ -144,9 +144,16 @@ pub struct Prober {
     notes: Vec<(Level, String)>,
 }
 
-/// Deliberately short: the host has already answered a ping, so a slow ARP
-/// reply is not worth holding a scan slot for.
-const MAC_LOOKUP_TIMEOUT: Duration = Duration::from_millis(400);
+/// How long a hardware lookup is given, and the range the scan's own timeout
+/// can move it inside.
+///
+/// It used to be a flat 400ms, on the reasoning that the host had already
+/// answered a ping. But an ARP reply on a wireless link routinely takes longer
+/// than that, so the column came back filled in on one scan and empty on the
+/// next for no reason anybody could see. The scan's own timeout is the better
+/// guide: somebody who raised it was asking for more patience everywhere.
+const MAC_LOOKUP_MIN: Duration = Duration::from_millis(900);
+const MAC_LOOKUP_MAX: Duration = Duration::from_millis(2500);
 
 impl Prober {
     /// Builds the backend named by `method`, preparing it for the given
@@ -227,6 +234,12 @@ impl Prober {
         Ok(pr)
     }
 
+    /// How long to wait for a hardware address, given how patient the scan
+    /// itself was told to be.
+    fn mac_timeout(&self) -> Duration {
+        self.timeout.clamp(MAC_LOOKUP_MIN, MAC_LOOKUP_MAX)
+    }
+
     /// Caveats worth showing the user before results start arriving.
     pub fn emit_notes(&self, emit: &Emitter) {
         for (level, text) in &self.notes {
@@ -277,7 +290,7 @@ impl Prober {
 
         if let Some(macs) = &self.macs
             && iface::is_local_link(addr)
-            && let Some(Ok(mac)) = cancel.run(macs.probe(addr, MAC_LOOKUP_TIMEOUT)).await
+            && let Some(Ok(mac)) = cancel.run(macs.probe(addr, self.mac_timeout())).await
         {
             out.vendor = oui::describe(&mac.mac);
             out.mac = mac.mac;

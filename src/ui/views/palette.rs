@@ -1,8 +1,9 @@
 //! The command palette, drawn over everything else.
 
 use gpui::{
-    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
+    AnimationExt, AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder,
+    px,
 };
 
 use crate::ui::app::App;
@@ -10,7 +11,7 @@ use crate::ui::icons::icon;
 use crate::ui::palette::{Param, Suggest, Value};
 use crate::ui::search::Hit;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::{Type, card, keycap, space};
+use crate::ui::widgets::{Type, card, keycap, motion, once, space};
 
 impl App {
     pub(super) fn palette_overlay(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -80,7 +81,7 @@ impl App {
             .flex_col()
             .items_center()
             // A scrim, so the palette reads as being in front of the work
-            // rather than part of it.
+            // and not part of it.
             .bg(gpui::black().opacity(if theme.mode == crate::ui::theme::Mode::Dark {
                 0.45
             } else {
@@ -94,7 +95,6 @@ impl App {
                 card(theme)
                     .id("palette")
                     .occlude()
-                    .mt(px(96.))
                     .w(px(520.))
                     .max_h(px(420.))
                     .flex()
@@ -185,7 +185,14 @@ impl App {
                             } else {
                                 rows
                             }),
-                    ),
+                    )
+                    // The card drops into place under the pointer's own
+                    // gesture: a panel that is simply there on the next frame
+                    // reads as the window having jumped and not as
+                    // something having opened.
+                    .with_animation("palette-in", once(motion::QUICK), |d, delta| {
+                        d.opacity(delta).mt(px(96. - 8. * (1. - delta)))
+                    }),
             )
             .into_any_element()
     }
@@ -341,7 +348,7 @@ fn value_row(
                 .child(if value.desc.is_empty() {
                     value.label.clone()
                 } else {
-                    format!("{} — {}", value.label, value.desc)
+                    format!("{}. {}", value.label, value.desc)
                 }),
         )
         .when(on_cursor, |d| d.child(keycap("⇥", theme)))

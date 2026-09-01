@@ -1,16 +1,16 @@
 //! Sends an HTTP request and reads what comes back.
 //!
 //! The question a network tool is asked about a web service is rarely "is the
-//! port open" — it is "what does it answer, how fast, is that what it should
+//! port open". It is "what does it answer, how fast, is that what it should
 //! answer, and is it still answering it". So this is a request tool rather
 //! than a fetcher: one row per request, the status and the timing in the
 //! table, the headers and the start of the body in the log, a graph of the
-//! response time, and two things that turn it from a request into a check —
+//! response time, and two things that turn a request into a check:
 //!
 //! - **Expect**, which says what a good answer looks like, so a row that is
-//!   not one is coloured as a failure rather than left to be read.
-//! - **Capture**, which pulls one value out of every response — a field of the
-//!   JSON, a header, the body itself — into its own column. A number captured
+//!   not one is coloured as a failure and not left to be read.
+//! - **Capture**, which pulls one value out of every response (a field of the
+//!   JSON, a header, the body itself) into its own column. A number captured
 //!   that way is graphed beside the response time, and a workflow can keep it:
 //!   `set queue = "Status page".value.last()`.
 
@@ -87,7 +87,7 @@ impl Tool for Http {
             Field::select(
                 "bodytype",
                 "Body type",
-                "What the body is, which is also the content type it is sent with",
+                "What the body is, and the content type it is sent with",
                 "text",
                 vec![
                     Opt::new("text", "text", "sent as it is written"),
@@ -128,7 +128,7 @@ impl Tool for Http {
             Field::boolean(
                 "insecure",
                 "Accept any certificate",
-                "Do not check the certificate — for an appliance with a self-signed one",
+                "Do not check the certificate, for an appliance with a self-signed one",
                 false,
             ),
             Field::boolean(
@@ -209,7 +209,7 @@ fn parse_headers(text: &str) -> (Vec<(String, String)>, Vec<String>) {
 
 /// A URL typed the way it is spoken.
 ///
-/// A name means `https://` — that is what the web is now. An address does
+/// A name means `https://`, which the web now is. An address does
 /// not: the machine at `10.0.0.1:8080` is on this network, and a box on this
 /// network with a certificate anyone trusts is the exception rather than the
 /// rule. Either way, anything that says its own scheme keeps it.
@@ -255,7 +255,7 @@ fn with_query(url: &str, query: &str) -> Result<String, String> {
 
 /// Whether a status is the kind of answer that was asked for.
 ///
-/// `any`, a family — `2xx` — a number, a range, or a list of those.
+/// `any`, a family such as `2xx`, a number, a range, or a list of those.
 fn expected(code: u16, spec: &str) -> bool {
     let spec = spec.trim();
     if spec.is_empty() || spec.eq_ignore_ascii_case("any") {
@@ -277,7 +277,7 @@ fn expected(code: u16, spec: &str) -> bool {
 }
 
 /// Reads what somebody typed into the Expect box, so a typo is refused when
-/// the form is submitted rather than silently passing everything.
+/// the form is submitted, instead of silently passing everything.
 pub fn valid_expect(spec: &str) -> Result<(), String> {
     let spec = spec.trim();
     if spec.is_empty() || spec.eq_ignore_ascii_case("any") {
@@ -404,7 +404,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
         } else {
             reqwest::redirect::Policy::none()
         })
-        .user_agent(concat!("ntls/", env!("CARGO_PKG_VERSION")));
+        .user_agent(format!("ntls/{}", crate::sys::build_tag()));
     if p.bool("insecure") {
         emit.warn("certificates are not being checked");
         client = client.danger_accept_invalid_certs(true);
@@ -418,7 +418,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
     }
     let client = client.build()?;
 
-    // A resumed run carries on the numbering rather than starting again.
+    // A resumed run carries on the numbering and does not start again.
     let first = r.prior.len();
     let start = Instant::now();
     let (mut sent, mut met) = (0usize, 0usize);
@@ -637,7 +637,7 @@ fn header(response: &reqwest::Response, name: reqwest::header::HeaderName) -> St
         .to_string()
 }
 
-/// A content type without its parameters: `text/html` rather than
+/// A content type without its parameters: `text/html`, not
 /// `text/html; charset=utf-8`.
 fn short(kind: &str) -> String {
     kind.split(';').next().unwrap_or(kind).trim().to_string()
@@ -661,7 +661,7 @@ fn preview(body: &[u8], emit: &Emitter) {
     }
 }
 
-/// What went wrong, in a few words rather than a chain of causes.
+/// What went wrong, in a few words instead of a chain of causes.
 fn why(e: &reqwest::Error) -> String {
     if e.is_timeout() {
         return "timed out".into();

@@ -2,8 +2,8 @@
 //!
 //! A scan is most useful against another scan: what is on the network now that
 //! was not last week, what has stopped answering, what changed its banner.
-//! Rows are matched on the target they refer to — the one part of a row that
-//! names the same thing across two runs — and compared cell by cell.
+//! Rows are matched on the target they refer to, the one part of a row that
+//! names the same thing across two runs, then compared cell by cell.
 
 use crate::core::{Column, Row, Status};
 
@@ -218,8 +218,8 @@ mod tests {
 
     #[test]
     fn only_the_declared_columns_are_compared() {
-        // A tool that emitted an extra cell is not reporting a difference in a
-        // column nobody can see.
+        // An extra cell beyond the declared columns is not shown, so it
+        // cannot be reported as a difference either.
         let before = [row("10.0.0.1", &["10.0.0.1", "22", "ssh", "hidden-a"])];
         let after = [row("10.0.0.1", &["10.0.0.1", "22", "ssh", "hidden-b"])];
 

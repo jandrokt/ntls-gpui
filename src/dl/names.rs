@@ -10,7 +10,7 @@ const FORBIDDEN: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0']
 
 /// Reduces anything to something safe to write to disk, keeping as much of the
 /// original as it can. An empty or all-dots result is rejected, since both are
-/// ways of naming a directory rather than a file.
+/// ways of naming a directory instead of a file.
 pub fn sanitize(name: &str) -> Option<String> {
     let cleaned: String = name
         .trim()
@@ -62,7 +62,7 @@ pub fn from_disposition(header: &str) -> Option<String> {
 /// name first is what keeps `filename` from also matching `filename*`.
 fn find_param(header: &str, key: &str) -> Option<String> {
     for part in header.split(';') {
-        // The disposition itself — `attachment` — carries no value, and
+        // The disposition itself (`attachment`) carries no value, and
         // neither do the parameters a server invents.
         let Some((name, value)) = part.trim().split_once('=') else { continue };
         if name.trim().eq_ignore_ascii_case(key) {
@@ -103,7 +103,7 @@ pub fn extension_for(mime: &str) -> Option<&'static str> {
     })
 }
 
-/// Whether a content type is a page rather than a file. Resolution keeps
+/// Whether a content type is a page instead of a file. Resolution keeps
 /// looking while the answer is yes.
 pub fn is_markup(mime: &str) -> bool {
     let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
@@ -156,7 +156,7 @@ pub fn expand_home(raw: &str) -> PathBuf {
 /// Today, as a folder name that sorts.
 pub fn today() -> String {
     // Days since the epoch, turned into a date by the civil-from-days
-    // algorithm — a whole date library to name a folder would be a poor trade.
+    // algorithm. A whole date library to name a folder would be a poor trade.
     let days = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() / 86_400)
@@ -272,7 +272,7 @@ mod tests {
         assert!(is_markup("text/html; charset=utf-8"));
         assert!(!is_markup("video/mp4"));
         // A server that says nothing might be serving anything, so it is worth
-        // another look rather than a download.
+        // another look instead of a download.
         assert!(is_markup(""));
     }
 }

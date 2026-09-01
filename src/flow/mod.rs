@@ -1,7 +1,7 @@
 //! Workflows: what to run, in what order, and on what conditions.
 //!
 //! A question about a network is rarely one tool, and rarely the same tools
-//! every time — you sweep, and *then* scan the ports of whatever answered, or
+//! every time. You sweep, and *then* scan the ports of whatever answered, or
 //! give up if nothing did. A workflow writes that down as a tree of steps.
 //!
 //! The file is text so that it can be read, diffed and edited anywhere:
@@ -21,7 +21,7 @@
 //! stop
 //! ```
 //!
-//! It is normally built in the editor rather than typed, which is why the
+//! It is normally built in the editor and not typed, which is why the
 //! writer is as much a part of this module as the reader: what the editor
 //! changes is the tree, and the file is written back from it.
 
@@ -89,16 +89,16 @@ pub struct Flow {
     /// throw away what it says about itself.
     pub heading: Vec<String>,
     pub steps: Vec<Step>,
-    /// Lines that are not steps, with why, so a typo is visible rather than
+    /// Lines that are not steps, with why, so a typo is visible and not
     /// silently doing nothing.
     pub problems: Vec<(usize, String)>,
     /// Whether reading it dropped something, so writing it back would lose
     /// what the file says.
     ///
     /// Not every problem is one of these. A branch with no condition yet is a
-    /// step that is half-built — it is read, written and read again
+    /// step that is half-built: it is read, written and read again
     /// unchanged, and it is exactly what the editor produces the moment you
-    /// add a branch. A line nobody can read is different: it is in the file
+    /// add a branch. An unreadable line is different: it is in the file
     /// and not in the tree, and writing the tree back would take it out. The
     /// editor puts its controls away for the second and not for the first.
     pub lossy: bool,
@@ -235,7 +235,7 @@ fn step(
         return Some(Step::Repeat { times: times_in_range(times), body });
     }
 
-    // `set gateway = Sweep.up` — the name, then the expression worked out
+    // `set gateway = Sweep.up`: the name, then the expression worked out
     // when the step is reached.
     if let Some(rest) = keyword(text, "set") {
         let rest = rest.trim();
@@ -433,7 +433,7 @@ fn suffix(condition: &Option<String>) -> String {
         Some(condition) => {
             // Whatever it says, including a condition that is still being
             // built. Dropping half of what somebody chose because the other
-            // half is not chosen yet is how an editor loses work — and every
+            // half is not chosen yet is how an editor loses work, and every
             // partial form reads back into the parts it was built from.
             let text = match edit::Guide::read_partial(condition) {
                 Some(guide) => guide.write(),
@@ -447,8 +447,8 @@ fn suffix(condition: &Option<String>) -> String {
 
 /// Whether a condition holds, against what the workspace has found.
 ///
-/// A condition that cannot be answered — one naming a run that has not been
-/// done — is a failure rather than a `false`, so the caller can say which of
+/// A condition that cannot be answered, one naming a run that has not been
+/// done, is a failure and not a `false`, so the caller can say which of
 /// the two happened.
 pub fn holds(condition: &str, source: &dyn crate::expr::Source) -> Result<bool, String> {
     crate::expr::run(condition, source).map(|value| value.truth())
@@ -591,7 +591,7 @@ mod tests {
     #[test]
     fn a_step_that_is_only_half_built_is_not_a_line_at_risk() {
         // Adding a branch with the editor makes exactly this, and it reads,
-        // writes and reads again unchanged — so it is a thing to finish, not
+        // writes and reads again unchanged, so it is a thing to finish, not
         // a reason to stop offering the controls that would finish it.
         let flow = parse("if  {\n  run A\n}");
         assert!(!flow.problems.is_empty(), "it still says the condition is missing");

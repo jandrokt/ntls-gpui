@@ -1,14 +1,15 @@
 //! Drawing the picker: a searchable list over the window.
 
 use gpui::{
-    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
+    AnimationExt, AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder,
+    px,
 };
 
 use crate::ui::app::App;
 use crate::ui::icons::icon;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::{Type, card, keycap, space};
+use crate::ui::widgets::{Type, card, keycap, motion, once, space};
 
 impl App {
     pub(super) fn picker_overlay(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -62,7 +63,6 @@ impl App {
                 card(theme)
                     .id("picker")
                     .occlude()
-                    .mt(px(120.))
                     .w(px(460.))
                     .max_h(px(380.))
                     .flex()
@@ -113,7 +113,10 @@ impl App {
                             } else {
                                 rows
                             }),
-                    ),
+                    )
+                    .with_animation("picker-in", once(motion::QUICK), |d, delta| {
+                        d.opacity(delta).mt(px(120. - 8. * (1. - delta)))
+                    }),
             )
             .into_any_element()
     }

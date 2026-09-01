@@ -22,8 +22,8 @@ fn table() -> &'static HashMap<String, String> {
         if flate2::read::GzDecoder::new(DATA).read_to_end(&mut raw).is_err() {
             return out;
         }
-        // The IEEE registries are not all UTF-8 — a handful of vendor names
-        // carry Latin-1 bytes — and one bad byte is no reason to lose 54,000
+        // The IEEE registries are not all UTF-8: a handful of vendor names
+        // carry Latin-1 bytes, and one bad byte is no reason to lose 54,000
         // good prefixes.
         for line in String::from_utf8_lossy(&raw).lines() {
             if let Some((prefix, vendor)) = line.split_once('\t') {
@@ -54,7 +54,7 @@ pub fn lookup(mac: &str) -> &'static str {
 }
 
 /// Reports whether a MAC is locally administered, which means it was chosen by
-/// the device rather than assigned by a vendor. Phones and laptops use these
+/// the device and not assigned by a vendor. Phones and laptops use these
 /// for per-network privacy addresses, so there is no vendor to find and the
 /// absence of one is itself the answer.
 pub fn is_local(mac: &str) -> bool {
@@ -65,9 +65,9 @@ pub fn is_local(mac: &str) -> bool {
 /// Reports an address the operating system declined to give us.
 ///
 /// Recent macOS hands unprivileged processes `02:00:00:00:00:00` for its own
-/// interfaces rather than the real hardware address. That has the
+/// interfaces instead of the real hardware address. That has the
 /// locally-administered bit set, so without this check it would be reported as
-/// a privacy address the device chose — which is a different and wrong thing
+/// a privacy address the device chose, a different and wrong thing
 /// to tell someone.
 pub fn withheld(mac: &str) -> bool {
     let hex = normalize(mac);

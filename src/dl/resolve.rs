@@ -56,7 +56,7 @@ pub enum Plan {
     /// URLs to fetch with our own engine.
     Direct(Vec<Asset>),
     /// A link an extractor claimed. It knows how to reassemble whatever is
-    /// behind it — streams in fragments, separate audio and video — so it does
+    /// behind it: streams in fragments, separate audio and video. It does
     /// the downloading too.
     Handled { by: Extractor, url: String, title: String },
 }
@@ -108,12 +108,12 @@ pub async fn resolve(
         let asset = Asset::new(url.clone());
         match super::fetch::head(client, &asset, cancel).await {
             Ok(head) if !names::is_markup(&head.mime) => {
-                emit.info(format!("{} — direct file, {}", short(&url), head.mime));
+                emit.info(format!("{}: direct file, {}", short(&url), head.mime));
                 return Ok(Plan::Direct(vec![asset]));
             }
             Ok(_) => {}
             // A server that refuses a bare range request may still serve the
-            // page, so this is a reason to keep looking rather than to stop.
+            // page, so this is a reason to keep looking instead of to stop.
             Err(e) => emit.info(format!("{}: probe failed, {e}", short(&url))),
         }
     }
@@ -166,8 +166,8 @@ pub async fn resolve(
 
 /// Reads a page and returns whatever on it turns out to be a file.
 ///
-/// Every candidate is checked before it is offered, which is what lets the
-/// scoring be generous: a wrong guess costs one request, and the guesses come
+/// Every candidate is checked before it is offered, so the scoring can be
+/// generous: a wrong guess costs one request, and the guesses come
 /// from markup that exists to be read.
 async fn scrape(
     client: &reqwest::Client,
@@ -272,8 +272,8 @@ fn candidates(body: &str, page: &str) -> Vec<Candidate> {
         }
     }
 
-    // A URL a page stashed somewhere other than an href, which is what a host
-    // does when it would rather a scraper did not find it. Both the plain and
+    // A URL a page stashed somewhere other than an href, the usual trick for
+    // keeping it away from a scraper. Both the plain and
     // the base64 form are worth a look.
     const STASHES: [&str; 7] =
         ["data-scrambled-url", "data-url", "data-href", "data-src", "data-file", "data-download", "data-link"];
@@ -420,7 +420,7 @@ fn uninteresting(url: &str, page: &str) -> bool {
 }
 
 /// Extensions worth a request. Deliberately not a list of file types the
-/// program understands — it never opens what it downloads — but of the ones
+/// program understands (it never opens what it downloads) but of the ones
 /// that distinguish a file from a page.
 const FILE_EXTENSIONS: [&str; 34] = [
     "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "dmg", "pkg", "exe", "msi", "apk", "deb",

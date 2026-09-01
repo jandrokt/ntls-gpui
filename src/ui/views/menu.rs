@@ -1,13 +1,13 @@
 //! Drawing the menu that a right-click opened.
 //!
 //! It is one absolutely-positioned panel over everything else, with a
-//! transparent sheet behind it that closes it when you click away — the same
+//! transparent sheet behind it that closes it when you click away. Same
 //! shape as the palette, and for the same reason: a menu that can be left open
 //! behind another click is a menu you have to think about.
 
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    AnimationExt, AnyElement, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
 use crate::ui::app::App;
@@ -15,10 +15,10 @@ use crate::ui::icons::icon;
 use crate::ui::menu::{Act, Item};
 use crate::ui::store::Tag;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::{Type, space};
+use crate::ui::widgets::{Type, motion, once, space};
 
 /// Wide enough for the longest thing a menu says, narrow enough to sit under
-/// the pointer rather than across the window.
+/// the pointer, not across the window.
 const WIDTH: Pixels = px(238.);
 /// The gap kept between the menu and the edge of the window.
 const MARGIN: f32 = 8.;
@@ -33,7 +33,7 @@ impl App {
         let Some(menu) = self.menu.clone() else { return div().into_any_element() };
 
         // A menu that would hang off the bottom opens upwards from the
-        // pointer instead, which is what every menu everywhere does.
+        // pointer instead, as menus everywhere do.
         let viewport = window.viewport_size();
         let height = menu.height();
         let left = f32::from(menu.at.x).min(f32::from(viewport.width - WIDTH) - MARGIN).max(MARGIN);
@@ -75,7 +75,6 @@ impl App {
                     .occlude()
                     .absolute()
                     .left(px(left))
-                    .top(px(top))
                     .w(WIDTH)
                     .flex()
                     .flex_col()
@@ -85,7 +84,14 @@ impl App {
                     .border_1()
                     .border_color(theme.border)
                     .shadow_lg()
-                    .children(rows),
+                    .children(rows)
+                    // A menu grows out of the point it was opened at, which
+                    // the only movement that says where it came from.
+                    .with_animation(
+                        SharedString::from(format!("menu-in-{left}-{top}")),
+                        once(motion::QUICK),
+                        move |d, delta| d.opacity(delta).top(px(top - 4. + 4. * delta)),
+                    ),
             )
             .into_any_element()
     }

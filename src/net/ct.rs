@@ -21,7 +21,7 @@ pub const MAX_NAMES: usize = 20_000;
 /// the process.
 const MAX_BODY: usize = 192 << 20;
 
-/// A calendar date, which is all the precision these listings need.
+/// A calendar date, all the precision these listings need.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct Date {
     /// Days since the Unix epoch. Zero means "not known".
@@ -51,7 +51,7 @@ impl Date {
     }
 }
 
-/// Howard Hinnant's days-to-calendar algorithm, which is exact and branch-free
+/// Howard Hinnant's days-to-calendar algorithm: exact and branch-free
 /// over the whole proleptic Gregorian range.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -85,7 +85,7 @@ pub struct Name {
     /// The earliest and latest issuance dates across those certificates.
     pub first_seen: Date,
     pub last_seen: Date,
-    /// The latest expiry among them, which is the one that decides whether the
+    /// The latest expiry among them, the one that decides whether the
     /// name still has a certificate covering it today.
     pub expires: Date,
     /// The CA behind the most recently issued of them.
@@ -151,7 +151,7 @@ pub struct Query {
     /// in the results when the logs know it.
     pub domain: String,
     /// Keeps names whose certificates have all lapsed. Those are often the
-    /// interesting ones — decommissioned hosts that still answer.
+    /// interesting ones: decommissioned hosts that still answer.
     pub include_expired: bool,
     /// Keeps `*.example.com` entries.
     pub include_wildcards: bool,
@@ -330,7 +330,7 @@ async fn query_certspotter(
     let mut agg = Agg::new(q);
 
     // certspotter answers in pages keyed by the last id seen. Without an API
-    // key the pages are small, so cap the walk rather than let a large domain
+    // key the pages are small, so cap the walk and do not let a large domain
     // spend the whole timeout collecting them.
     const MAX_PAGES: usize = 200;
     let mut after = String::new();
@@ -447,13 +447,13 @@ impl<'a> Agg<'a> {
             .collect();
 
         // Sorting by the name read right-to-left groups a host with its
-        // siblings rather than scattering them by first letter, so api.eu and
+        // siblings and does not scatter them by first letter, so api.eu and
         // api.us land together.
         names.sort_by(|a, b| {
             reverse_labels(&a.name)
                 .cmp(&reverse_labels(&b.name))
                 // A wildcard shares its key with the name it hangs off, and
-                // belongs just below it rather than above.
+                // belongs just below it, not above.
                 .then(a.wildcard.cmp(&b.wildcard))
                 .then(a.name.cmp(&b.name))
         });
@@ -484,7 +484,7 @@ fn clean_name(s: &str) -> Option<String> {
     Some(s.to_string())
 }
 
-/// Accepts what people paste — a URL, a wildcard, a trailing dot — and reduces
+/// Accepts what people paste (a URL, a wildcard, a trailing dot) and reduces
 /// it to the bare domain to query.
 pub fn normalize_domain(s: &str) -> Result<String, String> {
     let s = s.trim().to_ascii_lowercase();
@@ -538,7 +538,7 @@ fn parse_date(s: &str) -> Date {
     Date { days: days_from_civil(y, m, day) }
 }
 
-/// Pulls the readable part out of an X.500 issuer string, which is otherwise
+/// Pulls the readable part out of an X.500 issuer string, otherwise
 /// too wide for a column.
 fn short_issuer(dn: &str) -> String {
     let dn = dn.trim();
@@ -556,7 +556,7 @@ fn short_issuer(dn: &str) -> String {
         }
     }
     // The organisation is the name people recognise; the CN is the specific
-    // intermediate, which is worth keeping when it adds something.
+    // intermediate, worth keeping when it adds something.
     match (org.is_empty(), cn.is_empty()) {
         (false, false) if !org.eq_ignore_ascii_case(&cn) => format!("{org} {cn}"),
         (false, _) => org,
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn names_sort_right_to_left_by_label() {
         assert_eq!(reverse_labels("internal.api.example.com"), "com.example.api.internal");
-        // Which is what keeps a host next to its siblings rather than
+        // That keeps a host next to its siblings instead of
         // scattering them by first letter.
         let mut names = ["api.eu.example.com", "zeta.example.com", "api.us.example.com"];
         names.sort_by_key(|n| reverse_labels(n));

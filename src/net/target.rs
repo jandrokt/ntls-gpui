@@ -246,8 +246,8 @@ fn expand_range(lo: &str, hi: &str) -> Result<Vec<IpAddr>, String> {
 /// auto  ->  192.168.1.0/24  ->  192.168.1.1-192.168.1.254
 /// ```
 ///
-/// It returns `None` when nothing could be expanded further, which is what
-/// makes it safe to keep pressing Tab.
+/// It returns `None` when nothing could be expanded further, so pressing Tab
+/// again is safe.
 pub fn expand_target_spec(spec: &str, iface_name: &str) -> Option<String> {
     let mut parts: Vec<String> = spec.split(',').map(str::to_string).collect();
     let mut changed = false;

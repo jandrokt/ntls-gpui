@@ -143,7 +143,7 @@ impl Sheet {
     /// The step the editor has selected, if the tree still has one there.
     ///
     /// A workflow is re-read from its text on every repaint, so a cursor left
-    /// over from before a step was deleted has to be checked rather than
+    /// over from before a step was deleted has to be checked and not
     /// trusted.
     pub fn selected(&self) -> Option<(Spot, Step)> {
         let spot = self.cursor.clone()?;
@@ -158,7 +158,7 @@ impl Sheet {
     }
 
     /// How many passes of a repeated step have been done, so a card can say
-    /// `2 of 3` rather than flickering.
+    /// `2 of 3` and does not flicker.
     pub fn passes(&self, step: usize) -> usize {
         self.trail.iter().filter(|m| m.step == step).count()
     }

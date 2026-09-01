@@ -1,7 +1,7 @@
 //! A live line chart.
 //!
-//! Anything that produces a number over time — ping latency, either speed
-//! test — gets one of these without asking, because the samples a tool emits
+//! Anything producing a number over time (ping latency, either speed test)
+//! gets one of these without asking, because the samples a tool emits
 //! are enough to draw it.
 
 use gpui::{
@@ -173,7 +173,7 @@ fn paint(
         return;
     }
 
-    // Four horizontal rules with their values, which is enough to read a
+    // Four horizontal rules with their values: enough to read a
     // magnitude off without turning the panel into graph paper.
     const LINES: usize = 4;
     let style = window.text_style();
@@ -248,7 +248,7 @@ fn paint(
         window.paint_path(path, line_color);
     }
 
-    // A dot on the newest sample, which is the one being watched.
+    // A dot on the newest sample, the one being watched.
     if let Some(last) = values.last() {
         let p = at(values.len() - 1, *last);
         let r = px(3.);

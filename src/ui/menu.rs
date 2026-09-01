@@ -2,8 +2,8 @@
 //!
 //! One menu at a time, opened at a point with a list of items, closed by
 //! choosing something or by clicking away. Each item carries an [`Act`] rather
-//! than a closure, so a menu is built where the click happened — the only
-//! place that knows what it was about — and performed on the application.
+//! than a closure, so a menu is built where the click happened, the only
+//! place that knows what it was about, and performed on the application.
 
 use gpui::{Pixels, Point, SharedString};
 
@@ -109,7 +109,7 @@ pub enum Item {
         /// Destructive, so it is drawn as such and put at the bottom.
         danger: bool,
     },
-    /// A row of colour swatches, which is a faster way to tag something than a
+    /// A row of colour swatches, a faster way to tag something than a
     /// submenu of colour names.
     Colours {
         current: Tag,
@@ -149,7 +149,7 @@ impl Menu {
         Menu { at, items }
     }
 
-    /// How tall the menu will be, which is what decides whether it opens
+    /// How tall the menu will be, which decides whether it opens
     /// downwards from the pointer or upwards from it.
     pub fn height(&self) -> Pixels {
         let rows: f32 = self
@@ -224,7 +224,7 @@ pub fn for_job(
     ];
     // Comparing is only offered where there is something to compare with:
     // another run of the same tool, in the same workspace. Which one is asked
-    // in a searchable list rather than in a submenu that a workspace of thirty
+    // in a searchable list instead of in a submenu that a workspace of thirty
     // runs would make unusable.
     if comparing {
         items.push(Item::choice("Stop comparing", "compare", Act::StopComparing(id)));
@@ -235,7 +235,7 @@ pub fn for_job(
     }
 
     // Closing the tab and taking the tool out of the workspace are different
-    // things, and only one of them touches the file — so they are two items,
+    // things, and only one of them touches the file, so they are two items,
     // and the one that does is the one drawn in red.
     if open {
         items.push(Item::choice("Close tab", "close", Act::CloseTab(id)));
@@ -264,7 +264,7 @@ pub fn for_doc(id: usize, tag: Tag, favourite: bool) -> Vec<Item> {
         Item::Separator,
         Item::choice("Close tab", "close", Act::CloseDocTab(id)),
         // The same rule as a tool: this moves the file into the workspace's
-        // own `.closed` folder rather than destroying it.
+        // own `.closed` folder and does not destroy it.
         Item::danger("Delete document", "close", Act::DeleteDoc(id)),
     ]
 }
@@ -332,7 +332,7 @@ pub fn for_step(flow: usize, spot: Spot, step: &crate::flow::Step) -> Vec<Item> 
         Act::ChangeStep(flow, spot.clone(), Change::Move(true)),
     ));
     // A step that can carry a condition of its own says so; one that cannot
-    // is made conditional by being put inside a branch, which is the same
+    // is made conditional by being put inside a branch, the same
     // thing said the long way.
     if takes_a_condition(step) && !condition_of(step).is_empty() {
         items.push(Item::choice(
@@ -388,7 +388,7 @@ pub fn for_folder(name: String) -> Vec<Item> {
 /// The menu for a group heading in the side bar.
 ///
 /// Every heading has one, and every heading can be emptied: the documents and
-/// the workflows are groups like the tools are, rather than lists with no
+/// the workflows are groups like the tools are, not lists with no
 /// handle on them.
 pub fn for_group(group: Group, folder: Option<String>) -> Vec<Item> {
     let add = match group {
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn the_last_workspace_cannot_be_closed_from_its_menu() {
         // Closing the only workspace would leave nothing to work in, so the
-        // menu does not offer it rather than offering it and refusing.
+        // menu does not offer it, and does not offer it only to refuse.
         let only = for_workspace(0, Tag::None, false);
         assert!(!only.iter().any(|i| matches!(i, Item::Choice { act: Act::CloseWorkspace(_), .. })));
 

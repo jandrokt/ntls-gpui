@@ -2,7 +2,7 @@
 //!
 //! A transfer is split across several ranged requests, each retrying
 //! independently. Progress is recorded in a ledger beside the part file, so an
-//! interrupted transfer resumes from where it stopped — including across
+//! interrupted transfer resumes from where it stopped, including across
 //! sessions.
 
 use std::io::Write;
@@ -43,7 +43,7 @@ pub struct Opts {
     pub dir: PathBuf,
     /// How many ranged requests to run at once for a single file.
     pub connections: usize,
-    /// Replace an existing file rather than downloading alongside it.
+    /// Replace an existing file instead of downloading alongside it.
     pub overwrite: bool,
     /// A ceiling on the whole queue's rate, shared by every transfer in it.
     pub limit: Option<Arc<Limit>>,
@@ -67,7 +67,7 @@ impl Default for Opts {
 /// A ceiling on how fast bytes may arrive, shared by every transfer running
 /// under it.
 ///
-/// It is a token bucket rather than a sleep per chunk: a limit that is applied
+/// It is a token bucket instead of a sleep per chunk: a limit that is applied
 /// per connection is not the limit anyone asked for, and one that sleeps a
 /// fixed time per chunk stalls on a slow server instead of speeding up.
 #[derive(Debug)]
@@ -157,7 +157,7 @@ pub struct Head {
 
 /// Asks a server what is at a URL without downloading it.
 ///
-/// A one-byte ranged `GET` rather than a `HEAD`, because file hosts commonly
+/// A one-byte ranged `GET` instead of a `HEAD`, because file hosts commonly
 /// answer `HEAD` with a page, an error, or a length they then contradict.
 pub async fn head(client: &reqwest::Client, asset: &Asset, cancel: &Cancel) -> Result<Head> {
     let request = client
@@ -347,7 +347,7 @@ async fn segment(
 ///
 /// `origin` is where the whole segment begins and `start` is where this
 /// attempt begins; a retry starts partway in, and measuring progress from the
-/// request rather than from the segment would throw away everything the
+/// request instead of from the segment would throw away everything the
 /// earlier attempt already wrote.
 #[allow(clippy::too_many_arguments)]
 async fn pull(
@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn a_half_finished_segment_is_picked_up_where_it_stopped() {
         // The offset a retry asks for is the segment's origin plus everything
-        // written so far — not the origin, which would fetch bytes twice, and
+        // written so far, not the origin, which would fetch bytes twice, and
         // not the last attempt's start, which would leave a hole.
         let mut segment = Segment { start: 1_000, end: 1_999, done: 0 };
         segment.done = 400;
@@ -649,7 +649,7 @@ mod tests {
         let again = Ledger::open(&ledger_path, &first, 4 << 20, 2, &part).expect("a ledger");
         assert_eq!(again.done(), 128);
 
-        // A different file at the same URL: start over rather than write one
+        // A different file at the same URL: start over and does not write one
         // file's bytes into another's.
         let changed = Head { tag: Some("\"different\"".into()), ..first };
         let fresh = Ledger::open(&ledger_path, &changed, 4 << 20, 2, &part).expect("a ledger");

@@ -3,12 +3,195 @@
 //! Everything here obeys one type scale and one spacing rhythm, so the
 //! screens stay in proportion without each one deciding for itself.
 
+use std::time::Duration;
+
 use gpui::{
-    AnyElement, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, div, px, relative,
+    AnimationExt, AnyElement, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, div, ease_in_out,
+    prelude::FluentBuilder, px, relative,
 };
 
 use super::theme::{MONO, Theme};
+
+/// How long things take to move.
+///
+/// Two durations, for the same reason there are four text sizes. `QUICK` is a
+/// control answering a click and should feel like the click caused it.
+/// `SETTLE` is something arriving unasked, and can take long enough to be
+/// noticed.
+pub mod motion {
+    use std::time::Duration;
+    pub const QUICK: Duration = Duration::from_millis(130);
+    pub const SETTLE: Duration = Duration::from_millis(240);
+}
+
+/// Whether the interface moves at all. Read wherever an animation is built,
+/// so one switch covers all of them.
+static MOVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_motion(on: bool) {
+    MOVES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn motion_on() -> bool {
+    MOVES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// An animation that runs once, easing in and out.
+///
+/// With motion off it still runs, over a single frame: the animator gets one
+/// call with a delta of 1, the finished state. Callers need not check.
+pub fn once(duration: Duration) -> gpui::Animation {
+    let duration = if motion_on() { duration } else { Duration::from_millis(1) };
+    gpui::Animation::new(duration).with_easing(ease_in_out)
+}
+
+/// One choice in a [`Segments`]: what it says, and what picking it does.
+pub struct Segment {
+    pub label: SharedString,
+    pub pick: Box<dyn Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static>,
+}
+
+impl Segment {
+    pub fn new(
+        label: impl Into<SharedString>,
+        pick: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+    ) -> Segment {
+        Segment { label: label.into(), pick: Box::new(pick) }
+    }
+}
+
+/// A row of choices with the current one lit, and the light sliding between
+/// them.
+///
+/// The options are equal widths, so the lit part can be one
+/// element that moves instead of a highlight that goes out here and comes on
+/// over there. `from` is where the light is coming from; the caller remembers
+/// that, because an element cannot remember what it was last time.
+pub struct Segments {
+    pub id: String,
+    pub options: Vec<Segment>,
+    pub current: usize,
+    pub from: usize,
+}
+
+impl Segments {
+    pub fn render(self, theme: &Theme) -> AnyElement {
+        let Segments { id, options, current, from } = self;
+        let count = options.len().max(1);
+        let share = 1. / count as f32;
+        let (from, current) = (from.min(count - 1), current.min(count - 1));
+
+        let labels: Vec<AnyElement> = options
+            .into_iter()
+            .enumerate()
+            .map(|(i, option)| {
+                div()
+                    .id(SharedString::from(format!("{id}-{i}")))
+                    .relative()
+                    .flex()
+                    .flex_1()
+                    // Equal widths, and it takes both of these to get them:
+                    // without `min_w_0` the longest label sets a floor the
+                    // others cannot match, and the light is one element
+                    // sliding across equal shares, so it lands between two of
+                    // them.
+                    .min_w_0()
+                    .items_center()
+                    .justify_center()
+                    .h(px(22.))
+                    .px(px(space::TIGHT))
+                    .text_small()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .cursor_pointer()
+                    .text_color(if i == current { theme.on_accent } else { theme.dim })
+                    .when(i != current, |d| d.hover(|s| s.text_color(theme.text)))
+                    .child(option.label)
+                    .on_click(option.pick)
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .relative()
+            .flex()
+            // The row fills whatever it is given, so the shares it divides
+            // into are the same width whatever the labels say.
+            .w_full()
+            .p(px(2.))
+            .rounded(px(6.))
+            .bg(theme.raised)
+            .border_1()
+            .border_color(theme.border)
+            // The light, under the labels and moving between them.
+            .child(
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .bottom(px(2.))
+                    .w(relative(share))
+                    .rounded(px(4.))
+                    .bg(theme.accent)
+                    .with_animation(
+                        SharedString::from(format!("{id}-lit-{from}-{current}")),
+                        once(motion::QUICK),
+                        move |d, delta| {
+                            let at = from as f32 + (current as f32 - from as f32) * delta;
+                            d.left(relative(at * share))
+                        },
+                    ),
+            )
+            .child(div().relative().flex().flex_1().min_w_0().children(labels))
+            .into_any_element()
+    }
+}
+
+/// A switch, and the knob sliding across it.
+///
+/// The movement is the whole point: a switch that changes without moving
+/// leaves you checking whether you actually hit it. The element ids carry the
+/// state, so flipping it starts the animation over from where the knob was
+/// instead of from wherever it last happened to be.
+pub fn switch(id: &str, on: bool, theme: &Theme) -> AnyElement {
+    const TRACK: f32 = 32.;
+    const KNOB: f32 = 14.;
+    const INSET: f32 = 2.;
+    let travel = TRACK - KNOB - INSET * 2.;
+    // Where the knob is going, as a fraction of its travel: forwards when the
+    // switch is being turned on, back again when it is being turned off.
+    let at = move |delta: f32| if on { delta } else { 1. - delta };
+
+    div()
+        .relative()
+        .w(px(TRACK))
+        .h(px(KNOB + INSET * 2.))
+        .rounded_full()
+        .bg(theme.track)
+        // The colour arrives with the knob and does not switch under it.
+        .child(
+            div().absolute().inset_0().rounded_full().bg(theme.accent).with_animation(
+                SharedString::from(format!("{id}-fill-{on}")),
+                once(motion::QUICK),
+                move |d, delta| d.opacity(at(delta)),
+            ),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(INSET))
+                .size(px(KNOB))
+                .rounded_full()
+                .bg(if on { theme.on_accent } else { theme.faint })
+                .with_animation(
+                    SharedString::from(format!("{id}-knob-{on}")),
+                    once(motion::QUICK),
+                    move |d, delta| d.left(px(INSET + travel * at(delta))),
+                ),
+        )
+        .into_any_element()
+}
 
 /// The type scale.
 ///
@@ -26,7 +209,7 @@ pub mod text {
     pub const SMALL: Pixels = px(12.);
     /// Labels, counts, hints, the status bar.
     pub const META: Pixels = px(11.);
-    /// Group headings, which are shouted rather than sized up. The same size
+    /// Group headings, which are shouted, not sized up. The same size
     /// as a label, in capitals and heavier.
     pub const CAPS: Pixels = META;
 
@@ -35,7 +218,7 @@ pub mod text {
     /// GPUI places a run's baseline at
     /// `(line_height - ascent - descent) / 2 + ascent`, so two runs that
     /// differ in size or family sit at different heights however the row
-    /// around them is aligned — the drifting, superscript look. Pinning every
+    /// around them is aligned: the drifting, superscript look. Pinning every
     /// size to one box is what removes the whole class of problem, and it is
     /// why nothing in this interface calls `text_size` without also calling
     /// `line_height`. Use the [`Type`] methods and neither can be forgotten.
@@ -105,7 +288,7 @@ pub fn dot(color: Hsla) -> impl IntoElement {
     div().size(px(6.)).rounded_full().bg(color).flex_shrink_0()
 }
 
-/// A ring rather than a disc, for a status that is in progress.
+/// A ring instead of a disc, for a status that is in progress.
 pub fn ring(color: Hsla) -> impl IntoElement {
     div().size(px(7.)).rounded_full().border_2().border_color(color).flex_shrink_0()
 }

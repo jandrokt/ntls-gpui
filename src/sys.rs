@@ -1,8 +1,8 @@
 //! What differs between the systems ntls runs on.
 //!
 //! Everything platform-shaped that is not networking lives here, so the rest
-//! of the program can ask a plain question — where is home, what is this
-//! machine called, can this file be run — and get the same answer on macOS,
+//! of the program can ask a plain question (where is home, what is this
+//! machine called, can this file be run) and get the same answer on macOS,
 //! Linux and Windows.
 
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 ///
 /// `HOME` is the answer on macOS and Linux, and is often set on Windows too;
 /// `USERPROFILE` is the one Windows always sets. A machine with neither still
-/// runs, in the directory it was started from, rather than not starting.
+/// runs, in the directory it was started from, and does not refuse to start.
 pub fn home() -> PathBuf {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
@@ -29,7 +29,7 @@ pub fn downloads() -> PathBuf {
 ///
 /// Windows sets `COMPUTERNAME` and Unix often sets `HOSTNAME`; failing both,
 /// `hostname` is a program on all three. Failing that too, the name is the
-/// program's own — a peer list of several "ntls" is still better than a peer
+/// program's own. A peer list of several "ntls" beats a peer
 /// list of none.
 pub fn hostname() -> String {
     for key in ["COMPUTERNAME", "HOSTNAME"] {
@@ -46,6 +46,50 @@ pub fn hostname() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "ntls".into())
+}
+
+/// How tall the strip across the top of the window is, and how much room the
+/// window's own buttons need at the left of it.
+///
+/// On macOS the system titlebar is hidden and ntls draws its own, so these two
+/// have to agree with each other and with where the traffic lights are put:
+/// the lights are 12pt across and sit in a row 20pt from the left edge, so the
+/// strip is as tall as a light plus the same margin above and below it, and
+/// [`TRAFFIC_LIGHT_TOP`] is what centres them in it. Getting this wrong is
+/// what makes a window's own titlebar look subtly unlike every other window's.
+///
+/// Elsewhere the system draws the titlebar and this strip is just a toolbar,
+/// which wants the same height for the same reason: it holds the same
+/// controls.
+pub const TITLEBAR_HEIGHT: f32 = 38.;
+
+/// The macOS window buttons: their diameter, and where the row of them starts.
+pub const TRAFFIC_LIGHT_SIZE: f32 = 12.;
+pub const TRAFFIC_LIGHT_LEFT: f32 = 20.;
+
+/// Where the top of a traffic light goes, so the row sits on the strip's
+/// centre line.
+pub const TRAFFIC_LIGHT_TOP: f32 = (TITLEBAR_HEIGHT - TRAFFIC_LIGHT_SIZE) / 2.;
+
+/// Where the titlebar's own content can start: past all three buttons.
+pub const TITLEBAR_INSET: f32 = TRAFFIC_LIGHT_LEFT + TRAFFIC_LIGHT_SIZE * 3. + 8. * 2. + 12.;
+
+/// What this build of ntls is, as a number.
+///
+/// ntls counts builds, not versions: CI stamps its pipeline's own count
+/// in at compile time, so it goes up by one on every commit and a binary can
+/// always be traced back to the one that made it. Empty means nobody stamped
+/// it. Every build made outside CI is one.
+pub const BUILD: &str = env!("NTLS_BUILD");
+
+/// What to call this build on screen.
+pub fn build_label() -> String {
+    if BUILD.is_empty() { "local build".into() } else { format!("build {BUILD}") }
+}
+
+/// The same, for anything that has to be one token: a user agent, a file name.
+pub fn build_tag() -> String {
+    if BUILD.is_empty() { "dev".into() } else { BUILD.to_string() }
 }
 
 /// The modifier key application shortcuts are written with here.
@@ -101,7 +145,7 @@ fn title(word: &str) -> String {
 /// Whether this path is something the system will run.
 ///
 /// Unix asks the file: it is the execute bit. Windows asks the name, because
-/// that is what Windows runs on — and `PATHEXT` says which names count.
+/// that is what Windows runs on, and `PATHEXT` says which names count.
 pub fn is_executable(path: &Path) -> bool {
     if !path.is_file() {
         return false;
@@ -198,10 +242,24 @@ mod tests {
 
     #[test]
     fn home_is_somewhere_even_when_nothing_says_where() {
-        // The fallback is the directory ntls was started in, which is a real
-        // place — the alternative is refusing to start.
+        // The fallback is the directory ntls was started in, a real
+        // place. The alternative is refusing to start.
         assert!(!home().as_os_str().is_empty());
         assert!(downloads().ends_with("Downloads"));
+    }
+
+    #[test]
+    fn a_build_says_whether_it_came_from_ci() {
+        // The number is stamped in by CI and nowhere else, so a binary that
+        // claims one is a binary CI made.
+        if BUILD.is_empty() {
+            assert_eq!(build_label(), "local build");
+            assert_eq!(build_tag(), "dev");
+        } else {
+            assert!(BUILD.chars().all(|c| c.is_ascii_digit()));
+            assert_eq!(build_label(), format!("build {BUILD}"));
+            assert_eq!(build_tag(), BUILD);
+        }
     }
 
     #[test]
@@ -254,3 +312,4 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+

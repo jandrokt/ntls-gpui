@@ -56,7 +56,7 @@ mod tests {
     use crate::core::{Cancel, Emitter, Event, FieldKind, Params, Role, Status};
 
     /// The conventions the shared machinery relies on. A tool that breaks one
-    /// of these does not fail loudly at runtime — it just renders wrong — so
+    /// of these does not fail loudly at runtime, it just renders wrong, so
     /// they are checked here instead.
     #[test]
     fn every_tool_keeps_the_contract() {
@@ -173,7 +173,7 @@ mod tests {
     }
 
     /// Drives the port scanner against a listener bound here, which exercises
-    /// the whole pipeline — expansion, probing, rows, stats, progress —
+    /// the whole pipeline (expansion, probing, rows, stats, progress)
     /// without touching anything outside this machine.
     #[test]
     fn a_port_scan_finds_a_socket_we_opened() {
@@ -210,7 +210,7 @@ mod tests {
 
         // Look up the row for the socket this test opened. The neighbouring
         // port belongs to the machine, not to us, and is occasionally in use
-        // by something else — so nothing is claimed about it.
+        // by something else, so nothing is claimed about it.
         let ours = rows
             .iter()
             .find(|r| r.target == format!("127.0.0.1:{port}"))
@@ -246,7 +246,7 @@ mod tests {
         params.set("timeout", "400ms");
 
         // Told that everything up to the open port is done, only nothing is
-        // left — the scan reports no rows and closes the bar.
+        // left: the scan reports no rows and closes the bar.
         let collected = Arc::new(Mutex::new(Vec::new()));
         let sink = collected.clone();
         let emit = Emitter::new(move |e| sink.lock().unwrap().push(e));
@@ -281,7 +281,7 @@ mod tests {
         // decision, not ours: Linux only allows it unprivileged when
         // `net.ipv4.ping_group_range` covers this user's group, and Windows
         // wants Administrator. Where it is refused there is nothing to test,
-        // so say so and stop rather than reporting a bug that is not there.
+        // so say so and stop, and does not report a bug that is not there.
         if !crate::net::icmp::available() {
             eprintln!(
                 "skipped: this machine will not open an ICMP socket \
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(rows.len(), 2, "expected one row per probe");
 
         // The loopback answers its own pings, so anything else is a bug in
-        // the engine rather than a network condition.
+        // the engine instead of a network condition.
         for r in &rows {
             assert_eq!(r.status, Status::Up, "the loopback did not answer: {:?}", r.cells);
             // The TTL has a column of its own, and the loopback reports one

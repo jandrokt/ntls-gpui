@@ -82,7 +82,7 @@ fn rcode_name(c: u8) -> String {
 ///
 /// Unix keeps them in a file; Windows keeps them in the configuration store
 /// and prints them with `ipconfig`. A sweep asks for these once per host, so
-/// the answer is held briefly — long enough that a 254-host scan does not run
+/// the answer is held briefly: long enough that a 254-host scan does not run
 /// 254 subprocesses, short enough that joining another network is noticed.
 pub fn system_resolvers() -> Vec<String> {
     const FRESH: Duration = Duration::from_secs(20);
@@ -142,7 +142,7 @@ fn parse_resolv_conf(text: &str) -> Vec<String> {
 ///
 /// The first is labelled and the rest are not, so a line that is nothing but
 /// an address counts as long as the last labelled line was this one. The
-/// address may carry a zone — `fe80::1%12` — which is not part of it.
+/// address may carry a zone (`fe80::1%12`) which is not part of it.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn parse_ipconfig(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -178,8 +178,8 @@ fn parse_ipconfig(text: &str) -> Vec<String> {
     out
 }
 
-/// Builds the `in-addr.arpa` or `ip6.arpa` name for an address, which is what
-/// a PTR lookup actually asks for.
+/// Builds the `in-addr.arpa` or `ip6.arpa` name for an address, which is the
+/// name a PTR lookup actually asks for.
 pub fn reverse_arpa_name(addr: IpAddr) -> String {
     match addr {
         IpAddr::V4(v4) => {

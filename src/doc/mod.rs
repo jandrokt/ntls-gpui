@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! Average latency is {{ Router.rtt.avg().fixed(1) }} ms over
-//! {{ Router.rows }} probes — {{ if Router.rtt.avg() > 50 then "slow" else "normal" }}.
+//! {{ Router.rows }} probes, {{ if Router.rtt.avg() > 50 then "slow" else "normal" }}.
 //! ```
 //!
 //! The file is the source; the figures are worked out fresh every time it is

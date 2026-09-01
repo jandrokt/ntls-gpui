@@ -28,7 +28,7 @@ impl Value {
     }
 
     /// The number this is, if it is one. Text that reads as a number counts,
-    /// since a tool's cells are text — `"12.4 ms"` is 12.4.
+    /// since a tool's cells are text: `"12.4 ms"` is 12.4.
     pub fn number(&self) -> Option<f64> {
         match self {
             Value::Number(n) => Some(*n),

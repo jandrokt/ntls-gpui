@@ -1,9 +1,9 @@
 //! Documents in a workspace: the `.md` files beside the tool files.
 //!
 //! A document is a file. ntls lists them, renders them with the tools' figures
-//! filled in, and opens them in whatever you write with — it is not a text
-//! editor, and a workspace being a real directory is what makes that a
-//! reasonable division of labour rather than a limitation.
+//! filled in, and opens them in whatever you write with. ntls is not a text
+//! editor; a workspace is a real directory, so handing the file over costs
+//! nothing.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,8 +35,8 @@ pub struct Doc {
 impl Doc {
     /// What the document is called: its first heading, or its file name.
     ///
-    /// A heading may itself be computed — `# Link health, {{ Router.target }}`
-    /// — so the source is given the figures before the name is taken from it.
+    /// A heading may itself be computed (`# Link health, {{ Router.target }}`),
+    /// so the source is given the figures before the name is taken from it.
     pub fn title(&self, data: &dyn Source) -> String {
         for line in self.source.lines() {
             let line = line.trim();
@@ -183,7 +183,7 @@ pub struct Data<'a> {
     ///
     /// A formula may name another, and two that name each other would go
     /// round for ever; a name already on this list answers with nothing
-    /// instead, which is what an unanswerable expression answers with
+    /// instead, the same answer every unanswerable expression gives
     /// everywhere else.
     resolving: std::cell::RefCell<Vec<String>>,
 }
@@ -252,9 +252,9 @@ pub fn resolve(
 /// Every run in a workspace, read once and owned.
 ///
 /// A running workflow decides its next step while it is holding the workspace
-/// open to change it, so it answers its conditions from a copy rather than
-/// from a borrow. It is read once per step, not once per frame, which is what
-/// makes the copy affordable.
+/// open to change it, so it answers its conditions from a copy and not
+/// from a borrow. It is read once per step, not once per frame, so the copy
+/// is affordable.
 pub struct Snapshot {
     tables: Vec<Arc<Table>>,
     vars: std::collections::BTreeMap<String, crate::ui::store::Var>,
@@ -291,10 +291,10 @@ impl Source for Snapshot {
 }
 
 /// What a run looks like to something that only needs to know what it could be
-/// asked — its name, its columns, the figures it reported.
+/// asked: its name, its columns, the figures it reported.
 ///
 /// Completion and the workflow's condition controls offer those and never read
-/// a single row, so they take this rather than the table, and a scan with tens
+/// a single row, so they take this instead of the table, and a scan with tens
 /// of thousands of rows costs them nothing.
 pub fn shapes(workspace: &Workspace) -> Vec<Table> {
     workspace
@@ -387,7 +387,7 @@ mod tests {
             crate::ui::store::Var { value: "there".into(), formula: true, ..Default::default() },
         );
         let data = Data::of(&ws);
-        // Nothing, which is what every other unanswerable expression comes to.
+        // Nothing, the same as every other unanswerable expression.
         assert_eq!(Source::var(&data, "loop").as_deref(), Some("1"));
         assert_eq!(Source::var(&data, "there").as_deref(), Some(""));
     }

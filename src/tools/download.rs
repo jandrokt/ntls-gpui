@@ -3,7 +3,7 @@
 //! Paste in one link or twenty and this works out what each is, queues them,
 //! and fetches them several at a time with a row per file that rewrites itself
 //! as the transfer moves. Which sites are supported is not a question this
-//! file answers — see [`crate::dl`], which asks the extractors other people
+//! file answers; see [`crate::dl`], which asks the extractors other people
 //! maintain and otherwise reads the page.
 
 use std::sync::Arc;
@@ -297,7 +297,7 @@ async fn one(
                     return;
                 }
                 // A gallery is many files behind one link, so each gets its
-                // own row rather than sharing the pasted link's.
+                // own row and does not share the pasted link's.
                 let key = if many { format!("{link}#{index}") } else { link.to_string() };
                 transfer(client, &key, asset, opts, cancel, emit, tally).await;
             }
@@ -350,7 +350,7 @@ async fn transfer(
                     fraction: 1.0,
                 },
             );
-            emit.good(format!("{name} — {}", names::bytes(done.bytes)));
+            emit.good(format!("{name}, {}", names::bytes(done.bytes)));
             tally.ok.fetch_add(1, Ordering::Relaxed);
             tally.bytes.fetch_add(done.bytes, Ordering::Relaxed);
         }
@@ -429,7 +429,7 @@ async fn handled(
                     fraction: 1.0,
                 },
             );
-            emit.good(format!("{shown} — {}", names::bytes(size)));
+            emit.good(format!("{shown}, {}", names::bytes(size)));
             tally.ok.fetch_add(1, Ordering::Relaxed);
             tally.bytes.fetch_add(size, Ordering::Relaxed);
         }
@@ -495,8 +495,8 @@ fn watch(
 /// Reports on the queue as a whole: one chart of the combined rate, and the
 /// summary strip.
 ///
-/// It is one task rather than one per transfer because a chart of eight
-/// overlapping series is not a chart of how fast the queue is going, which is
+/// It is one task instead of one per transfer because a chart of eight
+/// overlapping series is not a chart of how fast the queue is going, which
 /// the only rate anyone asks about.
 fn watch_queue(emit: &Emitter, tally: Arc<Tally>, total: usize) -> tokio::task::JoinHandle<()> {
     let emit = emit.clone();
@@ -520,7 +520,7 @@ fn watch_queue(emit: &Emitter, tally: Arc<Tally>, total: usize) -> tokio::task::
 }
 
 /// One line of the transfer table. It is rewritten in place as the transfer
-/// moves, so a queue of twenty files is twenty rows rather than a log of every
+/// moves, so a queue of twenty files is twenty rows instead of a log of every
 /// state each of them passed through.
 struct Line<'a> {
     key: &'a str,

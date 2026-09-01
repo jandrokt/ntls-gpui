@@ -2,7 +2,7 @@
 //!
 //! Enough of the language to write a note in: headings, paragraphs, lists,
 //! quotes, fenced and inline code, rules, and bold, italic and links inside a
-//! line. Not a full implementation — tables and reference links are not here —
+//! line. Not a full implementation: tables and reference links are missing,
 //! because what is wanted is a readable note, not a typesetter.
 
 /// One block of a document.
