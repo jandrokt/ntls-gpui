@@ -9,7 +9,7 @@
 
 use gpui::{
     AnimationExt, AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
+    SharedString, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, relative,
 };
 
 use crate::ui::app::App;
@@ -83,18 +83,37 @@ pub(super) fn page_shell(
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                // The column is centred, not left-aligned. A page has
-                // no side bar beside it to be aligned to, and a measure of
-                // text against the far edge of a wide window is a page with
-                // its content pushed into a corner.
+                // The column is centred, not left-aligned. A page has no
+                // side bar beside it to be aligned to, and a measure of text
+                // against the far edge of a wide window is a page with its
+                // content pushed into a corner.
+                //
+                // Neither of these two may give way: a flex child shrinks to
+                // its container by default, and a column squashed to the
+                // height of the window is a column whose last card hangs
+                // below the end of what can be scrolled to.
                 .child(
-                    div().flex().flex_col().items_center().w_full().child(
+                    div().flex().flex_col().items_center().w_full().flex_shrink_0().child(
                         div()
                             .flex()
                             .flex_col()
+                            .flex_shrink_0()
                             .gap(px(space::SECTION))
-                            .w_full()
-                            .max_w(COLUMN)
+                            // A width, not a maximum. The height of this
+                            // column is worked out from its contents, and a
+                            // row's height depends on how many lines its
+                            // description wraps to, which depends on the
+                            // width. With `max_w` the width is not settled
+                            // when the height is measured, every wrapped
+                            // description is measured as one line, and the
+                            // column comes out short by 18px a time: the last
+                            // card of a long page ends up below the end of
+                            // what can be scrolled to.
+                            .w(COLUMN)
+                            // The window cannot currently be made narrower
+                            // than this, but if it ever can the column gives
+                            // way rather than running off the side.
+                            .max_w(relative(1.))
                             .px(px(space::GUTTER * 2.))
                             .pt(px(space::SECTION))
                             // A page ends in air, not against the

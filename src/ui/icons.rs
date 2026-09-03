@@ -59,6 +59,13 @@ icons![
     "variables",
     "check",
     "alert",
+    // The window's own buttons, on the systems where ntls draws them. Drawn in
+    // a ten unit box and shown at ten pixels, so the hairlines Windows draws
+    // these glyphs as land on whole pixels instead of between two.
+    "window-minimize",
+    "window-maximize",
+    "window-restore",
+    "window-close",
 ];
 
 /// Serves the icons to GPUI's SVG renderer.

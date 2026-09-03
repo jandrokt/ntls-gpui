@@ -39,7 +39,7 @@ pub fn hostname() -> String {
             return name.to_string_lossy().trim().to_string();
         }
     }
-    std::process::Command::new("hostname")
+    quietly(&mut std::process::Command::new("hostname"))
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -73,6 +73,46 @@ pub const TRAFFIC_LIGHT_TOP: f32 = (TITLEBAR_HEIGHT - TRAFFIC_LIGHT_SIZE) / 2.;
 
 /// Where the titlebar's own content can start: past all three buttons.
 pub const TITLEBAR_INSET: f32 = TRAFFIC_LIGHT_LEFT + TRAFFIC_LIGHT_SIZE * 3. + 8. * 2. + 12.;
+
+/// One Windows caption button: minimise, maximise and close are this wide
+/// each, and as tall as the strip they sit in.
+///
+/// 46 is what Windows itself uses at 100%, and a window whose buttons are a
+/// different size from every other window's is the sort of thing that reads as
+/// wrong without being able to say why.
+pub const CAPTION_BUTTON: f32 = 46.;
+
+/// How much of the titlebar's top edge is left to the system.
+///
+/// With the system titlebar hidden, Windows asks what every point in the
+/// window is before it decides what a click there means, and it asks ntls
+/// first. A strip that claimed the whole height would claim the top edge with
+/// it, and the top edge is what the window is resized by. This much is left
+/// unclaimed, so the answer falls through to "this is the top border".
+pub const TOP_RESIZE_EDGE: f32 = 4.;
+
+/// `CREATE_NO_WINDOW`: the process flag that stops a child command opening a
+/// console window of its own.
+///
+/// A program in the windows subsystem has no console, so every command it runs
+/// is given a brand new one, which flashes up on screen and takes the focus
+/// with it. Naming the constant here saves depending on `windows-sys` for one
+/// number.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Runs a command without letting it open a console window.
+///
+/// Only Windows has anything to do here. Everywhere else a child process has
+/// no window to begin with and this hands the command straight back.
+pub fn quietly(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
 
 /// What this build of ntls is, as a number.
 ///

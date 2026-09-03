@@ -10,13 +10,16 @@
 //! a long list reads as a list.
 
 use gpui::{
-    AnyElement, AppContext, Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, AppContext, Context, FontWeight, HighlightStyle, InteractiveElement, IntoElement,
+    ParentElement, SharedString, StatefulInteractiveElement, StyledText, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 
 use crate::ui::app::{App, VarPart};
+use crate::ui::editor::Colours;
 use crate::ui::icons::icon;
 use crate::ui::store::Var;
+use crate::ui::syntax;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{Kind, Type, button, space};
 
@@ -43,7 +46,7 @@ impl Line {
     /// half can be empty, and a row with both empty stays one line high.
     fn under(&self) -> (String, String) {
         let left = if self.var.formula {
-            format!("= {}", self.var.value.trim())
+            self.var.value.trim().to_string()
         } else {
             self.var.about.clone()
         };
@@ -87,6 +90,15 @@ impl App {
         if editing.is_some() {
             style_input(&self.var_input, theme, cx);
         }
+        // A formula is code, and it is coloured as code while it is typed. A
+        // piece of text is a piece of text, and colouring it would be
+        // claiming it means something it does not.
+        let writing_formula = matches!(&editing, Some((name, VarPart::Value))
+            if self.workspace().var(name).is_some_and(|v| v.formula));
+        let colours = Colours::of(theme);
+        self.var_input.update(cx, |input, _| {
+            input.as_formula = writing_formula.then_some(colours);
+        });
         let input = self.var_input.clone();
         let filter = self.var_filter.trim().to_lowercase();
 
@@ -214,6 +226,35 @@ impl App {
     }
 }
 
+/// A formula, drawn the way the editor draws one.
+///
+/// The spans cover the text end to end, so every character gets a colour and
+/// nothing falls through to whatever the container happened to be set to.
+fn coloured(formula: &str, theme: &Theme) -> AnyElement {
+    let colours = Colours::of(theme);
+    let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = syntax::expr_line(formula)
+        .into_iter()
+        .filter(|s| !s.range.is_empty())
+        .map(|s| {
+            (
+                s.range,
+                HighlightStyle {
+                    color: Some(colours.of_kind(s.kind)),
+                    font_weight: Some(Colours::weight_of(s.kind)),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+
+    div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .child(StyledText::new(formula.to_string()).with_highlights(highlights))
+        .into_any_element()
+}
+
 /// One variable. Click any part of it to type into that part.
 fn variable_row(
     line: &Line,
@@ -225,6 +266,7 @@ fn variable_row(
     let Line { name, var, answer, .. } = line;
     let (editing_name, editing_value, editing_about) = editing;
     let (for_name, for_value, for_about) = (name.clone(), name.clone(), name.clone());
+    let for_formula = name.clone();
 
     let (shown, wrong) = match answer {
         Ok((value, _)) if value.is_empty() => ("\u{2014}".to_string(), false),
@@ -306,14 +348,34 @@ fn variable_row(
                     .pl(NAME + px(space::SNUG))
                     .child(if editing_about {
                         boxed_input(input, px(0.), theme).into_any_element()
+                    } else if var.formula {
+                        // The formula, not the description: clicking what is
+                        // shown opens what is shown, so this goes to the
+                        // value the way the answer above it does.
+                        div()
+                            .id("var-formula")
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_baseline()
+                            .gap(px(4.))
+                            .mono()
+                            .text_meta()
+                            .overflow_hidden()
+                            .cursor_text()
+                            .child(div().flex_shrink_0().text_color(theme.faint).child("="))
+                            .child(coloured(&under_left, theme))
+                            .on_click(cx.listener(move |app, _, window, cx| {
+                                app.edit_var(for_formula.clone(), VarPart::Value, window, cx);
+                            }))
+                            .into_any_element()
                     } else {
                         div()
                             .id("var-under")
                             .flex_1()
                             .min_w_0()
-                            .when(var.formula, |d| d.mono())
                             .text_meta()
-                            .text_color(if var.formula { theme.dim } else { theme.faint })
+                            .text_color(theme.faint)
                             .truncate()
                             .cursor_text()
                             .child(under_left)
@@ -348,6 +410,7 @@ fn row_actions(
 ) -> AnyElement {
     let (toggle, duplicate, reference, remove) =
         (name.to_string(), name.to_string(), name.to_string(), name.to_string());
+    let describe = name.to_string();
     let value = shown.to_string();
 
     div()
@@ -366,8 +429,18 @@ fn row_actions(
             cx.listener(move |app, _, _, cx| app.toggle_var_formula(&toggle, cx)),
         ))
         .child(action(
+            format!("var-about-{name}"),
+            "note",
+            "Say what it is for",
+            false,
+            theme,
+            cx.listener(move |app, _, window, cx| {
+                app.edit_var(describe.clone(), VarPart::About, window, cx);
+            }),
+        ))
+        .child(action(
             format!("var-copy-{name}"),
-            "link",
+            "download",
             "Copy the value",
             false,
             theme,
@@ -375,7 +448,7 @@ fn row_actions(
         ))
         .child(action(
             format!("var-ref-{name}"),
-            "note",
+            "link",
             "Copy it as {{ a reference }}",
             false,
             theme,
@@ -470,5 +543,119 @@ fn empty(theme: &Theme, cx: &mut Context<App>) -> AnyElement {
             button("var-add-empty", "New variable", Kind::Primary, theme)
                 .on_click(cx.listener(|app, _, w, cx| app.new_var(w, cx))),
         )
+        .into_any_element()
+}
+
+/// The shape of the list of completions: how wide it is, how far it keeps
+/// from the edge of the window, and how tall one row of it is.
+const OFFER_WIDTH: f32 = 300.;
+const OFFER_MARGIN: f32 = 8.;
+const OFFER_ROW: f32 = 22.;
+
+impl App {
+    /// What the formula being typed could be finished with.
+    ///
+    /// Drawn over the window rather than inside the row, the way a menu is: a
+    /// card that hung out of a row would be cut off by the card the row is in,
+    /// and then again by the page it scrolls in.
+    pub(super) fn var_offer_overlay(
+        &mut self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        // The list is drawn over the whole window, so it has to be told to
+        // stop when the page it belongs to is no longer the page.
+        if self.var_offering.is_empty() || self.page != Some(Page::Variables) {
+            return None;
+        }
+        // Nothing until the box has been painted once, so the list arrives on
+        // the frame after the character that asked for it.
+        let caret = self.var_input.read(cx).caret_at()?;
+        let lit = self.var_offering_at;
+        let rows: Vec<AnyElement> = self
+            .var_offering
+            .iter()
+            .enumerate()
+            .map(|(i, c)| offer_row(i, i == lit, c, theme, cx))
+            .collect();
+
+        let viewport = window.viewport_size();
+        let height = OFFER_ROW * rows.len() as f32 + 8.;
+        let left = f32::from(caret.x)
+            .min(f32::from(viewport.width) - OFFER_WIDTH - OFFER_MARGIN)
+            .max(OFFER_MARGIN);
+        // A list that would hang off the bottom opens upwards from the caret.
+        let below = f32::from(caret.y) + 4.;
+        let top = if below + height + OFFER_MARGIN > f32::from(viewport.height) {
+            (f32::from(caret.y) - height - 18.).max(OFFER_MARGIN)
+        } else {
+            below
+        };
+
+        Some(
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(OFFER_WIDTH))
+                .flex()
+                .flex_col()
+                .p(px(4.))
+                .rounded(px(8.))
+                .bg(theme.panel)
+                .border_1()
+                .border_color(theme.border)
+                .shadow_lg()
+                .occlude()
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+}
+
+/// One thing the formula could be finished with: what would be written, what
+/// kind of thing it is, and a word about it.
+fn offer_row(
+    i: usize,
+    lit: bool,
+    candidate: &crate::ui::complete::Candidate,
+    theme: &Theme,
+    cx: &mut Context<App>,
+) -> AnyElement {
+    div()
+        .id(SharedString::from(format!("var-offer-{i}")))
+        .flex()
+        .items_center()
+        .gap(px(space::SNUG))
+        .h(px(OFFER_ROW))
+        .px(px(space::SNUG))
+        .rounded(px(4.))
+        .cursor_pointer()
+        .when(lit, |d| d.bg(theme.accent_soft))
+        .when(!lit, |d| d.hover(|st| st.bg(theme.hover)))
+        .child(
+            div()
+                .flex_shrink_0()
+                .mono()
+                .text_small()
+                .text_color(if lit { theme.accent } else { theme.text })
+                .child(candidate.text.clone()),
+        )
+        .child(div().flex_shrink_0().text_meta().text_color(theme.faint).child(candidate.kind))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_meta()
+                .text_color(theme.faint)
+                .truncate()
+                .child(candidate.detail.clone()),
+        )
+        .on_click(cx.listener(move |app, _, _, cx| {
+            app.var_offering_at = i;
+            app.take_var_offer(cx);
+            cx.stop_propagation();
+        }))
         .into_any_element()
 }

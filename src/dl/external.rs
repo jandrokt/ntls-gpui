@@ -153,6 +153,10 @@ pub async fn ytdlp_download(
 
     let output_template = dir.join("%(title)s [%(id)s].%(ext)s");
     let mut command = tokio::process::Command::new(binary);
+    // yt-dlp is a console program, and a console program started by a window
+    // program gets a console window of its own unless it is told otherwise.
+    #[cfg(windows)]
+    command.creation_flags(crate::sys::CREATE_NO_WINDOW);
     command
         .arg("--newline")
         .arg("--no-colors")
@@ -246,7 +250,10 @@ struct Output {
 /// Runs a command to completion, giving up if the job is cancelled.
 async fn run(binary: &str, args: &[&str], cancel: &Cancel) -> Result<Option<Output>> {
     let Some(path) = which(binary) else { return Ok(None) };
-    let child = tokio::process::Command::new(path)
+    let mut command = tokio::process::Command::new(path);
+    #[cfg(windows)]
+    command.creation_flags(crate::sys::CREATE_NO_WINDOW);
+    let child = command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

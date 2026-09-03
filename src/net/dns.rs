@@ -109,7 +109,7 @@ fn read_resolvers() -> Vec<String> {
     }
     #[cfg(windows)]
     {
-        std::process::Command::new("ipconfig")
+        crate::sys::quietly(&mut std::process::Command::new("ipconfig"))
             .arg("/all")
             .output()
             .ok()

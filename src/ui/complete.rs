@@ -84,25 +84,31 @@ pub enum Context {
 pub fn context(language: Language, line: &str, at: usize) -> Context {
     let before = &line[..at.min(line.len())];
 
-    if language == Language::Markdown {
-        // Only inside an expression: the prose around it is prose.
-        let Some(open) = before.rfind("{{") else { return Context::Nowhere };
-        if before[open..].contains("}}") {
-            return Context::Nowhere;
+    match language {
+        Language::Markdown => {
+            // Only inside an expression: the prose around it is prose.
+            let Some(open) = before.rfind("{{") else { return Context::Nowhere };
+            if before[open..].contains("}}") {
+                return Context::Nowhere;
+            }
         }
-    } else {
-        // A comment is not a place for suggestions.
-        if before.contains('#') {
-            return Context::Nowhere;
+        Language::Flow => {
+            // A comment is not a place for suggestions.
+            if before.contains('#') {
+                return Context::Nowhere;
+            }
+            // `run "` names a tool, and the name may have spaces in it.
+            if let Some(rest) = after_keyword(before, "run") {
+                let opened = rest.strip_prefix('"').or_else(|| rest.strip_prefix('\''));
+                return Context::Run {
+                    quoted: opened.is_some(),
+                    typed: opened.unwrap_or(rest).to_string(),
+                };
+            }
         }
-        // `run "` names a tool, and the name may have spaces in it.
-        if let Some(rest) = after_keyword(before, "run") {
-            let opened = rest.strip_prefix('"').or_else(|| rest.strip_prefix('\''));
-            return Context::Run {
-                quoted: opened.is_some(),
-                typed: opened.unwrap_or(rest).to_string(),
-            };
-        }
+        // The whole of it is the expression, so there is nothing to be
+        // outside of and nothing to open first.
+        Language::Expr => {}
     }
 
     // A run whose name has a space in it is named in quotes, so the thing
@@ -158,7 +164,12 @@ fn after_keyword<'a>(before: &'a str, word: &str) -> Option<&'a str> {
 }
 
 /// What to offer, given where the caret is and what the workspace holds.
-pub fn candidates(context: &Context, tables: &[Table], vars: &[String]) -> Vec<Candidate> {
+pub fn candidates(
+    context: &Context,
+    language: Language,
+    tables: &[Table],
+    vars: &[String],
+) -> Vec<Candidate> {
     let mut out = Vec::new();
 
     let typed = match context {
@@ -186,8 +197,12 @@ pub fn candidates(context: &Context, tables: &[Table], vars: &[String]) -> Vec<C
             for word in ["if", "then", "else", "true", "false", "nothing"] {
                 out.push(candidate(word, "word", ""));
             }
-            for word in FLOW_WORDS {
-                out.push(candidate(word, "word", ""));
+            // Only a workflow has steps. `repeat` in a formula would be a
+            // name that resolves to nothing.
+            if language == Language::Flow {
+                for word in FLOW_WORDS {
+                    out.push(candidate(word, "word", ""));
+                }
             }
             typed
         }
@@ -234,7 +249,7 @@ pub fn candidates(context: &Context, tables: &[Table], vars: &[String]) -> Vec<C
 fn priority(kind: &str) -> u8 {
     match kind {
         "run" => 0,
-        "column" | "figure" => 1,
+        "column" | "figure" | "variable" => 1,
         "field" => 2,
         "method" | "function" => 3,
         _ => 4,
@@ -367,11 +382,50 @@ mod tests {
     }
 
     #[test]
+    fn a_formula_is_all_expression_with_nothing_to_open_first() {
+        // A document needs `{{` before anything is offered. A formula is the
+        // expression, so the first character typed into one is already in it.
+        assert_eq!(context(Language::Markdown, "Rou", 3), Context::Nowhere);
+        assert_eq!(context(Language::Expr, "Rou", 3), Context::Word("Rou".into()));
+        assert_eq!(
+            context(Language::Expr, "Router.rt", 9),
+            Context::Field { subject: "Router".into(), typed: "rt".into() }
+        );
+
+        let offered = candidates(&Context::Word("Rou".into()), Language::Expr, &tables(), &[]);
+        assert_eq!(offered[0].text, "Router");
+    }
+
+    #[test]
+    fn what_the_workspace_holds_is_offered_before_what_the_language_has() {
+        // `text` and `tool` are functions and `threshold` is a variable of
+        // this workspace. The one that was written here is the one meant.
+        let vars = vec!["threshold".to_string()];
+        let offered = candidates(&Context::Word("t".into()), Language::Expr, &[], &vars);
+        assert_eq!(offered[0].text, "threshold");
+    }
+
+    #[test]
+    fn a_formula_is_not_offered_the_words_a_workflow_is_written_with() {
+        // `repeat` is a step. A formula that said it would be naming
+        // something that does not exist.
+        let offered = candidates(&Context::Word("rep".into()), Language::Expr, &[], &[]);
+        assert!(offered.iter().all(|c| c.text != "repeat"), "{offered:?}");
+
+        let in_a_flow = candidates(&Context::Word("rep".into()), Language::Flow, &[], &[]);
+        assert!(in_a_flow.iter().any(|c| c.text == "repeat"));
+
+        // The words an expression does have are still offered to one.
+        let words = candidates(&Context::Word("if".into()), Language::Expr, &[], &[]);
+        assert_eq!(words[0].text, "if");
+    }
+
+    #[test]
     fn a_dot_asks_about_the_thing_before_it() {
         let found = context(Language::Markdown, "{{ Router.rt", 12);
         assert_eq!(found, Context::Field { subject: "Router".into(), typed: "rt".into() });
 
-        let offered = candidates(&found, &tables(), &[]);
+        let offered = candidates(&found, Language::Markdown, &tables(), &[]);
         assert_eq!(offered[0].text, "rtt", "the column it is a prefix of");
     }
 
@@ -381,7 +435,7 @@ mod tests {
             context(Language::Flow, "run \"Rou", 8),
             Context::Run { typed: "Rou".into(), quoted: true }
         );
-        let offered = candidates(&Context::Run { typed: "Rou".into(), quoted: true }, &tables(), &[]);
+        let offered = candidates(&Context::Run { typed: "Rou".into(), quoted: true }, Language::Flow, &tables(), &[]);
         assert_eq!(offered.len(), 1);
         assert_eq!(offered[0].text, "Router");
 
@@ -411,14 +465,14 @@ mod tests {
         // Offered in a document, it comes with its quotes, because
         // `{{ IP scan.rows }}` is not an expression.
         let word = Context::Word("IP".into());
-        let offered = candidates(&word, &spaced, &[]);
+        let offered = candidates(&word, Language::Markdown, &spaced, &[]);
         assert_eq!(offered[0].text, "IP scan");
         assert_eq!(insertion(&word, &offered[0]), "\"IP scan\"");
 
         // And once it is written, the dot after it asks about that run.
         let after = context(Language::Markdown, "{{ \"IP scan\".ro", 17);
         assert_eq!(after, Context::Field { subject: "IP scan".into(), typed: "ro".into() });
-        let offered = candidates(&after, &spaced, &[]);
+        let offered = candidates(&after, Language::Markdown, &spaced, &[]);
         assert_eq!(offered[0].text, "rows");
         // What is replaced is only what was typed after the dot.
         assert_eq!(replacing(&after), 2);
@@ -428,7 +482,7 @@ mod tests {
     fn a_run_in_this_workspace_beats_a_function_of_the_same_shape() {
         // "Rou" matches both the run called Router and the `round` function;
         // the document is about the run.
-        let offered = candidates(&Context::Word("Rou".into()), &tables(), &[]);
+        let offered = candidates(&Context::Word("Rou".into()), Language::Markdown, &tables(), &[]);
         assert_eq!(offered[0].text, "Router");
         assert!(offered.iter().any(|c| c.text == "round"));
     }
@@ -441,7 +495,7 @@ mod tests {
     #[test]
     fn the_fields_every_run_has_are_offered_whatever_the_tool() {
         let found = Context::Field { subject: "Router".into(), typed: String::new() };
-        let offered = candidates(&found, &tables(), &[]);
+        let offered = candidates(&found, Language::Markdown, &tables(), &[]);
         let texts: Vec<&str> = offered.iter().map(|c| c.text.as_str()).collect();
         assert!(texts.contains(&"up"));
         assert!(texts.contains(&"rows"));
@@ -452,7 +506,7 @@ mod tests {
     #[test]
     fn nothing_is_offered_for_a_subject_that_is_not_there() {
         let found = Context::Field { subject: "Nowhere".into(), typed: "rt".into() };
-        let offered = candidates(&found, &tables(), &[]);
+        let offered = candidates(&found, Language::Markdown, &tables(), &[]);
         // The fields every run has still apply; the columns of a run that does
         // not exist do not.
         assert!(!offered.iter().any(|c| c.text == "rtt"));
@@ -462,7 +516,7 @@ mod tests {
     fn a_column_is_a_list_and_only_answers_to_methods() {
         // `Router.rtt.` is a list; offering `up` after it would be nonsense.
         let found = Context::Field { subject: "rtt".into(), typed: String::new() };
-        let offered = candidates(&found, &tables(), &[]);
+        let offered = candidates(&found, Language::Markdown, &tables(), &[]);
         let texts: Vec<&str> = offered.iter().map(|c| c.text.as_str()).collect();
         assert!(texts.contains(&"avg"));
         assert!(!texts.contains(&"up"));
@@ -473,7 +527,7 @@ mod tests {
     fn a_column_that_cannot_follow_a_dot_is_not_offered_as_one() {
         // `#` is a column of the ping table, and `Router.#` is not writable.
         let found = Context::Field { subject: "Router".into(), typed: String::new() };
-        let offered = candidates(&found, &tables(), &[]);
+        let offered = candidates(&found, Language::Markdown, &tables(), &[]);
         assert!(!offered.iter().any(|c| c.text == "#"));
         // It is reached through `col` instead, which is.
         assert!(offered.iter().any(|c| c.text == "col"));
@@ -514,10 +568,10 @@ mod tests {
 
     #[test]
     fn exact_matches_and_prefixes_rank_first() {
-        let offered = candidates(&Context::Word("Rou".into()), &tables(), &[]);
+        let offered = candidates(&Context::Word("Rou".into()), Language::Markdown, &tables(), &[]);
         assert_eq!(offered[0].text, "Router");
         // Exact match or prefix match is offered first
-        let offered_field = candidates(&Context::Field { subject: "Router".into(), typed: "rtt".into() }, &tables(), &[]);
+        let offered_field = candidates(&Context::Field { subject: "Router".into(), typed: "rtt".into() }, Language::Markdown, &tables(), &[]);
         assert_eq!(offered_field[0].text, "rtt");
     }
 }

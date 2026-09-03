@@ -38,6 +38,7 @@ impl Render for App {
         }
         self.commit_item_rename(cx);
         self.commit_var(cx);
+        self.sync_var_offer(cx);
         self.sync_var_filter(cx);
         // A document is a file something else edits, so a save elsewhere shows
         // up here.
@@ -141,7 +142,7 @@ impl Render for App {
             .text_color(theme.text)
             .font_family(super::theme::UI_FONT)
             .text_body()
-            .child(self.titlebar(&theme, cx))
+            .child(self.titlebar(&theme, window, cx))
             .child(
                 div()
                     .flex()
@@ -183,6 +184,7 @@ impl Render for App {
             .children(notices)
             .when(self.palette_open, |d| d.child(self.palette_overlay(&theme, cx)))
             .when(self.picker_open, |d| d.child(self.picker_overlay(&theme, cx)))
+            .children(self.var_offer_overlay(&theme, window, cx))
             .when(self.menu.is_some(), |d| d.child(self.menu_overlay(&theme, window, cx)))
     }
 }
@@ -309,7 +311,7 @@ impl Actions for gpui::Div {
                 // the shorthand.
                 if app.palette_open {
                     app.complete_palette(window, cx);
-                } else {
+                } else if !app.take_var_offer(cx) {
                     app.expand_focused(window, cx);
                 }
             }))
@@ -340,6 +342,9 @@ impl App {
             let palette = self.palette.clone();
             palette.update(cx, |p, _| p.move_cursor(delta.signum(), len));
             cx.notify();
+            return;
+        }
+        if self.walk_var_offer(delta.signum(), cx) {
             return;
         }
         // While a form field has the caret, the arrows belong to the text.
@@ -375,6 +380,10 @@ impl App {
             return;
         }
         if self.editing_var.is_some() {
+            if self.var_offer_is_the_answer() {
+                self.take_var_offer(cx);
+                return;
+            }
             self.end_var_edit(window, cx);
             return;
         }
@@ -422,8 +431,18 @@ impl App {
             self.toggle_notices(cx);
             return;
         }
+        // What is being typed into a page comes off before the page does:
+        // escape peels one layer at a time, and the completion list, the box
+        // and the page are three layers.
+        if self.editing_var.is_some() {
+            if self.clear_var_offer(cx) {
+                return;
+            }
+            self.end_var_edit(window, cx);
+            return;
+        }
         if self.page.is_some() {
-            self.close_page(cx);
+            self.close_page(window, cx);
             return;
         }
         if self.menu.is_some() {
@@ -448,10 +467,6 @@ impl App {
         }
         if self.renaming_item.is_some() {
             self.end_item_rename(window, cx);
-            return;
-        }
-        if self.editing_var.is_some() {
-            self.end_var_edit(window, cx);
             return;
         }
         if self.renaming_workspace {

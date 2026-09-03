@@ -395,7 +395,7 @@ fn read_arp_command() -> Result<HashMap<IpAddr, String>, String> {
 ///   192.168.1.1           a4-83-e7-01-02-03     dynamic
 /// ```
 fn read_arp_windows() -> Result<HashMap<IpAddr, String>, String> {
-    let out = std::process::Command::new("arp")
+    let out = crate::sys::quietly(&mut std::process::Command::new("arp"))
         .arg("-a")
         .output()
         .map_err(|e| format!("read neighbour table: {e}"))?;

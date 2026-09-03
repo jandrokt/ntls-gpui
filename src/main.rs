@@ -1,6 +1,16 @@
 //! ntls: a desktop toolbox for the network questions you ask most often. Is
 //! this host up, what else is on this network, and what is it listening on.
 
+// A Windows executable declares which subsystem it wants, and the default is
+// the console one: Windows then opens a console window next to the actual
+// window, and the program appears to run in two. Saying `windows` here is how
+// a program says it draws its own window and needs no console.
+//
+// Only in a release build. A debug build keeps the console, because that is
+// where a panic message and everything printed while working goes, and losing
+// it would mean a crash on Windows left nothing behind to read.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod core;
 mod dl;
 mod doc;
@@ -39,12 +49,20 @@ fn main() {
                     window_min_size: Some(size(px(880.), px(560.))),
                     titlebar: Some(TitlebarOptions {
                         title: Some("ntls".into()),
-                        // On macOS the tab strip lives in the titlebar, so the
-                        // system one is hidden and the traffic lights are
-                        // nudged down to sit level with it. Windows and Linux
-                        // keep their own titlebar, because hiding it there
-                        // takes the window's buttons with it.
-                        appears_transparent: cfg!(target_os = "macos"),
+                        // The strip ntls draws across the top is the titlebar,
+                        // so the system's own is hidden and what would have
+                        // been in it is drawn into the strip: the traffic
+                        // lights on macOS, which the system still draws and
+                        // which are only nudged down to sit level with it, and
+                        // the minimise, maximise and close buttons on Windows,
+                        // which ntls draws itself.
+                        //
+                        // Linux keeps the titlebar its desktop draws. There is
+                        // no one set of window buttons to stand in for there.
+                        appears_transparent: cfg!(any(
+                            target_os = "macos",
+                            target_os = "windows"
+                        )),
                         // Sized and placed from one set of numbers, so the
                         // strip ntls draws and the buttons the system draws
                         // on top of it agree about where the middle is.

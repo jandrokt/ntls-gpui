@@ -192,7 +192,7 @@ impl Colours {
         }
     }
 
-    fn of_kind(&self, kind: Kind) -> Hsla {
+    pub(crate) fn of_kind(&self, kind: Kind) -> Hsla {
         match kind {
             Kind::Text => self.text,
             Kind::Heading | Kind::Strong => self.strong,
@@ -209,7 +209,7 @@ impl Colours {
         }
     }
 
-    fn weight_of(kind: Kind) -> gpui::FontWeight {
+    pub(crate) fn weight_of(kind: Kind) -> gpui::FontWeight {
         match kind {
             Kind::Heading | Kind::Strong | Kind::Keyword => gpui::FontWeight::SEMIBOLD,
             _ => gpui::FontWeight::NORMAL,
@@ -531,7 +531,7 @@ impl Editor {
         let found = context(self.language, &line, at);
         self.offering = match &found {
             Where::Nowhere => Vec::new(),
-            _ => candidates(&found, &self.tables, &self.vars),
+            _ => candidates(&found, self.language, &self.tables, &self.vars),
         };
         self.offer_context = found;
         self.offering_at = 0;

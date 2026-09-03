@@ -70,6 +70,10 @@ pub struct TextInput {
     /// without comparing strings on every frame.
     pub revision: usize,
     pub mono: bool,
+    /// When set, the line is coloured as a formula instead of drawn in one
+    /// colour. A formula is code, and code in a single colour is read a word
+    /// at a time.
+    pub as_formula: Option<super::editor::Colours>,
     /// Colours, refreshed by the owner when the theme changes.
     pub text_color: Hsla,
     pub placeholder_color: Hsla,
@@ -91,6 +95,7 @@ impl TextInput {
             is_selecting: false,
             revision: 0,
             mono: true,
+            as_formula: None,
             text_color: gpui::white(),
             placeholder_color: gpui::opaque_grey(0.5, 1.0),
             caret_color: gpui::blue(),
@@ -100,6 +105,40 @@ impl TextInput {
 
     pub fn value(&self) -> &str {
         &self.content
+    }
+
+    /// Where the caret is, as a byte offset into the value.
+    pub fn caret(&self) -> usize {
+        self.cursor_offset()
+    }
+
+    /// Where the caret is in the window, at the bottom of the line: the point
+    /// anything floating under the field hangs from.
+    ///
+    /// Nothing until the field has been painted once, so a list of completions
+    /// appears on the frame after the one that asked for it.
+    pub fn caret_at(&self) -> Option<Point<Pixels>> {
+        let bounds = self.last_bounds.as_ref()?;
+        let line = self.last_layout.as_ref()?;
+        Some(point(bounds.left() + line.x_for_index(self.cursor_offset()), bounds.bottom()))
+    }
+
+    /// Replaces the `back` bytes before the caret with `insert`, and leaves the
+    /// caret after what was inserted. How a completion is taken.
+    pub fn splice(&mut self, back: usize, insert: &str, cx: &mut Context<Self>) {
+        let at = self.cursor_offset();
+        let mut start = at.saturating_sub(back);
+        // A byte count that landed inside a character would split it in half.
+        while start > 0 && !self.content.is_char_boundary(start) {
+            start -= 1;
+        }
+        self.content = (self.content[..start].to_owned() + insert + &self.content[at..]).into();
+        let caret = start + insert.len();
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.revision += 1;
+        cx.notify();
     }
 
     /// Replaces the whole value, putting the caret at the end. Used when a
@@ -479,7 +518,8 @@ impl gpui::Element for TextElement {
         let cursor = input.cursor_offset();
         let style = window.text_style();
 
-        let (display_text, text_color) = if content.is_empty() {
+        let empty = content.is_empty();
+        let (display_text, text_color) = if empty {
             (input.placeholder.clone(), input.placeholder_color)
         } else {
             (content, input.text_color)
@@ -510,6 +550,24 @@ impl gpui::Element for TextElement {
             .into_iter()
             .filter(|r| r.len > 0)
             .collect()
+        } else if let Some(colours) = input.as_formula.filter(|_| !empty) {
+            // The spans cover the line end to end, so the runs do too and
+            // nothing has to be worked out about what was missed.
+            super::syntax::expr_line(&display_text)
+                .into_iter()
+                .filter(|s| !s.range.is_empty())
+                .map(|s| TextRun {
+                    len: s.range.len(),
+                    font: gpui::Font {
+                        weight: super::editor::Colours::weight_of(s.kind),
+                        ..style.font()
+                    },
+                    color: colours.of_kind(s.kind),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                })
+                .collect()
         } else {
             vec![run]
         };

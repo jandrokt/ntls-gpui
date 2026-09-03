@@ -13,6 +13,9 @@ use std::ops::Range;
 pub enum Language {
     Markdown,
     Flow,
+    /// A bare expression, with no prose or `{{ }}` around it. What a
+    /// variable's formula is.
+    Expr,
 }
 
 /// What a run of characters is.
@@ -79,6 +82,7 @@ pub fn highlight(language: Language, source: &str) -> Vec<Vec<Span>> {
     for line in source.lines() {
         let spans = match language {
             Language::Flow => flow_line(line),
+            Language::Expr => inside(line, 0),
             Language::Markdown => {
                 let is_fence = line.trim_start().starts_with("```");
                 if is_fence {
@@ -278,15 +282,31 @@ fn starts_emphasis(rest: &str) -> Option<(&'static str, Kind)> {
 
 /// The inside of a `{{ … }}`, so that a name reads differently from a call.
 fn expression(text: &str, offset: usize) -> Vec<Span> {
-    let mut spans = vec![span(offset..offset + 2.min(text.len()), Kind::Delim)];
-    let inner_end = text.len().saturating_sub(if text.ends_with("}}") { 2 } else { 0 });
-    let inner = &text[2.min(text.len())..inner_end];
+    let open = 2.min(text.len());
+    let closed = text.len() >= 4 && text.ends_with("}}");
+    let inner_end = if closed { text.len() - 2 } else { text.len() };
 
+    let mut spans = vec![span(offset..offset + open, Kind::Delim)];
+    spans.extend(inside(&text[open..inner_end], offset + open));
+    if closed {
+        spans.push(span(offset + inner_end..offset + text.len(), Kind::Delim));
+    }
+    spans
+}
+
+/// The inside of an expression: names, calls, keywords and literals.
+///
+/// `offset` is where `inner` starts in the line the spans are for, so the same
+/// tokeniser serves an expression buried in a paragraph and one that is the
+/// whole of what is being typed.
+fn inside(inner: &str, offset: usize) -> Vec<Span> {
+    let mut spans = Vec::new();
     let mut at = 0usize;
+
     while at < inner.len() {
         let rest = &inner[at..];
         let ch = rest.chars().next().unwrap_or(' ');
-        let here = offset + 2 + at;
+        let here = offset + at;
 
         if ch.is_whitespace() {
             at += ch.len_utf8();
@@ -294,14 +314,14 @@ fn expression(text: &str, offset: usize) -> Vec<Span> {
         }
         if ch == '"' || ch == '\'' {
             let end = rest[1..].find(ch).map(|e| at + 1 + e + 1).unwrap_or(inner.len());
-            spans.push(span(here..offset + 2 + end, Kind::Str));
+            spans.push(span(here..offset + end, Kind::Str));
             at = end;
             continue;
         }
         if ch.is_ascii_digit() {
             let end =
                 at + rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(rest.len());
-            spans.push(span(here..offset + 2 + end, Kind::Number));
+            spans.push(span(here..offset + end, Kind::Number));
             at = end;
             continue;
         }
@@ -318,17 +338,21 @@ fn expression(text: &str, offset: usize) -> Vec<Span> {
             } else {
                 Kind::Name
             };
-            spans.push(span(here..offset + 2 + end, kind));
+            spans.push(span(here..offset + end, kind));
             at = end;
             continue;
         }
         at += ch.len_utf8();
     }
-
-    if text.ends_with("}}") {
-        spans.push(span(offset + inner_end..offset + text.len(), Kind::Delim));
-    }
     spans
+}
+
+/// Colours a formula, which is an expression and nothing else.
+///
+/// The spans cover the whole of it, the way [`highlight`] covers a line, so
+/// the caller can shape it in one pass.
+pub fn expr_line(source: &str) -> Vec<Span> {
+    cover(source, inside(source, 0))
 }
 
 /// A heading, or anything else that is one colour, with the expressions in
@@ -368,6 +392,46 @@ mod tests {
             .filter(|s| s.kind != Kind::Text)
             .map(|s| (s.kind, &line[s.range.clone()]))
             .collect()
+    }
+
+    #[test]
+    fn a_formula_is_coloured_without_any_braces_around_it() {
+        let line = "round(Router.rtt.avg) + 1";
+        let spans = expr_line(line);
+        assert_eq!(
+            marked(line, &spans),
+            vec![
+                (Kind::Function, "round"),
+                (Kind::Name, "Router"),
+                (Kind::Name, "rtt"),
+                (Kind::Function, "avg"),
+                (Kind::Number, "1"),
+            ]
+        );
+        // Covered end to end, so a caller can shape it in one pass.
+        let mut at = 0;
+        for span in &spans {
+            assert_eq!(span.range.start, at);
+            at = span.range.end;
+        }
+        assert_eq!(at, line.len());
+    }
+
+    #[test]
+    fn a_formula_keeps_its_keywords_and_its_strings() {
+        let line = "if Router.ok then \"up\" else \"down\"";
+        assert_eq!(
+            marked(line, &expr_line(line)),
+            vec![
+                (Kind::Keyword, "if"),
+                (Kind::Name, "Router"),
+                (Kind::Name, "ok"),
+                (Kind::Keyword, "then"),
+                (Kind::Str, "\"up\""),
+                (Kind::Keyword, "else"),
+                (Kind::Str, "\"down\""),
+            ]
+        );
     }
 
     #[test]

@@ -111,6 +111,13 @@ const TRAFFIC_LIGHTS: Pixels = if cfg!(target_os = "macos") {
 } else {
     px(8.)
 };
+/// Whether ntls draws the window's buttons into its own titlebar. Only
+/// Windows: macOS draws its three itself and Linux keeps its titlebar.
+const OWN_CAPTION: bool = cfg!(target_os = "windows");
+/// What Windows turns the close button under the pointer. Every window on the
+/// desktop uses this red, so a window that picked its own would stand out for
+/// the wrong reason.
+const CLOSE_HOVER: u32 = 0xc42b1c;
 /// The rail of view icons.
 const ACTIVITY_WIDTH: Pixels = px(48.);
 /// One row of a tree, a tab strip, or the status bar. Three heights for the
@@ -124,7 +131,12 @@ impl App {
 
     /// The strip the window is dragged by, with the workspace it is showing
     /// named in the middle of it.
-    pub(super) fn titlebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn titlebar(
+        &mut self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let name = self.workspace().name();
         let tag = self.workspace().tag.color();
         let busy = self.workspaces.iter().filter(|w| w.is_busy()).count();
@@ -133,20 +145,31 @@ impl App {
         div()
             .id("titlebar")
             // With the system titlebar hidden, this strip is what the user
-            // drags the window by. Anything interactive on top of it takes its
-            // own clicks first.
-            .window_control_area(gpui::WindowControlArea::Drag)
-            .on_click(|event, window, _| {
-                if event.click_count() >= 2 {
-                    window.zoom_window();
-                }
+            // drags the window by.
+            //
+            // On macOS and Linux saying so once, here, is enough: the strip
+            // drags and anything interactive on it takes its own clicks
+            // first. Windows works the other way around. There, a drag area
+            // is a region the system decides about before ntls sees a click
+            // at all, so a region covering the whole strip would answer "this
+            // is the titlebar" over the search box and the close button and
+            // drag the window instead. The draggable parts are named one at a
+            // time instead, beside the controls rather than under them.
+            .when(!OWN_CAPTION, |d| {
+                d.window_control_area(gpui::WindowControlArea::Drag).on_click(|event, window, _| {
+                    if event.click_count() >= 2 {
+                        window.zoom_window();
+                    }
+                })
             })
             .flex()
             .items_center()
             .h(px(crate::sys::TITLEBAR_HEIGHT))
             .flex_shrink_0()
             .pl(TRAFFIC_LIGHTS)
-            .pr(px(space::SNUG))
+            // The buttons sit flush in the corner, the way every other window
+            // on the desktop has them, so there is no padding to their right.
+            .pr(if OWN_CAPTION { px(0.) } else { px(space::SNUG) })
             .gap(px(space::SNUG))
             .bg(theme.chrome)
             .border_b_1()
@@ -182,11 +205,12 @@ impl App {
                         app.show_view(View::Workspaces, window, cx)
                     })),
             )
-            // The command centre. Only the box takes clicks: a click target
-            // wider than the thing it looks like is a click target that
-            // catches drags of the window.
+            // The command centre, with the room either side of it given over
+            // to dragging the window. Only the box takes clicks: a click
+            // target wider than the thing it looks like is a click target
+            // that catches drags of the window.
             .child(
-                div().flex().flex_1().min_w_0().justify_center().child(
+                div().flex().items_center().flex_1().min_w_0().child(drag_spacer()).child(
                     div()
                         .id("command-centre")
                         .flex()
@@ -215,7 +239,8 @@ impl App {
                         )
                         .child(keycap(&crate::sys::shortcut_label("cmd-k"), theme))
                         .on_click(cx.listener(|app, _, window, cx| app.open_palette(window, cx))),
-                ),
+                )
+                .child(drag_spacer()),
             )
             .child(
                 div()
@@ -233,6 +258,7 @@ impl App {
                     )
                     ,
             )
+            .when(OWN_CAPTION, |d| d.child(caption_buttons(theme, window)))
             .into_any_element()
     }
 
@@ -1268,6 +1294,118 @@ fn sidebar_action(
         .on_click(on_click)
         .child(icon(icon_name, px(13.), theme.dim))
         .child(div().flex_1().min_w_0().text_small().text_color(theme.dim).truncate().child(label.to_string()))
+        .into_any_element()
+}
+
+/// Empty room in the titlebar that the window can be dragged by.
+///
+/// It takes whatever width is going, so the two of them either side of the
+/// command centre keep it in the middle of the strip and turn everything that
+/// is not a control into somewhere to pick the window up.
+///
+/// The area is an inner layer rather than the spacer itself so that it can
+/// stop short of the top edge. That edge belongs to the system: it is what
+/// the window is resized by, and Windows only offers it where nothing else
+/// has claimed the point first.
+fn drag_spacer() -> AnyElement {
+    div()
+        .relative()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .child(
+            div()
+                .absolute()
+                .top(px(crate::sys::TOP_RESIZE_EDGE))
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .window_control_area(gpui::WindowControlArea::Drag),
+        )
+        .into_any_element()
+}
+
+/// Minimise, maximise and close, drawn into the titlebar because the system
+/// one they would otherwise sit in is hidden.
+///
+/// Windows does the work. Each button says which kind of window control it is,
+/// and the system takes it from there: pressing one minimises, restores or
+/// closes without ntls handling the click at all, and hovering the middle one
+/// still brings up the snap layouts. So there is nothing here but the shape.
+fn caption_buttons(theme: &Theme, window: &Window) -> AnyElement {
+    // Maximised, the middle button puts the window back, and says so.
+    let (middle, middle_tip) = if window.is_maximized() {
+        ("window-restore", "Restore")
+    } else {
+        ("window-maximize", "Maximise")
+    };
+
+    div()
+        .flex()
+        .h_full()
+        .flex_shrink_0()
+        .child(caption_button(
+            "caption-minimise",
+            "window-minimize",
+            "Minimise",
+            gpui::WindowControlArea::Min,
+            theme.hover,
+            theme.dim,
+            theme,
+        ))
+        .child(caption_button(
+            "caption-maximise",
+            middle,
+            middle_tip,
+            gpui::WindowControlArea::Max,
+            theme.hover,
+            theme.dim,
+            theme,
+        ))
+        // The close button is the one that goes red, and its glyph turns white
+        // to stay legible on it.
+        .child(caption_button(
+            "caption-close",
+            "window-close",
+            "Close",
+            gpui::WindowControlArea::Close,
+            gpui::rgb(CLOSE_HOVER).into(),
+            gpui::white(),
+            theme,
+        ))
+        .into_any_element()
+}
+
+/// One of the window's own buttons.
+///
+/// The glyph takes the colour of the text around it rather than one of its
+/// own, so that hovering can change both the panel behind it and the mark on
+/// it in one move.
+fn caption_button(
+    id: &'static str,
+    glyph: &str,
+    tip: &'static str,
+    area: gpui::WindowControlArea,
+    hover_bg: Hsla,
+    hover_fg: Hsla,
+    theme: &Theme,
+) -> AnyElement {
+    div()
+        .id(id)
+        .window_control_area(area)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(crate::sys::CAPTION_BUTTON))
+        .h_full()
+        .flex_shrink_0()
+        .text_color(theme.dim)
+        .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
+        .tooltip({
+            let theme = *theme;
+            move |_, cx| cx.new(|_| Tip { label: tip, theme }).into()
+        })
+        .child(gpui::svg().path(format!("icons/{glyph}.svg")).size(px(10.)).flex_none())
         .into_any_element()
 }
 

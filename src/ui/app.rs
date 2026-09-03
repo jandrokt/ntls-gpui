@@ -216,6 +216,17 @@ pub struct App {
     pub var_input: Entity<TextInput>,
     pub editing_var: Option<(String, VarPart)>,
     var_revision: usize,
+    /// What the formula being typed could be finished with, which row of the
+    /// list is lit, and whether the arrows have been used. Walking the list is
+    /// what turns return from "I have finished" into "take that one".
+    pub var_offering: Vec<super::complete::Candidate>,
+    pub var_offering_at: usize,
+    var_walked_offer: bool,
+    /// What the offer would replace, worked out when it was made.
+    var_offer_context: super::complete::Context,
+    /// The edit and caret the offer was worked out for, so it is not worked
+    /// out again on every frame.
+    var_offer_for: Option<(usize, usize)>,
     /// The box that narrows the variables page down, and what is in it.
     pub var_filter_input: Entity<TextInput>,
     pub var_filter: String,
@@ -534,6 +545,11 @@ impl App {
             var_input: cx.new(|cx| TextInput::new(cx, "", "value")),
             editing_var: None,
             var_revision: 0,
+            var_offering: Vec::new(),
+            var_offering_at: 0,
+            var_walked_offer: false,
+            var_offer_context: super::complete::Context::Nowhere,
+            var_offer_for: None,
             var_filter_input: cx.new(|cx| {
                 let mut input = TextInput::new(cx, "", "Filter");
                 input.mono = false;
@@ -1251,6 +1267,99 @@ impl App {
         cx.notify();
     }
 
+    // --- finishing a formula ------------------------------------------------
+
+    /// Works out what the formula being typed could be finished with.
+    ///
+    /// Only a formula. Text is text: offering it the name of a run would be
+    /// offering to write something nothing will ever read.
+    pub fn sync_var_offer(&mut self, cx: &mut Context<Self>) {
+        let writing_formula = matches!(&self.editing_var, Some((name, VarPart::Value))
+            if self.workspace().var(name).is_some_and(|v| v.formula));
+        if !writing_formula {
+            self.var_offering.clear();
+            self.var_offer_for = None;
+            return;
+        }
+
+        let (revision, caret, line) = {
+            let input = self.var_input.read(cx);
+            (input.revision, input.caret(), input.value().to_string())
+        };
+        // Nothing has moved and nothing has been typed, so the list is still
+        // the list, and whichever row was walked to is still the one.
+        if self.var_offer_for == Some((revision, caret)) {
+            return;
+        }
+        self.var_offer_for = Some((revision, caret));
+
+        let language = super::syntax::Language::Expr;
+        let found = super::complete::context(language, &line, caret);
+        let tables = super::notes::shapes(self.workspace());
+        let vars: Vec<String> = self.workspace().vars.keys().cloned().collect();
+        self.var_offering = match &found {
+            super::complete::Context::Nowhere => Vec::new(),
+            _ => super::complete::candidates(&found, language, &tables, &vars),
+        };
+        self.var_offer_context = found;
+        self.var_offering_at = 0;
+        self.var_walked_offer = false;
+    }
+
+    /// Moves through the offer. Says whether there was one, so the caller
+    /// knows whether the arrow key was used up.
+    pub fn walk_var_offer(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        if self.var_offering.is_empty() {
+            return false;
+        }
+        let len = self.var_offering.len() as isize;
+        self.var_offering_at = (self.var_offering_at as isize + delta).rem_euclid(len) as usize;
+        self.var_walked_offer = true;
+        // Nothing was typed and the caret did not move, so the list is not
+        // worked out again on the next frame and the row walked to stays.
+        cx.notify();
+        true
+    }
+
+    /// Whether return should take the offer rather than finish the edit.
+    ///
+    /// With a prefix typed, the highlighted row is what was meant. With
+    /// nothing typed the list is only showing what exists, so return still
+    /// means "done" unless the arrows have been used.
+    pub fn var_offer_is_the_answer(&self) -> bool {
+        !self.var_offering.is_empty()
+            && (self.var_walked_offer || super::complete::replacing(&self.var_offer_context) > 0)
+    }
+
+    /// Writes whatever is highlighted into the box.
+    pub fn take_var_offer(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(candidate) = self.var_offering.get(self.var_offering_at).cloned() else {
+            return false;
+        };
+        let back = super::complete::replacing(&self.var_offer_context);
+        let insert = super::complete::insertion(&self.var_offer_context, &candidate);
+        let input = self.var_input.clone();
+        input.update(cx, |input, cx| input.splice(back, &insert, cx));
+        self.clear_var_offer(cx);
+        cx.notify();
+        true
+    }
+
+    /// Puts the list away without taking anything from it.
+    pub fn clear_var_offer(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.var_offering.is_empty() {
+            return false;
+        }
+        self.var_offering.clear();
+        self.var_walked_offer = false;
+        // Nothing is offered again until the caret moves or something is
+        // typed, so escape puts it away and it stays away.
+        let held = self.var_input.read(cx);
+        self.var_offer_for = Some((held.revision, held.caret()));
+        cx.notify();
+        true
+    }
+
     /// Reads the variables page's filter box back, as it is typed.
     pub fn sync_var_filter(&mut self, cx: &mut GpuiApp) {
         let (revision, value) = {
@@ -1267,6 +1376,8 @@ impl App {
         if self.editing_var.take().is_none() {
             return;
         }
+        self.var_offering.clear();
+        self.var_offer_for = None;
         window.focus(&self.focus_handle);
         cx.notify();
     }
@@ -1476,6 +1587,7 @@ impl App {
     /// somewhere you are, not something you opened.
     pub fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         self.page = (self.page != Some(page)).then_some(page);
+        self.end_var_edit(window, cx);
         if self.page.is_some() {
             self.end_note_edit();
             window.focus(&self.focus_handle);
@@ -1484,8 +1596,14 @@ impl App {
     }
 
     /// Goes back to the workspace, from wherever.
-    pub fn close_page(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// Whatever was being typed into the page is left as it stands. Nothing
+    /// belonging to the page may outlive it: a box that is no longer drawn
+    /// still holds the caret, and the list of completions is drawn over the
+    /// window rather than on the page and would be left hanging there.
+    pub fn close_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page.take().is_some() {
+            self.end_var_edit(window, cx);
             cx.notify();
         }
     }
@@ -1598,7 +1716,9 @@ impl App {
             let dir = path.parent().unwrap_or(path);
             ("xdg-open", vec![dir.display().to_string()])
         };
-        let _ = std::process::Command::new(program).args(args).spawn();
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        let _ = crate::sys::quietly(&mut command).spawn();
     }
 
     /// What a run that has just finished has to say for itself.
@@ -2519,10 +2639,13 @@ impl App {
 
     /// Shows a side bar view, or hides the side bar when its own icon is
     /// clicked again, the way an activity bar behaves everywhere else.
-    pub fn show_view(&mut self, view: View, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn show_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
         // Coming back from a page always lands on a side bar, whichever icon
         // was clicked: hiding it would look like the click did nothing.
         let from_page = self.page.take().is_some();
+        if from_page {
+            self.end_var_edit(window, cx);
+        }
         if !from_page && self.view == view && self.sidebar_open {
             self.sidebar_open = false;
         } else {
