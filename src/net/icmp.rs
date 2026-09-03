@@ -464,6 +464,13 @@ fn spawn_reader(inner: Weak<Inner>, v6: bool, fd: AsyncFd<OwnedFd>) -> tokio::ta
     })
 }
 
+/// How many reads may fail in a row before the reader gives up on its socket.
+///
+/// High enough that no run of ordinary failures ends the listening, low enough
+/// that a socket which has genuinely gone does not spin.
+#[cfg(not(unix))]
+const MAX_READ_FAILURES: usize = 64;
+
 /// The same, where the socket cannot be registered with the runtime.
 ///
 /// One blocking thread per socket, woken by its own read timeout, which is
@@ -472,6 +479,12 @@ fn spawn_reader(inner: Weak<Inner>, v6: bool, fd: AsyncFd<OwnedFd>) -> tokio::ta
 fn spawn_reader(inner: Weak<Inner>, v6: bool, socket: Socket) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 2048];
+        // How many reads in a row have failed. One failure means nothing: a
+        // datagram wider than the buffer, an interface that went away for a
+        // moment, a refusal arriving on the socket. Giving up on the first one
+        // is what turned a single oversized reply into every later probe
+        // timing out, with nothing anywhere to say why.
+        let mut failures = 0usize;
         loop {
             let Some(alive) = inner.upgrade() else { return };
             if alive.closed.load(Ordering::SeqCst) {
@@ -492,6 +505,7 @@ fn spawn_reader(inner: Weak<Inner>, v6: bool, socket: Socket) -> tokio::task::Jo
             };
             match read {
                 Ok((n, from)) => {
+                    failures = 0;
                     let Some(inner) = inner.upgrade() else { return };
                     let from = from.as_socket().map(|s| s.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                     // No ancillary data here, so no TTL: the column is left
@@ -501,7 +515,16 @@ fn spawn_reader(inner: Weak<Inner>, v6: bool, socket: Socket) -> tokio::task::Jo
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => return,
+                // Windows answers a datagram too big for the buffer with an
+                // error rather than a truncated read, and that is one reply
+                // to skip, not a reason to stop listening for the rest.
+                Err(_) => {
+                    failures += 1;
+                    if failures > MAX_READ_FAILURES {
+                        return;
+                    }
+                    continue;
+                }
             }
         }
     })

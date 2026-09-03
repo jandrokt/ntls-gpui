@@ -308,19 +308,21 @@ fn keyword<'a>(text: &'a str, word: &str) -> Option<&'a str> {
 /// Splits a line at its `if`, ignoring one inside quotes so a run may be
 /// called "Check if reachable".
 fn split_condition(text: &str) -> (&str, Option<String>) {
-    let bytes = text.as_bytes();
-    let mut quote: Option<u8> = None;
+    // Walked a character at a time, not a byte at a time. Stepping by bytes
+    // meant the index landed inside a multi-byte character, and slicing there
+    // is not something a `str` allows: one accented letter anywhere in a
+    // workflow took the program down with it.
+    let mut quote: Option<char> = None;
+    let mut after_space = false;
 
-    for at in 0..bytes.len() {
-        let byte = bytes[at];
+    for (at, ch) in text.char_indices() {
         match quote {
-            Some(open) if byte == open => quote = None,
+            Some(open) if ch == open => quote = None,
             Some(_) => {}
-            None if byte == b'"' || byte == b'\'' => quote = Some(byte),
-            None if text[at..].starts_with("if")
-                && at > 0
-                && bytes[at - 1].is_ascii_whitespace()
-                && bytes.get(at + 2).is_none_or(u8::is_ascii_whitespace) =>
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if after_space
+                && text[at..].starts_with("if")
+                && text[at + 2..].chars().next().is_none_or(char::is_whitespace) =>
             {
                 let condition = text[at + 2..].trim();
                 return (
@@ -330,6 +332,7 @@ fn split_condition(text: &str) -> (&str, Option<String>) {
             }
             None => {}
         }
+        after_space = ch.is_whitespace();
     }
     (text, None)
 }
@@ -468,6 +471,19 @@ pub fn starter(name: &str) -> Flow {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_line_with_an_accent_in_it_is_read_and_not_fatal() {
+        // The condition split used to step through the line a byte at a time,
+        // so the first multi-byte character put the index inside a character
+        // and slicing there ended the program.
+        assert_eq!(super::split_condition("run \"caf\u{e9}\""), ("run \"caf\u{e9}\"", None));
+        let (before, cond) = super::split_condition("run \"caf\u{e9}\" if Router.ok");
+        assert_eq!(before.trim(), "run \"caf\u{e9}\"");
+        assert_eq!(cond.as_deref(), Some("Router.ok"));
+        // An `if` inside a quoted name is still part of the name.
+        assert_eq!(super::split_condition("run \"Check if reach\u{e9}ble\"").1, None);
+    }
     use super::*;
 
     fn run(name: &str) -> Step {

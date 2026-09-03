@@ -315,13 +315,23 @@ fn link_for(interface: Option<&str>, src: Option<Ipv4Addr>) -> Result<ArpLink, S
     ArpLink::open(&chosen.name, addr).map_err(|e| e.to_string())
 }
 
+/// Whether the neighbour table can be read here at all.
+///
+/// This has to agree with [`read_neighbours`], which is what actually does the
+/// reading: Linux has the file, Windows has `arp -a`, and the rest of the Unix
+/// family has `arp -an`. Saying no to a system that in fact has a reader is
+/// how the Windows parser below came to be written, shipped, and never once
+/// called: probing refused before it got that far, so a scan there resolved no
+/// hardware address at all and the MAC and vendor columns were always empty.
 fn supported() -> bool {
     cfg!(any(
         target_os = "linux",
+        windows,
         target_os = "macos",
         target_os = "freebsd",
         target_os = "openbsd",
-        target_os = "netbsd"
+        target_os = "netbsd",
+        target_os = "dragonfly"
     ))
 }
 

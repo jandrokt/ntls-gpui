@@ -309,10 +309,26 @@ pub fn job_path_in(dir: &Path, folder: Option<&str>, stem: &str) -> PathBuf {
         Some(folder) => {
             let mut target = dir.to_path_buf();
             for part in folder.split('/') {
-                let s = slugify(part);
-                if !s.is_empty() {
-                    target.push(s);
-                }
+                // The name is one that already exists on disk: a folder ntls
+                // made, which was slugified when it was created, or one that
+                // was simply there in a directory somebody opened. So it is
+                // used as it stands.
+                //
+                // Slugifying it again rewrote every folder ntls had not made
+                // itself: `My Folder` became `My-Folder`, so a tool read out
+                // of one was written into a second folder beside it, both
+                // copies were then loaded as separate tools, and every later
+                // save widened the gap between them.
+                //
+                // What is refused is a component that is not a plain name,
+                // which is the only way one could climb out of the workspace.
+                let mut parts = Path::new(part).components();
+                let (Some(std::path::Component::Normal(name)), None) =
+                    (parts.next(), parts.next())
+                else {
+                    continue;
+                };
+                target.push(name);
             }
             target.join(format!("{stem}.json"))
         }
@@ -782,6 +798,32 @@ mod tests {
             .collect();
         assert_eq!(kept.len(), 1, "the file should have been kept, not deleted");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_folder_that_ntls_did_not_name_keeps_the_name_it_has() {
+        // Folder names come off the disk as they are. Rewriting one on the way
+        // back meant a tool read out of `My Folder` was saved into a second
+        // folder called `My-Folder`, and the two copies then drifted.
+        let dir = Path::new("/tmp/ntls-folder-test");
+        assert_eq!(
+            super::job_path_in(dir, Some("My Folder"), "001-ping"),
+            dir.join("My Folder").join("001-ping.json")
+        );
+        assert_eq!(
+            super::job_path_in(dir, Some("caf\u{e9}/inner"), "002-ping"),
+            dir.join("caf\u{e9}").join("inner").join("002-ping.json")
+        );
+        // A component that is not a plain name cannot climb out of the
+        // workspace, whichever way it is spelled.
+        assert_eq!(
+            super::job_path_in(dir, Some("../escape"), "003-ping"),
+            dir.join("escape").join("003-ping.json")
+        );
+        assert_eq!(
+            super::job_path_in(dir, Some("/etc"), "004-ping"),
+            dir.join("etc").join("004-ping.json")
+        );
     }
 
     #[test]

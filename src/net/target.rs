@@ -184,16 +184,20 @@ fn expand_one(part: &str, iface_name: &str) -> Result<Vec<IpAddr>, String> {
         return parse_prefix(part)?.hosts();
     }
 
-    // A bare IPv6 address is full of colons but no dashes; only treat a dash
-    // as a range separator when it is not the leading character.
-    if let Some(i) = part.find('-')
-        && i > 0
-    {
-        return expand_range(&part[..i], &part[i + 1..]);
-    }
-
+    // An address is an address before it is anything else.
     if let Ok(a) = part.parse::<IpAddr>() {
         return Ok(vec![a]);
+    }
+
+    // A dash separates a range only when what is on the left of it is an
+    // address. Hostnames have dashes in them too, and far more often: reading
+    // the dash first meant `my-server` was taken for a range from `my` to
+    // `server`, refused as a bad range start, and never once looked up.
+    if let Some(i) = part.find('-').filter(|&i| i > 0) {
+        let (lo, hi) = (part[..i].trim(), part[i + 1..].trim());
+        if lo.parse::<IpAddr>().is_ok() {
+            return expand_range(lo, hi);
+        }
     }
 
     // Fall back to DNS so hostnames work everywhere an address does.
@@ -316,6 +320,24 @@ mod tests {
         let hosts = expand_targets_on("10.0.0.254-10.0.1.1", "").unwrap();
         assert_eq!(hosts.len(), 4);
         assert_eq!(hosts.last(), Some(&v4("10.0.1.1")));
+    }
+
+    #[test]
+    fn a_hostname_with_a_dash_in_it_is_a_hostname() {
+        // A dash means a range between two addresses. It also appears in most
+        // hostnames anyone actually types, and reading it as a range first
+        // meant every one of those was refused before it could be looked up.
+        let refused = expand_targets_on("my-server.invalid", "").unwrap_err();
+        assert!(refused.contains("cannot resolve"), "{refused}");
+        assert!(!refused.contains("bad range"), "{refused}");
+    }
+
+    #[test]
+    fn a_range_between_addresses_is_still_a_range() {
+        let hosts = expand_targets_on("192.168.1.10-12", "").unwrap();
+        assert_eq!(hosts.len(), 3);
+        let hosts = expand_targets_on("10.0.0.254-10.0.1.1", "").unwrap();
+        assert_eq!(hosts.len(), 4);
     }
 
     #[test]

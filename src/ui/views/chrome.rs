@@ -147,14 +147,18 @@ impl App {
             // With the system titlebar hidden, this strip is what the user
             // drags the window by.
             //
-            // On macOS and Linux saying so once, here, is enough: the strip
-            // drags and anything interactive on it takes its own clicks
-            // first. Windows works the other way around. There, a drag area
-            // is a region the system decides about before ntls sees a click
-            // at all, so a region covering the whole strip would answer "this
-            // is the titlebar" over the search box and the close button and
-            // drag the window instead. The draggable parts are named one at a
-            // time instead, beside the controls rather than under them.
+            // On macOS and Linux saying so once, here, is enough: the system
+            // moves a window dragged by a transparent titlebar, and anything
+            // interactive on the strip takes its own clicks first.
+            //
+            // Windows is told nothing. Declaring a region a window control
+            // there hands the whole press to the system before ntls sees it,
+            // which is how the buttons came to do nothing and the strip came
+            // to drag nothing: whether that press ever arrives depends on a
+            // hit test that is asked and answered a frame out of step. So
+            // every part of the strip stays ordinary content, gpui delivers
+            // the clicks it always would, and the two things that need the
+            // system's help ask for it by name in `crate::sys`.
             .when(!OWN_CAPTION, |d| {
                 d.window_control_area(gpui::WindowControlArea::Drag).on_click(|event, window, _| {
                     if event.click_count() >= 2 {
@@ -1315,19 +1319,29 @@ fn drag_spacer() -> AnyElement {
         .min_w_0()
         .mt(px(crate::sys::TOP_RESIZE_EDGE))
         .h(px(crate::sys::TITLEBAR_HEIGHT - crate::sys::TOP_RESIZE_EDGE))
-        .window_control_area(gpui::WindowControlArea::Drag)
+        .when(OWN_CAPTION, |d| {
+            d.on_mouse_down(MouseButton::Left, |event: &gpui::MouseDownEvent, window, _| {
+                // A titlebar answers a press by moving and a double press by
+                // filling the screen. Both are the system's to do.
+                if event.click_count >= 2 {
+                    crate::sys::toggle_maximized(window);
+                } else {
+                    crate::sys::drag_window(window);
+                }
+            })
+        })
         .into_any_element()
 }
 
 /// Minimise, maximise and close, drawn into the titlebar because the system
 /// one they would otherwise sit in is hidden.
 ///
-/// Each button says which kind of window control it is, which is what lets
-/// Windows treat it as one: hovering the middle one brings up the snap
-/// layouts, and the system acts on a press without ntls handling the click.
-/// Each one also says what it does through gpui, so that a button still works
-/// if that never reaches it. Doing both is safe. Minimising a minimised
-/// window and closing a closing one are the same as doing it once.
+/// Each button acts on its own click, like any other button in the window.
+/// Declaring them window controls to Windows instead, which is the documented
+/// way and the way that would also offer the snap layouts under the maximise
+/// button, means the system decides what the press was before ntls is told
+/// about it, and a press that the system decides was a caption press never
+/// arrives at all. A button that works is worth more than the hover menu.
 fn caption_buttons(theme: &Theme, window: &Window) -> AnyElement {
     // Maximised, the middle button puts the window back, and says so.
     let maximized = window.is_maximized();
@@ -1342,7 +1356,6 @@ fn caption_buttons(theme: &Theme, window: &Window) -> AnyElement {
             "caption-minimise",
             "window-minimize",
             "Minimise",
-            gpui::WindowControlArea::Min,
             (theme.hover, theme.dim),
             theme,
             |window, _| window.minimize_window(),
@@ -1351,18 +1364,9 @@ fn caption_buttons(theme: &Theme, window: &Window) -> AnyElement {
             "caption-maximise",
             middle,
             middle_tip,
-            gpui::WindowControlArea::Max,
             (theme.hover, theme.dim),
             theme,
-            // Only the one direction. gpui can maximise a window and has no
-            // way to put a maximised one back, so restoring is left to the
-            // system, which does both. Saying "maximise" to a window that is
-            // already maximised would undo the restore it is about to do.
-            |window, _| {
-                if !window.is_maximized() {
-                    window.zoom_window();
-                }
-            },
+            |window, _| crate::sys::toggle_maximized(window),
         ))
         // The close button is the one that goes red, and its glyph turns white
         // to stay legible on it.
@@ -1370,7 +1374,6 @@ fn caption_buttons(theme: &Theme, window: &Window) -> AnyElement {
             "caption-close",
             "window-close",
             "Close",
-            gpui::WindowControlArea::Close,
             (gpui::rgb(CLOSE_HOVER).into(), gpui::white()),
             theme,
             // ntls has one window, so closing it is quitting, and quitting is
@@ -1391,7 +1394,6 @@ fn caption_button(
     id: &'static str,
     glyph: &str,
     tip: &'static str,
-    area: gpui::WindowControlArea,
     // What the button turns under the pointer: the panel behind the glyph,
     // and the glyph.
     hover: (Hsla, Hsla),
@@ -1403,7 +1405,6 @@ fn caption_button(
     div()
         .id(id)
         .group(group.clone())
-        .window_control_area(area)
         .flex()
         .items_center()
         .justify_center()

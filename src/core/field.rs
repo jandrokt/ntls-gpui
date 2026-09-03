@@ -356,9 +356,31 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
         "h" => value * 3600.0,
         _ => return None,
     };
-    Some(Duration::from_secs_f64(seconds))
+    // `from_secs_f64` panics on a value it cannot represent, and a unit
+    // multiplies whatever was typed: `1e300h` is infinite by the time it gets
+    // here, and a number need only be large to overflow. A duration nobody
+    // could wait out is not worth taking the program down for.
+    Duration::try_from_secs_f64(seconds).ok()
 }
 
+
+#[cfg(test)]
+mod duration_tests {
+    use super::parse_duration;
+
+    #[test]
+    fn a_duration_nobody_could_wait_out_is_refused_and_not_fatal() {
+        // A unit multiplies whatever was typed, so a large number becomes an
+        // impossible one and an enormous number becomes infinite. Neither is
+        // worth taking the program down for.
+        assert_eq!(parse_duration("1e300h"), None);
+        assert_eq!(parse_duration("1e30s"), None);
+        assert_eq!(parse_duration("-1s"), None);
+        // The ordinary ones still read the way they are written.
+        assert_eq!(parse_duration("500ms"), Some(std::time::Duration::from_millis(500)));
+        assert_eq!(parse_duration("2m"), Some(std::time::Duration::from_secs(120)));
+    }
+}
 
 #[cfg(test)]
 mod rate_tests {

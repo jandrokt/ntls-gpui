@@ -50,6 +50,20 @@ base64 = "0.22"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Moving and sizing the window is the one thing gpui does not offer on Windows,
+# and its own titlebar is hidden, so ntls asks the system directly. Both of
+# these are already in the tree underneath gpui and at the versions it uses, so
+# naming them here adds a dependency edge and nothing to compile: `windows` for
+# the messages, and `raw-window-handle` for the one thing gpui does hand over,
+# which is the window's handle.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+raw-window-handle = "0.6"
+
 # The Windows executable carries its own icon and version information.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

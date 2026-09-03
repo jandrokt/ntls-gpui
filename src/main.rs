@@ -79,9 +79,9 @@ fn main() {
 
         // Workspaces are written as they change, but a last pass on the way
         // out catches anything a run finished a moment ago.
-        let closing = window;
+        let handle = window;
         cx.on_app_quit(move |cx| {
-            closing.update(cx, |view: &mut Ntls, _, _| view.save_all()).ok();
+            handle.update(cx, |view: &mut Ntls, _, _| view.save_all()).ok();
             async {}
         })
         .detach();
@@ -89,6 +89,15 @@ fn main() {
         cx.activate(true);
         window
             .update(cx, |view, window, cx| {
+                // Closing the window is the other way out, and the only pass
+                // that wrote everything down was wired to quitting. So a run
+                // that finished a moment before the window was closed was
+                // simply lost, on every platform and by whichever means the
+                // window was closed.
+                window.on_window_should_close(cx, move |_, cx| {
+                    handle.update(cx, |view: &mut Ntls, _, _| view.save_all()).ok();
+                    true
+                });
                 window.focus(&view.focus_handle);
                 cx.notify();
             })

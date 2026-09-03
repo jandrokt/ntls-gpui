@@ -777,10 +777,46 @@ impl App {
     }
 
     /// Renames a workspace, and the directory it lives in with it.
+    /// Records what a workspace is called.
+    ///
+    /// The name is the workspace's own, written into its file. The directory
+    /// it lives in is renamed to match separately, by [`Self::tidy_workspace_dir`],
+    /// once the naming is finished.
     pub fn rename_workspace(&mut self, index: usize, name: &str, cx: &mut Context<Self>) {
         let name = name.trim().to_string();
+        if let Some(ws) = self.workspaces.get_mut(index) {
+            ws.name_override = (!name.is_empty()).then_some(name);
+        } else {
+            return;
+        }
+        self.save_workspace(index);
+        cx.notify();
+    }
+
+    /// Renames a workspace's directory to match what the workspace is called.
+    ///
+    /// Only a directory inside ntls's own folder, and only once the naming is
+    /// finished. Both conditions are there because of what happened without
+    /// them.
+    ///
+    /// A workspace can be any folder dropped on the window, and that folder is
+    /// somewhere its owner put it. The name was turned into a path under
+    /// `~/Documents/ntls` and the directory moved there, so renaming a
+    /// workspace took someone's directory out of their project and filed it
+    /// under ntls. Nothing is lost by leaving a folder where it is: the name
+    /// is in the workspace's own file either way.
+    ///
+    /// And the box is read back as it is typed, so this ran once per
+    /// character, leaving a trail of `a`, `ab`, `abc` directories, each one
+    /// suffixed `-2` because the keystroke before it was already in the way.
+    fn tidy_workspace_dir(&mut self, index: usize) {
         let Some(ws) = self.workspaces.get(index) else { return };
         let old = ws.dir.clone();
+        if old.parent() != Some(store::root().as_path()) {
+            return;
+        }
+        let label = ws.name();
+        let label = if label.trim().is_empty() { "New workspace" } else { label.trim() };
 
         let taken: Vec<_> = self
             .workspaces
@@ -789,18 +825,25 @@ impl App {
             .filter(|(i, _)| *i != index)
             .map(|(_, w)| w.dir.clone())
             .collect();
-        let wanted = store::claim_dir(if name.is_empty() { "New workspace" } else { &name }, &taken);
-
-        if wanted != old && std::fs::rename(&old, &wanted).is_ok() {
-            if let Some(ws) = self.workspaces.get_mut(index) {
-                ws.dir = wanted;
-            }
+        let wanted = store::claim_dir(label, &taken);
+        if wanted == old || std::fs::rename(&old, &wanted).is_err() {
+            return;
         }
+
+        // Every document and workflow remembers the file it came from, and the
+        // file has just moved. A path left pointing at the old directory reads
+        // as a document deleted from under ntls, and writes the next save
+        // somewhere that no longer exists.
         if let Some(ws) = self.workspaces.get_mut(index) {
-            ws.name_override = (!name.is_empty()).then_some(name);
+            for doc in &mut ws.docs {
+                doc.path = repoint(&doc.path, &old, &wanted);
+            }
+            for flow in &mut ws.flows {
+                flow.path = repoint(&flow.path, &old, &wanted);
+            }
+            ws.dir = wanted;
         }
         self.save_workspace(index);
-        cx.notify();
     }
 
     pub fn tag_workspace(&mut self, index: usize, tag: Tag, cx: &mut Context<Self>) {
@@ -2519,6 +2562,8 @@ impl App {
     pub fn end_workspace_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.renaming_workspace = false;
         self.ws_rename_for = None;
+        // The name is settled now, so the directory can be made to match it.
+        self.tidy_workspace_dir(self.active);
         window.focus(&self.focus_handle);
         cx.notify();
     }
@@ -4530,6 +4575,21 @@ impl Focusable for App {
 /// takes everything waiting, applies it in one go, and then yields for a frame
 /// so the window stays responsive without repainting more often than a screen
 /// can show.
+/// The same file, under a directory that has been renamed.
+///
+/// Anything that is not inside `from` is left exactly as it is, so a path that
+/// was never under the workspace cannot be rewritten into it.
+fn repoint(
+    path: &std::path::Path,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> std::path::PathBuf {
+    match path.strip_prefix(from) {
+        Ok(rest) => to.join(rest),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 fn spawn_pump(job_id: usize, rx: async_channel::Receiver<Msg>, cx: &mut Context<App>) -> gpui::Task<()> {
     cx.spawn(async move |this, cx| {
         const MAX_BATCH: usize = 4096;

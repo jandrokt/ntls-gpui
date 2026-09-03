@@ -91,6 +91,108 @@ pub const CAPTION_BUTTON: f32 = 46.;
 /// unclaimed, so the answer falls through to "this is the top border".
 pub const TOP_RESIZE_EDGE: f32 = 4.;
 
+// --- moving and sizing the window -------------------------------------------
+
+/// The window's handle, on the one system that needs to be handed it.
+///
+/// gpui keeps the platform window to itself, but it implements
+/// `HasWindowHandle`, and that is the door out.
+#[cfg(windows)]
+fn handle_of(window: &gpui::Window) -> Option<windows::Win32::Foundation::HWND> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    // Named the long way round on purpose. `Window` has a `window_handle` of
+    // its own, which answers with gpui's own identifier for the window, and an
+    // inherent method wins over a trait's. This asks the trait.
+    let handle = <gpui::Window as HasWindowHandle>::window_handle(window).ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(win32) => {
+            Some(windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut core::ffi::c_void))
+        }
+        _ => None,
+    }
+}
+
+/// Starts moving the window, as though its own titlebar had been pressed.
+///
+/// With the system titlebar hidden, Windows sees a press on the strip ntls
+/// draws as an ordinary press inside the window's own content and has no
+/// reason to move anything, so the move is asked for by name. Asking rather
+/// than imitating is what keeps the snapping, the edge gestures and
+/// shake-to-restore: those belong to the system's own move loop, and this is a
+/// request for that loop.
+///
+/// Two details are load-bearing, and both were arrived at the hard way.
+///
+/// It is a system command and not a titlebar press, because a titlebar press
+/// is exactly what gpui takes for itself: it offers the press to the window's
+/// contents first, and ntls's root element is focusable, which means the press
+/// is always accepted and the system never hears about it. That is the whole
+/// reason declaring these regions window controls could never work.
+///
+/// And it is posted rather than sent. Sent, the system would run its move loop
+/// inside this call, which is inside gpui's own handling of the click, which is
+/// inside its borrow of the application. The loop ticks a timer that runs
+/// whatever work is queued, and the first piece of that work to ask for the
+/// application would find it already held. Posting leaves the loop until after
+/// this returns and the borrow is gone.
+///
+/// The mouse has to be let go of first: gpui takes it in order to deliver the
+/// press, and a window still holding the mouse cannot be moved by it.
+///
+/// macOS and Linux need nothing here. Both move a window dragged by a
+/// transparent titlebar without being asked.
+pub fn drag_window(window: &gpui::Window) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            HTCAPTION, PostMessageW, SC_MOVE, WM_SYSCOMMAND,
+        };
+
+        if let Some(hwnd) = handle_of(window) {
+            unsafe {
+                let _ = ReleaseCapture();
+                // The low bits of a system command say where it came from, and
+                // naming the caption is what makes this the move that follows
+                // the mouse rather than the one driven by the arrow keys.
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_SYSCOMMAND,
+                    WPARAM((SC_MOVE | HTCAPTION) as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+    }
+}
+
+/// Maximises the window, or puts a maximised one back where it was.
+///
+/// gpui can maximise a window and has no way to restore one, so on Windows
+/// both directions are asked for directly. Everywhere else its own call is
+/// already the toggle.
+pub fn toggle_maximized(window: &gpui::Window) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, SW_RESTORE, ShowWindowAsync};
+
+        if let Some(hwnd) = handle_of(window) {
+            let how = if window.is_maximized() { SW_RESTORE } else { SW_MAXIMIZE };
+            unsafe {
+                let _ = ShowWindowAsync(hwnd, how);
+            }
+            return;
+        }
+    }
+    window.zoom_window();
+}
+
 /// `CREATE_NO_WINDOW`: the process flag that stops a child command opening a
 /// console window of its own.
 ///

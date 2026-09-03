@@ -210,7 +210,10 @@ fn classify_udp_error(e: &io::Error) -> PortState {
     // An ICMP port-unreachable is reported back on the connected socket as a
     // refusal, which is the one unambiguous UDP answer available.
     match e.kind() {
-        io::ErrorKind::ConnectionRefused => PortState::Closed,
+        // Unix reports the port-unreachable as a refusal. Windows reports the
+        // same thing as a reset, and reading only the first spelling is how
+        // every closed port on Windows came back as "open|filtered".
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => PortState::Closed,
         io::ErrorKind::HostUnreachable | io::ErrorKind::NetworkUnreachable => PortState::Filtered,
         _ => PortState::OpenFiltered,
     }
