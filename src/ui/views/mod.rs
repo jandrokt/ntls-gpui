@@ -427,6 +427,14 @@ impl App {
             self.close_picker(window, cx);
             return;
         }
+        // The palette and the picker are drawn over the window rather than
+        // in it, so they come off first. Anything this escape might otherwise
+        // have reached is behind them, and backing out of something behind
+        // what you are looking at reads as the key having done nothing.
+        if self.palette_open {
+            self.close_palette(window, cx);
+            return;
+        }
         if self.notices.open {
             self.toggle_notices(cx);
             return;
@@ -455,10 +463,6 @@ impl App {
         }
         if self.clearing.is_some() {
             self.cancel_clear(cx);
-            return;
-        }
-        if self.palette_open {
-            self.close_palette(window, cx);
             return;
         }
         if self.renaming {

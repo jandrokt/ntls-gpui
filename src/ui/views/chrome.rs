@@ -210,7 +210,7 @@ impl App {
             // target wider than the thing it looks like is a click target
             // that catches drags of the window.
             .child(
-                div().flex().items_center().flex_1().min_w_0().child(drag_spacer()).child(
+                div().flex().items_center().h_full().flex_1().min_w_0().child(drag_spacer()).child(
                     div()
                         .id("command-centre")
                         .flex()
@@ -1303,42 +1303,36 @@ fn sidebar_action(
 /// command centre keep it in the middle of the strip and turn everything that
 /// is not a control into somewhere to pick the window up.
 ///
-/// The area is an inner layer rather than the spacer itself so that it can
-/// stop short of the top edge. That edge belongs to the system: it is what
-/// the window is resized by, and Windows only offers it where nothing else
-/// has claimed the point first.
+/// Both measurements are stated rather than inherited. The row this sits in is
+/// only as tall as the box it centres, so a spacer that took its height from
+/// its parent would be a drag area two thirds of the way down a strip nobody
+/// aims at the middle of. The margin is what leaves the top edge to the
+/// system, which is what the window is resized by: Windows only offers that
+/// edge where nothing else has claimed the point first.
 fn drag_spacer() -> AnyElement {
     div()
-        .relative()
         .flex_1()
         .min_w_0()
-        .h_full()
-        .child(
-            div()
-                .absolute()
-                .top(px(crate::sys::TOP_RESIZE_EDGE))
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .window_control_area(gpui::WindowControlArea::Drag),
-        )
+        .mt(px(crate::sys::TOP_RESIZE_EDGE))
+        .h(px(crate::sys::TITLEBAR_HEIGHT - crate::sys::TOP_RESIZE_EDGE))
+        .window_control_area(gpui::WindowControlArea::Drag)
         .into_any_element()
 }
 
 /// Minimise, maximise and close, drawn into the titlebar because the system
 /// one they would otherwise sit in is hidden.
 ///
-/// Windows does the work. Each button says which kind of window control it is,
-/// and the system takes it from there: pressing one minimises, restores or
-/// closes without ntls handling the click at all, and hovering the middle one
-/// still brings up the snap layouts. So there is nothing here but the shape.
+/// Each button says which kind of window control it is, which is what lets
+/// Windows treat it as one: hovering the middle one brings up the snap
+/// layouts, and the system acts on a press without ntls handling the click.
+/// Each one also says what it does through gpui, so that a button still works
+/// if that never reaches it. Doing both is safe. Minimising a minimised
+/// window and closing a closing one are the same as doing it once.
 fn caption_buttons(theme: &Theme, window: &Window) -> AnyElement {
     // Maximised, the middle button puts the window back, and says so.
-    let (middle, middle_tip) = if window.is_maximized() {
-        ("window-restore", "Restore")
-    } else {
-        ("window-maximize", "Maximise")
-    };
+    let maximized = window.is_maximized();
+    let (middle, middle_tip) =
+        if maximized { ("window-restore", "Restore") } else { ("window-maximize", "Maximise") };
 
     div()
         .flex()
@@ -1349,18 +1343,26 @@ fn caption_buttons(theme: &Theme, window: &Window) -> AnyElement {
             "window-minimize",
             "Minimise",
             gpui::WindowControlArea::Min,
-            theme.hover,
-            theme.dim,
+            (theme.hover, theme.dim),
             theme,
+            |window, _| window.minimize_window(),
         ))
         .child(caption_button(
             "caption-maximise",
             middle,
             middle_tip,
             gpui::WindowControlArea::Max,
-            theme.hover,
-            theme.dim,
+            (theme.hover, theme.dim),
             theme,
+            // Only the one direction. gpui can maximise a window and has no
+            // way to put a maximised one back, so restoring is left to the
+            // system, which does both. Saying "maximise" to a window that is
+            // already maximised would undo the restore it is about to do.
+            |window, _| {
+                if !window.is_maximized() {
+                    window.zoom_window();
+                }
+            },
         ))
         // The close button is the one that goes red, and its glyph turns white
         // to stay legible on it.
@@ -1369,29 +1371,38 @@ fn caption_buttons(theme: &Theme, window: &Window) -> AnyElement {
             "window-close",
             "Close",
             gpui::WindowControlArea::Close,
-            gpui::rgb(CLOSE_HOVER).into(),
-            gpui::white(),
+            (gpui::rgb(CLOSE_HOVER).into(), gpui::white()),
             theme,
+            // ntls has one window, so closing it is quitting, and quitting is
+            // what writes out everything a run finished a moment ago.
+            |_, cx| cx.quit(),
         ))
         .into_any_element()
 }
 
 /// One of the window's own buttons.
 ///
-/// The glyph takes the colour of the text around it rather than one of its
-/// own, so that hovering can change both the panel behind it and the mark on
-/// it in one move.
+/// An svg is not told what colour to be by the element around it, so the glyph
+/// names both of its own states: an icon left to inherit would be painted in
+/// no colour at all, which is to say not painted. The group is what lets
+/// hovering the button change the panel behind the glyph and the glyph itself
+/// in one move.
 fn caption_button(
     id: &'static str,
     glyph: &str,
     tip: &'static str,
     area: gpui::WindowControlArea,
-    hover_bg: Hsla,
-    hover_fg: Hsla,
+    // What the button turns under the pointer: the panel behind the glyph,
+    // and the glyph.
+    hover: (Hsla, Hsla),
     theme: &Theme,
+    press: fn(&mut Window, &mut gpui::App),
 ) -> AnyElement {
+    let (hover_bg, hover_fg) = hover;
+    let group = SharedString::from(id);
     div()
         .id(id)
+        .group(group.clone())
         .window_control_area(area)
         .flex()
         .items_center()
@@ -1399,13 +1410,20 @@ fn caption_button(
         .w(px(crate::sys::CAPTION_BUTTON))
         .h_full()
         .flex_shrink_0()
-        .text_color(theme.dim)
-        .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
+        .hover(move |s| s.bg(hover_bg))
+        .on_click(move |_, window, cx| press(window, cx))
         .tooltip({
             let theme = *theme;
             move |_, cx| cx.new(|_| Tip { label: tip, theme }).into()
         })
-        .child(gpui::svg().path(format!("icons/{glyph}.svg")).size(px(10.)).flex_none())
+        .child(
+            gpui::svg()
+                .path(format!("icons/{glyph}.svg"))
+                .size(px(10.))
+                .flex_none()
+                .text_color(theme.dim)
+                .group_hover(group, move |s| s.text_color(hover_fg)),
+        )
         .into_any_element()
 }
 
