@@ -521,10 +521,14 @@ pub fn expand_domain(s: &str) -> Option<String> {
 /// certspotter sends RFC 3339. Only the date matters here.
 fn parse_date(s: &str) -> Date {
     let s = s.trim();
-    if s.len() < 10 {
+    // A date is ten bytes, but this string is whatever the aggregator sent and
+    // nothing makes it ASCII. Ten bytes into a field that starts with a
+    // multibyte character lands mid-character, and taking it as a slice
+    // panicked the task decoding the response: the run then never reported
+    // finishing and its job sat at "running" until the app was restarted.
+    let Some(d) = s.get(..10) else {
         return Date::default();
-    }
-    let d = &s[..10];
+    };
     let mut parts = d.split('-');
     let (Some(y), Some(m), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
         return Date::default();
@@ -636,6 +640,17 @@ mod tests {
         assert_eq!(parse_date("2024-06-01T12:00:00Z").format(), "2024-06-01");
         assert!(parse_date("").is_zero());
         assert_eq!(parse_date("").format(), "-");
+    }
+
+    #[test]
+    fn a_timestamp_whose_tenth_byte_is_mid_character_is_read_as_unknown() {
+        // Each of these runs past ten bytes, so length is no protection, and
+        // in each one byte ten falls inside a character. Taking the first ten
+        // bytes of such a field killed the task decoding the response, and the
+        // job it belonged to never reported that it had stopped.
+        assert!(parse_date("\u{65e5}\u{65e5}\u{65e5}\u{65e5}").is_zero());
+        assert!(parse_date("2024-01-0\u{e9}1").is_zero());
+        assert_eq!(parse_date("\u{65e5}\u{65e5}\u{65e5}\u{65e5}").format(), "-");
     }
 
     #[test]

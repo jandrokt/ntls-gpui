@@ -278,6 +278,16 @@ pub struct App {
     /// Set while files are being dragged over the window, so it can say it
     /// will take them.
     pub drop_hover: bool,
+    /// Tools whose file is behind what is on screen, waiting to be written.
+    ///
+    /// A note is read back as it is typed, and writing a tool's file means
+    /// serialising every row it holds, up to fifty thousand of them for a
+    /// wide scan. Doing that once per character made typing into a note feel
+    /// like wading, worst of all on Windows, where writing a new file and
+    /// renaming it over the old one inside the documents folder is two trips
+    /// through the virus scanner. So the write is noted as owed here and paid
+    /// a moment later instead.
+    pending_saves: std::collections::HashSet<(usize, usize)>,
 }
 
 /// A drag in progress, of a table column or of the side bar's edge.
@@ -463,6 +473,120 @@ fn is_carryable(target: &str) -> bool {
         && !target.contains(char::is_whitespace)
 }
 
+/// The host and the port a result's target names, or the whole of it and no
+/// port.
+///
+/// For the tail after the last colon to be a port, what is in front of it has
+/// to be something a host could be on its own. An IPv6 address is written as
+/// colons and hexadecimal, and a group of it is often nothing but digits, so
+/// the last colon of one read as a port: the AAAA answer
+/// `2606:2800:220:1:248:1893:25c8:1946` went to the port scanner as the host
+/// `2606:2800:220:1:248:1893:25c8` — an address the scan was never pointed at
+/// — with 1946 written over whatever the ports box said.
+fn split_host_port(target: &str) -> (&str, Option<&str>) {
+    match target.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty()
+                && port.chars().all(|c| c.is_ascii_digit())
+                // A name or an IPv4 address holds no colons of its own; an
+                // address in brackets says itself where it ends; and an
+                // address that is already whole without the last group is a
+                // port scan's own `address:port`.
+                && (!host.contains(':')
+                    || host.ends_with(']')
+                    || host.parse::<std::net::Ipv6Addr>().is_ok()) =>
+        {
+            (host, Some(port))
+        }
+        _ => (target, None),
+    }
+}
+
+/// Folds a fresh reading of the workspace directory into the documents the
+/// workspace already holds, keeping the ones that are still there as they are.
+///
+/// A document read off disk is a new document: a new id, no tab, and nothing
+/// of what was being done to it. Putting a whole fresh reading in place of the
+/// old list therefore shut every other document's tab and left every id held
+/// elsewhere (the editor open in the pane, the selection, a name being typed)
+/// pointing at a document that no longer existed. So a re-reading only adds
+/// the files that are new and drops the ones that have gone.
+fn merge_docs(held: &mut Vec<super::notes::Doc>, found: Vec<super::notes::Doc>) {
+    held.retain(|doc| found.iter().any(|fresh| fresh.path == doc.path));
+    for fresh in found {
+        if !held.iter().any(|doc| doc.path == fresh.path) {
+            held.push(fresh);
+        }
+    }
+}
+
+/// The same for workflows, which have more to lose than a tab: a workflow read
+/// off disk has no machine and nothing it is waiting on, so replacing the list
+/// while one was running abandoned the run it was part of the way through.
+fn merge_flows(held: &mut Vec<super::flows::Sheet>, found: Vec<super::flows::Sheet>) {
+    held.retain(|flow| found.iter().any(|fresh| fresh.path == flow.path));
+    for fresh in found {
+        if !held.iter().any(|flow| flow.path == fresh.path) {
+            held.push(fresh);
+        }
+    }
+}
+
+/// The workflow waiting on a run: which workspace holds it, and which workflow
+/// it is.
+///
+/// Every workspace is looked in, and not only the one on screen. A run started
+/// by a workflow goes on running while the user works elsewhere, so where they
+/// happen to be standing when it finishes says nothing about where the
+/// workflow waiting on it lives.
+fn flow_waiting_on(workspaces: &[Workspace], job: usize) -> Option<(usize, usize)> {
+    workspaces.iter().enumerate().find_map(|(at, ws)| {
+        ws.flows
+            .iter()
+            .find(|flow| flow.busy.as_ref().and_then(super::flows::Busy::job) == Some(job))
+            .map(|flow| (at, flow.id))
+    })
+}
+
+/// Which workspace the window is standing in once the one at `removed` has
+/// been taken out of a list that now holds `left` of them.
+///
+/// Taking one out shifts everything after it down a place, so the number the
+/// window was holding stops meaning the workspace it meant. Clamping it to the
+/// end of the list was not enough: closing a workspace to the left of the one
+/// on screen left the number pointing one past it, and the window jumped to
+/// the workspace that followed the one the user was working in.
+fn active_after_close(active: usize, removed: usize, left: usize) -> usize {
+    if left == 0 {
+        return 0;
+    }
+    let moved = if removed < active { active - 1 } else { active };
+    moved.min(left - 1)
+}
+
+/// Renames a variable, unless the name asked for belongs to another one.
+/// Answers with the name it now goes by, when it moved.
+///
+/// The name box is read back as it is typed, so every halfway spelling of a
+/// new name arrives as a rename of its own, and a variable is written under
+/// whatever name it is given. So renaming `ipv6` to `ip_v6` passed through
+/// `ip` on the second keystroke and wrote `ipv6` on top of the variable
+/// called `ip`, which was gone by the time the typing finished. A spelling
+/// that is taken waits: the keystroke after it is not taken and does the
+/// rename.
+fn rename_var_unless_taken(ws: &mut Workspace, from: &str, wanted: &str) -> Option<String> {
+    if wanted.is_empty() || wanted == from {
+        return None;
+    }
+    // Its own name under a different capitalisation is still its own name, so
+    // changing only the case is still a rename it may have.
+    if ws.var_named(wanted).is_some_and(|held| held != from) {
+        return None;
+    }
+    ws.rename_var(from, wanted);
+    Some(wanted.to_string())
+}
+
 /// Builds the editors a form needs, one per text field.
 fn build_inputs(
     fields: &[crate::core::Field],
@@ -591,6 +715,7 @@ impl App {
             page: None,
             segment_from: std::collections::HashMap::new(),
             drop_hover: false,
+            pending_saves: std::collections::HashSet::new(),
         };
 
         super::widgets::set_motion(app.settings.animate);
@@ -718,7 +843,26 @@ impl App {
     }
 
     /// Writes everything, for shutdown.
+    /// Notes that a tool's file needs writing, without writing it yet.
+    fn owe_save(&mut self, ws: usize, job_id: usize) {
+        self.pending_saves.insert((ws, job_id));
+    }
+
+    /// Writes whatever is owed.
+    ///
+    /// Called from the tick, when a note is finished, and on the way out, so
+    /// nothing waits longer than one tick.
+    pub fn flush_saves(&mut self) {
+        if self.pending_saves.is_empty() {
+            return;
+        }
+        for (ws, job_id) in std::mem::take(&mut self.pending_saves) {
+            self.save_job(ws, job_id);
+        }
+    }
+
     pub fn save_all(&mut self) {
+        self.pending_saves.clear();
         let all: Vec<(usize, Vec<usize>)> = self
             .workspaces
             .iter()
@@ -888,7 +1032,7 @@ impl App {
             self.settings.closed.push(dir);
             self.save_settings();
         }
-        self.settle_after_close(cx);
+        self.settle_after_close(index, cx);
     }
 
     /// Deletes a workspace and its directory, after asking.
@@ -934,16 +1078,17 @@ impl App {
                         Some(super::notify::About::File(dir.clone())),
                     );
                 }
-                app.settle_after_close(cx);
+                app.settle_after_close(at, cx);
             })
             .ok();
         })
         .detach();
     }
 
-    /// Keeps the program in a workable state after a workspace goes: there is
-    /// always one to work in, and the selection is inside it.
-    fn settle_after_close(&mut self, cx: &mut Context<Self>) {
+    /// Keeps the program in a workable state after the workspace at `removed`
+    /// goes: there is always one to work in, and the window is still standing
+    /// in the one it was standing in.
+    fn settle_after_close(&mut self, removed: usize, cx: &mut Context<Self>) {
         if self.workspaces.is_empty() {
             let ws = Workspace::new(self.next_ws_id, store::claim_dir("New workspace", &[]));
             self.next_ws_id += 1;
@@ -951,7 +1096,7 @@ impl App {
             self.active = 0;
             self.save_workspace(0);
         } else {
-            self.active = self.active.min(self.workspaces.len() - 1);
+            self.active = active_after_close(self.active, removed, self.workspaces.len());
         }
         cx.notify();
     }
@@ -1453,11 +1598,11 @@ impl App {
             }
             VarPart::Name => {
                 let wanted = value.trim().to_string();
-                if wanted.is_empty() || wanted == name {
+                let Some(now) = rename_var_unless_taken(self.workspace_mut(), &name, &wanted)
+                else {
                     return;
-                }
-                self.workspace_mut().rename_var(&name, &wanted);
-                self.editing_var = Some((wanted, VarPart::Name));
+                };
+                self.editing_var = Some((now, VarPart::Name));
             }
         }
         self.save_workspace(self.active);
@@ -2039,11 +2184,7 @@ impl App {
     /// message from a background task does not carry one. The next repaint
     /// picks it up.
     fn finished_for_flow(&mut self, job: usize, failed: bool, _cx: &mut Context<Self>) {
-        let waiting = self
-            .workspaces
-            .iter()
-            .any(|w| w.flows.iter().any(|f| f.busy.as_ref().and_then(super::flows::Busy::job) == Some(job)));
-        if waiting {
+        if flow_waiting_on(&self.workspaces, job).is_some() {
             self.flow_pending = Some((job, failed));
         }
     }
@@ -2073,16 +2214,12 @@ impl App {
 
         // A row that names a port carries it into a port field, when the tool
         // has one.
-        let (host, port) = match target.rsplit_once(':') {
-            Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-                (h.to_string(), Some(p.to_string()))
-            }
-            _ => (target.clone(), None),
-        };
+        let (host, port) = split_host_port(&target);
         let carry_port = tool.ports_key().is_some();
-        let host = if carry_port { host } else { target };
+        let host = if carry_port { host.to_string() } else { target.clone() };
+        let port = port.filter(|_| carry_port).map(str::to_string);
 
-        self.add_tool(tool, Some(host), port.filter(|_| carry_port), window, cx);
+        self.add_tool(tool, Some(host), port, window, cx);
     }
 
     /// The tools a selected result could be sent to: everything with a target
@@ -2631,7 +2768,7 @@ impl App {
         job.rows[idx].note = note;
         let job_id = job.id;
         self.editing_note_row = Some((idx, identity));
-        self.save_job(self.active, job_id);
+        self.owe_save(self.active, job_id);
         true
     }
 
@@ -3149,10 +3286,10 @@ impl App {
         };
 
         let mut id = self.next_job_id;
-        let docs = super::notes::load(&dir, &mut id);
+        let found = super::notes::load(&dir, &mut id);
         self.next_job_id = id;
-        let opened = docs.iter().find(|d| d.path == path).map(|d| d.id);
-        self.workspace_mut().docs = docs;
+        let opened = found.iter().find(|d| d.path == path).map(|d| d.id);
+        merge_docs(&mut self.workspace_mut().docs, found);
         if let Some(id) = opened {
             self.workspace_mut().select_doc(id);
             // A new document is empty, so there is nothing to read and every
@@ -3329,10 +3466,10 @@ impl App {
         };
 
         let mut id = self.next_job_id;
-        let flows = super::flows::load(&dir, &mut id);
+        let found = super::flows::load(&dir, &mut id);
         self.next_job_id = id;
-        let opened = flows.iter().find(|f| f.path == path).map(|f| f.id);
-        self.workspace_mut().flows = flows;
+        let opened = found.iter().find(|f| f.path == path).map(|f| f.id);
+        merge_flows(&mut self.workspace_mut().flows, found);
         if let Some(id) = opened {
             self.workspace_mut().select_flow(id);
         }
@@ -3634,6 +3771,26 @@ impl App {
         cx.notify();
     }
 
+    /// Carries a workflow on, in the workspace that holds it.
+    ///
+    /// A workflow acts on the workspace the application is standing in: the run
+    /// it starts next is that workspace's run, the value it works out is that
+    /// workspace's variable. But a run finishing and a pause ending happen when
+    /// they happen, which may well be while another workspace is on screen, so
+    /// this stands in the workflow's own workspace for as long as carrying it
+    /// on takes, and then goes back to where the user is.
+    fn advance_flow_in(
+        &mut self,
+        at: usize,
+        id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let showing = std::mem::replace(&mut self.active, at);
+        self.advance_flow(id, window, cx);
+        self.active = showing;
+    }
+
     /// Works through a workflow until it has to wait for something.
     ///
     /// Every condition is decided when it is reached, not when the workflow
@@ -3711,6 +3868,16 @@ impl App {
                     cx.notify();
                     return;
                 }
+                // It ran out of the operations one run is allowed. That is a
+                // workflow which was never going to come back, so it is shown
+                // as having failed at the step it was on, and not as done.
+                Event::Failed { step, why } => {
+                    sheet.trail.push(Mark { step, outcome: Outcome::Failed(why) });
+                    sheet.machine = None;
+                    sheet.busy = None;
+                    cx.notify();
+                    return;
+                }
                 Event::Finished => {
                     sheet.machine = None;
                     sheet.busy = None;
@@ -3754,22 +3921,28 @@ impl App {
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(delay).await;
             this.update_in(cx, |this, window, cx| {
+                // The workflow is found by whichever workspace holds it. A
+                // pause that ran out while another workspace was on screen
+                // found nothing here, and left the workflow waiting for ever on
+                // a pause that was already over.
+                let Some(at) = this.workspaces.iter().position(|w| w.flow(id).is_some()) else {
+                    return;
+                };
                 // Only if it is still waiting on that same pause: the user may
                 // have stopped it, or started it again.
-                let waiting = this
-                    .workspace()
+                let waiting = this.workspaces[at]
                     .flow(id)
                     .is_some_and(|f| matches!(f.busy, Some(super::flows::Busy::Until { .. })));
                 if !waiting {
                     return;
                 }
-                if let Some(sheet) = this.workspace_mut().flow_mut(id) {
+                if let Some(sheet) = this.workspaces[at].flow_mut(id) {
                     if let Some(last) = sheet.trail.last_mut() {
                         last.outcome = super::flows::Outcome::Done;
                     }
                     sheet.busy = None;
                 }
-                this.advance_flow(id, window, cx);
+                this.advance_flow_in(at, id, window, cx);
             })
             .ok();
         })
@@ -3777,17 +3950,18 @@ impl App {
     }
 
     /// Called when a run finishes, to carry on any workflow waiting on it.
+    ///
+    /// The workflow is looked for in every workspace, because the run it was
+    /// waiting on carries on wherever the user goes. Looking only in the
+    /// workspace on screen meant that switching workspaces while a workflow
+    /// was running left it marked as waiting on a run that had already
+    /// finished, with nothing left to wake it: it sat there, still counted as
+    /// running, until it was stopped by hand.
     fn flow_finished(&mut self, job: usize, failed: bool, window: &mut Window, cx: &mut Context<Self>) {
         use super::flows::Outcome;
-        let waiting = self
-            .workspace()
-            .flows
-            .iter()
-            .find(|f| f.busy.as_ref().and_then(super::flows::Busy::job) == Some(job))
-            .map(|f| f.id);
-        let Some(id) = waiting else { return };
+        let Some((at, id)) = flow_waiting_on(&self.workspaces, job) else { return };
 
-        if let Some(flow) = self.workspace_mut().flow_mut(id) {
+        if let Some(flow) = self.workspaces[at].flow_mut(id) {
             if let Some(last) = flow.trail.last_mut() {
                 last.outcome =
                     if failed { Outcome::Failed("the run failed".into()) } else { Outcome::Done };
@@ -3797,7 +3971,7 @@ impl App {
                 machine.resume(!failed);
             }
         }
-        self.advance_flow(id, window, cx);
+        self.advance_flow_in(at, id, window, cx);
     }
 
     /// Re-reads every document whose file has changed. Called on each repaint,
@@ -4114,10 +4288,30 @@ impl App {
         }
         let folder_path = self.workspace().dir.join(&slug);
         let _ = std::fs::create_dir_all(&folder_path);
+        // The list of folders is remembered for a moment, and this has just
+        // made the remembered one wrong.
+        self.workspace().forget_folders();
         cx.notify();
     }
 
     /// Reorders a job in the workspace.
+    /// Which way a thing in the side bar can be moved, if either.
+    ///
+    /// Asked while a menu is being built, so that a move which would not move
+    /// anything is left out of it rather than offered and inert. A group is
+    /// drawn with the starred things first, so the top of a group and the
+    /// first unstarred thing in one both have nowhere above them.
+    pub fn can_move(&self, item: super::workspace::Item) -> super::menu::CanMove {
+        use super::workspace::Item;
+        let ws = self.workspace();
+        let ask = |delta: isize| match item {
+            Item::Tool(id) => ws.can_move_job(id, delta),
+            Item::Doc(id) => ws.can_move_doc(id, delta),
+            Item::Flow(id) => ws.can_move_flow(id, delta),
+        };
+        super::menu::CanMove { up: ask(-1), down: ask(1) }
+    }
+
     pub fn move_job_by(&mut self, id: usize, delta: isize, cx: &mut Context<Self>) {
         if self.workspace_mut().move_job(id, delta) {
             self.save_workspace(self.active);
@@ -4357,6 +4551,8 @@ impl App {
     /// editor is drawn on a line and the line would then be a different row.
     pub fn end_note_edit(&mut self) -> bool {
         self.editing_note_row = None;
+        // Whatever was typed is written now rather than waiting for the tick.
+        self.flush_saves();
         self.editing_note.take().is_some()
     }
 
@@ -4374,8 +4570,19 @@ impl App {
     pub fn clear_sort(&mut self, cx: &mut Context<Self>) {
         self.end_note_edit();
         if let Some(job) = self.selected_job_mut() {
-            job.sort = None;
-            job.set_filter(job.filter.clone());
+            // The table of lines is worked out once and kept, and it is the
+            // job's own `set_sort` that says when it has to be worked out
+            // again. Writing `sort = None` here and asking for the filter it
+            // already had said nothing to it, so the button cleared the arrow
+            // in the header and left the rows sitting in the order they had
+            // been sorted into. `set_sort` walks a column round instead: up,
+            // down, and then off.
+            if let Some((column, descending)) = job.sort {
+                if !descending {
+                    job.set_sort(column);
+                }
+                job.set_sort(column);
+            }
         }
         cx.notify();
     }
@@ -4412,6 +4619,14 @@ impl App {
             }
             Item::Tool(_) => return,
         };
+
+        // Whatever was already open in the pane is closed properly first, and
+        // closing it writes it. The pane holds one editor, so opening a second
+        // file used to overwrite the first one where it stood: what had been
+        // typed into it never reached its file, and the "unsaved" mark that was
+        // the only sign of it went with the editor, so there was nothing left
+        // on screen to save and nothing to say it had not been.
+        self.stop_editing(cx);
 
         let editor = cx.new(|cx| super::editor::Editor::new(cx, &text, path, language));
         let handle = editor.read(cx).focus_handle.clone();
@@ -4657,6 +4872,9 @@ fn spawn_tick(cx: &mut Context<App>) -> gpui::Task<()> {
             cx.background_executor().timer(Duration::from_millis(500)).await;
             if this
                 .update(cx, |app, cx| {
+                    // Anything a note owes is written here, so nothing waits
+                    // longer than one tick for its file.
+                    app.flush_saves();
                     if app.workspaces.iter().any(Workspace::is_busy) || app.notices.any_fading()
                     {
                         cx.notify();
@@ -4672,8 +4890,102 @@ fn spawn_tick(cx: &mut Context<App>) -> gpui::Task<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_carryable, locate_row};
+    use super::{
+        active_after_close, flow_waiting_on, is_carryable, locate_row, merge_docs, merge_flows,
+        rename_var_unless_taken, split_host_port,
+    };
     use crate::core::{Row, Status};
+    use crate::ui::flows::{Busy, Sheet};
+    use crate::ui::notes::Doc;
+    use crate::ui::workspace::Workspace;
+
+    fn a_doc(id: usize, path: &str) -> Doc {
+        Doc {
+            id,
+            stem: "notes".into(),
+            path: std::path::PathBuf::from(path),
+            source: String::new(),
+            open: false,
+            folder: None,
+            seen: None,
+            scroll: gpui::ScrollHandle::new(),
+        }
+    }
+
+    fn a_flow(id: usize, path: &str) -> Sheet {
+        Sheet {
+            id,
+            stem: "flow".into(),
+            path: std::path::PathBuf::from(path),
+            source: String::new(),
+            open: false,
+            folder: None,
+            seen: None,
+            trail: Vec::new(),
+            machine: None,
+            busy: None,
+            scroll: gpui::ScrollHandle::new(),
+            cursor: None,
+        }
+    }
+
+    #[test]
+    fn making_a_document_leaves_the_others_open_and_leaves_their_ids_alone() {
+        let mut held = vec![a_doc(4, "/w/one.md"), a_doc(5, "/w/two.md")];
+        held[0].open = true;
+        held[0].source = "# one, as it is being written".into();
+
+        // What reading the directory again says once a third file is in it:
+        // the same three files, each with a fresh id and no tab.
+        let found = vec![a_doc(9, "/w/one.md"), a_doc(10, "/w/three.md"), a_doc(11, "/w/two.md")];
+        merge_docs(&mut held, found);
+
+        // The two that were already there are the same two documents, so a tab,
+        // a selection or an open editor still points at the right one.
+        assert_eq!(held.iter().map(|d| d.id).collect::<Vec<_>>(), vec![4, 5, 10]);
+        assert!(held[0].open, "a document with a tab keeps it");
+        assert_eq!(held[0].source, "# one, as it is being written");
+
+        // And a file that has gone from the directory goes from the list.
+        let found = vec![a_doc(20, "/w/one.md")];
+        merge_docs(&mut held, found);
+        assert_eq!(held.iter().map(|d| d.id).collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn making_a_workflow_does_not_abandon_one_that_is_running() {
+        let mut held = vec![a_flow(4, "/w/first.flow")];
+        held[0].open = true;
+        held[0].machine =
+            Some(crate::flow::compile::Machine::new(&[crate::flow::Step::Wait { seconds: 1. }]));
+        held[0].busy = Some(Busy::Run { step: 0, job: 7 });
+
+        let found = vec![a_flow(9, "/w/first.flow"), a_flow(10, "/w/second.flow")];
+        merge_flows(&mut held, found);
+
+        assert_eq!(held.len(), 2);
+        assert_eq!(held[0].id, 4, "the one that was running is still the same workflow");
+        assert!(held[0].running(), "and it is still running");
+        assert_eq!(held[0].busy, Some(Busy::Run { step: 0, job: 7 }));
+        assert!(held[0].open);
+    }
+
+    #[test]
+    fn a_run_that_finishes_elsewhere_still_finds_the_workflow_waiting_on_it() {
+        let mut first = Workspace::new(1, std::path::PathBuf::from("/w/one"));
+        let mut second = Workspace::new(2, std::path::PathBuf::from("/w/two"));
+        first.flows.push(a_flow(5, "/w/one/other.flow"));
+        let mut waiting = a_flow(4, "/w/two/watch.flow");
+        waiting.busy = Some(Busy::Run { step: 1, job: 12 });
+        second.flows.push(waiting);
+
+        // The first workspace is the one on screen; the run belongs to the
+        // second, which is where the workflow waiting on it has to be found or
+        // it waits for ever.
+        let workspaces = vec![first, second];
+        assert_eq!(flow_waiting_on(&workspaces, 12), Some((1, 4)));
+        assert_eq!(flow_waiting_on(&workspaces, 99), None);
+    }
 
     fn row(target: &str) -> Row {
         Row {
@@ -4717,6 +5029,76 @@ mod tests {
         // to whatever took its place.
         let gone: Vec<Row> = rows.iter().filter(|r| r.target != "10.0.0.2").cloned().collect();
         assert_eq!(locate_row(&gone, 1, "10.0.0.2"), None);
+    }
+
+    #[test]
+    fn a_half_typed_variable_name_does_not_bury_the_variable_it_passes_through() {
+        let mut ws = Workspace::new(1, std::path::PathBuf::from("/w/one"));
+        ws.set_var("ip", "10.0.0.1");
+        ws.set_var("ipv6", "fe80::1");
+
+        // The box is read back on every keystroke, so renaming `ipv6` to
+        // `ip_v6` arrives as five renames, and the second of them asks for a
+        // name that belongs to another variable.
+        let mut name = String::from("ipv6");
+        for typed in ["i", "ip", "ip_", "ip_v", "ip_v6"] {
+            if let Some(now) = rename_var_unless_taken(&mut ws, &name, typed) {
+                name = now;
+            }
+        }
+
+        assert_eq!(name, "ip_v6");
+        assert_eq!(ws.var("ip_v6").map(|v| v.value.as_str()), Some("fe80::1"));
+        assert_eq!(
+            ws.var("ip").map(|v| v.value.as_str()),
+            Some("10.0.0.1"),
+            "the variable the typing passed through still has its value"
+        );
+        assert_eq!(ws.vars.len(), 2, "and there are still two variables");
+
+        // A change of capitalisation is the variable's own name, not another
+        // variable's, so it still goes through.
+        assert_eq!(rename_var_unless_taken(&mut ws, "ip", "IP").as_deref(), Some("IP"));
+    }
+
+    #[test]
+    fn an_ipv6_result_is_handed_on_whole_instead_of_read_as_a_host_and_a_port() {
+        // What an AAAA lookup puts in a row. Its last group is four digits, so
+        // reading the last colon as a port pointed the next tool at a
+        // truncated address and wrote 1946 into its ports box.
+        assert_eq!(
+            split_host_port("2606:2800:220:1:248:1893:25c8:1946"),
+            ("2606:2800:220:1:248:1893:25c8:1946", None)
+        );
+        assert_eq!(split_host_port("fe80::1"), ("fe80::1", None));
+
+        // A name or an address with a port after it is still a host and a
+        // port, which is the whole reason for carrying one.
+        assert_eq!(split_host_port("example.com:8080"), ("example.com", Some("8080")));
+        assert_eq!(split_host_port("10.0.0.4:443"), ("10.0.0.4", Some("443")));
+        // Including a port scan's own rows, where the address is whole and the
+        // port follows it.
+        assert_eq!(split_host_port("2001:db8::1:443"), ("2001:db8::1", Some("443")));
+        assert_eq!(split_host_port("[2001:db8::1]:443"), ("[2001:db8::1]", Some("443")));
+
+        // And a link is neither.
+        assert_eq!(split_host_port("https://example.com/x"), ("https://example.com/x", None));
+    }
+
+    #[test]
+    fn closing_a_workspace_in_front_of_the_active_one_stays_on_the_active_one() {
+        // Three open, standing in the middle one, and the first is closed: the
+        // middle one is now first in the list, and that is where the window
+        // has to be. Clamping alone left it on what had been the third.
+        assert_eq!(active_after_close(1, 0, 2), 0);
+
+        // Closing one behind it does not move it at all.
+        assert_eq!(active_after_close(1, 2, 2), 1);
+
+        // Closing the one being worked in shows whatever took its place, and
+        // the last one closing falls back onto the new end of the list.
+        assert_eq!(active_after_close(1, 1, 2), 1);
+        assert_eq!(active_after_close(2, 2, 2), 1);
     }
 
     #[test]

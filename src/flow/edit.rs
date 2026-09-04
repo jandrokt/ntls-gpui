@@ -606,6 +606,12 @@ impl Recipe {
     }
 }
 
+/// The words an expression is written with, which no bare name begins with.
+///
+/// `not` is a real operator, as in `not Sweep.ok`, and `if`, `then` and `else`
+/// are the rest of what the parser reads as syntax rather than as a name.
+const OPERATOR_WORDS: [&str; 4] = ["not", "if", "then", "else"];
+
 fn parse_subject(text: &str) -> Option<String> {
     let text = text.trim();
     if text.is_empty() {
@@ -614,6 +620,20 @@ fn parse_subject(text: &str) -> Option<String> {
     if let Some(inner) = text.strip_prefix("tool(").and_then(|s| s.strip_suffix(')')) {
         let s = super::unquote(inner);
         return (!s.is_empty()).then_some(s);
+    }
+    // A subject may have a space in it, so that `Port scan.open` names the run
+    // it looks like it names. That allowance used to swallow `not Sweep.ok`:
+    // `not Sweep` read as a two-word run, so the workflow was written back as
+    // `tool("not Sweep").ok`, and a run that is not there is nothing rather
+    // than an error, so the condition became a silent permanent false and the
+    // step it guarded stopped running. Nobody had to touch that line for it to
+    // happen: the file is written out from the tree after any other edit.
+    //
+    // It is the first whole word that decides, so `notes` and `not_yet` are
+    // still names.
+    let first = text.split_whitespace().next().unwrap_or_default();
+    if OPERATOR_WORDS.contains(&first) {
+        return None;
     }
     if text.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ' ') {
         return Some(text.to_string());

@@ -69,6 +69,17 @@ impl Render for App {
             });
         }
 
+        // The tab strip and the pane have to name the same tool. Opening a
+        // document clears the tool selection, and closing the document's tab
+        // does not put one back, so `showing` falls through to the first tool
+        // with a tab: the strip draws that tab as active while the pane, which
+        // looks its tool up by the selection, finds none and says no tool is
+        // selected. The keys that act on the selection do nothing there too.
+        let out_of_step = tool_out_of_step(self.workspace().showing(), self.workspace().selected);
+        if let Some(id) = out_of_step {
+            self.workspace_mut().selected = Some(id);
+        }
+
         // A page takes the whole window: no side bar, no tab strip, no output
         // panel. What it is about is not a thing inside the workspace, so a
         // list of what is inside the workspace is only in the way.
@@ -114,10 +125,27 @@ impl Render for App {
             .relative()
             .on_mouse_move(cx.listener(|app, e: &gpui::MouseMoveEvent, _, cx| {
                 if app.resizing.is_some() {
-                    app.drag_resize(f32::from(e.position.x), cx);
+                    // A pointer over the window with nothing held down is not
+                    // dragging anything. Without this the edge goes on
+                    // following the pointer after a release the window never
+                    // saw, and the only way out is to click somewhere.
+                    if e.pressed_button == Some(gpui::MouseButton::Left) {
+                        app.drag_resize(f32::from(e.position.x), cx);
+                    } else {
+                        app.end_resize();
+                    }
                 }
             }))
             .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|app, _, _, _| app.end_resize()),
+            )
+            // That handler only hears a release landing on the window itself
+            // with nothing drawn over that spot. Let go of an edge over a
+            // notice in the corner, or past the window's own border, and the
+            // drag would never be told it was over: the width would not be
+            // remembered, and the next move would carry on resizing.
+            .on_mouse_up_out(
                 gpui::MouseButton::Left,
                 cx.listener(|app, _, _, _| app.end_resize()),
             )
@@ -449,13 +477,22 @@ impl App {
             self.end_var_edit(window, cx);
             return;
         }
-        if self.page.is_some() {
-            self.close_page(window, cx);
-            return;
-        }
-        if self.menu.is_some() {
-            self.close_menu(cx);
-            return;
+        // A menu is the last thing the window draws, over a page that has
+        // taken the whole window included, so it is the layer an escape
+        // reaches first. Taking the page off first left the menu where it was
+        // opened, hanging over a workspace it had nothing to do with and still
+        // offering to copy an address from a list that was no longer on
+        // screen.
+        match front_layer(self.menu.is_some(), self.page.is_some()) {
+            Some(Front::Menu) => {
+                self.close_menu(cx);
+                return;
+            }
+            Some(Front::Page) => {
+                self.close_page(window, cx);
+                return;
+            }
+            None => {}
         }
         if self.editing_note.is_some() {
             self.end_note(window, cx);
@@ -505,4 +542,87 @@ impl App {
 /// A hairline that separates without drawing attention.
 pub(crate) fn rule(theme: &super::theme::Theme) -> gpui::Div {
     div().h(px(1.)).w_full().flex_shrink_0().bg(theme.rule)
+}
+
+/// The tool whose tab is drawn as active while the selection points somewhere
+/// else, if there is one.
+///
+/// What the tab strip draws as active is whatever the workspace is showing,
+/// and with nothing selected that is the first tool with a tab. The pane for a
+/// tool goes by the selection instead, so the two can end up describing
+/// different tools: the answer here is the tool the selection has to be moved
+/// to for them to agree again.
+fn tool_out_of_step(
+    showing: Option<super::workspace::Item>,
+    selected: Option<usize>,
+) -> Option<usize> {
+    match showing {
+        Some(super::workspace::Item::Tool(id)) if selected != Some(id) => Some(id),
+        _ => None,
+    }
+}
+
+/// One of the two things that cover the whole window: the menu drawn over it,
+/// and the page drawn in it.
+#[derive(Debug, PartialEq, Eq)]
+enum Front {
+    Menu,
+    Page,
+}
+
+/// Which of the two an escape reaches first, if either is up.
+///
+/// A page takes the whole window, and a menu is drawn over everything the
+/// window has, the page included, so the menu is always the one in front of
+/// the other. Closing the page first left the menu behind it, over a
+/// workspace it was never opened on and naming a row that had gone with the
+/// page.
+fn front_layer(menu_open: bool, page_open: bool) -> Option<Front> {
+    match (menu_open, page_open) {
+        (true, _) => Some(Front::Menu),
+        (false, true) => Some(Front::Page),
+        (false, false) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Front, front_layer, tool_out_of_step};
+    use crate::ui::workspace::Item;
+
+    #[test]
+    fn the_tool_whose_tab_is_drawn_as_active_is_the_one_the_pane_shows() {
+        // Closing the last document tab leaves no document selected, and no
+        // tool selected either because opening the document had cleared that,
+        // so the strip falls back to the first tool with a tab and draws it
+        // active over a pane that says no tool is selected.
+        assert_eq!(tool_out_of_step(Some(Item::Tool(4)), None), Some(4));
+        // Same story with the selection left on a tool whose tab has since
+        // been closed: the strip is drawing tab 4, the pane is showing 9.
+        assert_eq!(tool_out_of_step(Some(Item::Tool(4)), Some(9)), Some(4));
+
+        // A selection that already agrees is left alone.
+        assert_eq!(tool_out_of_step(Some(Item::Tool(4)), Some(4)), None);
+        // A document or a workflow pane is handed the id of what it draws and
+        // never asks which tool is selected, so neither is out of step.
+        assert_eq!(tool_out_of_step(Some(Item::Doc(1)), None), None);
+        assert_eq!(tool_out_of_step(Some(Item::Flow(1)), Some(9)), None);
+        // Nothing open at all is the welcome screen, not a disagreement.
+        assert_eq!(tool_out_of_step(None, Some(4)), None);
+    }
+
+    #[test]
+    fn a_menu_opened_over_a_page_comes_off_before_the_page_does() {
+        // The interfaces page answers a right-click with a menu, and that
+        // menu is drawn over the window rather than on the page. Closing the
+        // page first put the workspace back underneath a menu that was still
+        // open, offering to copy an address from a list that had gone.
+        assert_eq!(front_layer(true, true), Some(Front::Menu));
+
+        // Either one on its own is still the thing that comes off.
+        assert_eq!(front_layer(true, false), Some(Front::Menu));
+        assert_eq!(front_layer(false, true), Some(Front::Page));
+        // With neither up, the escape belongs to something inside the window.
+        assert_eq!(front_layer(false, false), None);
+    }
 }

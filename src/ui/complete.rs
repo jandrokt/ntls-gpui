@@ -117,9 +117,15 @@ pub fn context(language: Language, line: &str, at: usize) -> Context {
         return Context::Field { subject, typed };
     }
 
+    // Stepping one byte past the delimiter assumed every delimiter is one
+    // byte wide. An em dash, a curly quote or a degree sign is not, so the
+    // word began inside a character and slicing there ended the program: in
+    // the formula box that meant a panic on every frame, from one keystroke.
     let word_start = before
-        .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
-        .map_or(0, |i| i + 1);
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == '.'))
+        .map_or(0, |(i, c)| i + c.len_utf8());
     let word = &before[word_start..];
 
     match word.rsplit_once('.') {
@@ -379,6 +385,25 @@ mod tests {
         );
         // Once the expression is closed, it is prose again.
         assert_eq!(context(Language::Markdown, "{{ a }} and", 11), Context::Nowhere);
+    }
+
+    #[test]
+    fn a_character_wider_than_one_byte_is_not_sliced_through() {
+        // The start of the word was found by stepping one byte past the
+        // delimiter, so a delimiter wider than a byte put it inside a
+        // character. Reading a formula happens on every frame, so one
+        // degree sign typed into one meant a panic on every frame after.
+        for line in ["a\u{b0}", "x \u{2019}", "{{ a\u{2014}b", "run x\u{2014}y", "Router.rtt\u{2014}"] {
+            for language in [Language::Expr, Language::Flow, Language::Markdown] {
+                for caret in 0..=line.len() {
+                    if line.is_char_boundary(caret) {
+                        let _ = context(language, line, caret);
+                    }
+                }
+            }
+        }
+        // And the word under the caret is still the word.
+        assert_eq!(context(Language::Expr, "a\u{b0}Rou", 6), Context::Word("Rou".into()));
     }
 
     #[test]

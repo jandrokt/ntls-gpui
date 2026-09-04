@@ -1234,16 +1234,21 @@ fn chooser(
 }
 
 /// The next length of pause up or down from this one.
+///
+/// A file is allowed to say more than the control offers: `wait 2h` is a
+/// perfectly good line to type. Taking such a pause to be sitting on the last
+/// of the offered lengths made both arrows point the wrong way for it: asking
+/// for a longer pause handed back an hour, which is shorter than the two that
+/// were there, and asking for a shorter one jumped straight past the hour to
+/// half of one. Each arrow looks for the nearest offered length on its own
+/// side of where the pause really is, so neither can move it backwards.
 fn nearer(seconds: f64, direction: i32) -> u32 {
-    let at = WAITS.iter().position(|w| *w >= seconds - 0.001).unwrap_or(WAITS.len() - 1);
-    let next = if direction < 0 {
-        at.saturating_sub(1)
-    } else if WAITS.get(at).is_some_and(|w| *w > seconds + 0.001) {
-        at
-    } else {
-        (at + 1).min(WAITS.len() - 1)
-    };
-    WAITS[next] as u32
+    if direction < 0 {
+        let below = WAITS.iter().rev().find(|w| **w < seconds - 0.001);
+        return below.copied().unwrap_or(WAITS[0]) as u32;
+    }
+    let above = WAITS.iter().find(|w| **w > seconds + 0.001);
+    above.copied().unwrap_or_else(|| seconds.max(WAITS[WAITS.len() - 1])) as u32
 }
 
 #[cfg(test)]
@@ -1329,5 +1334,16 @@ mod tests {
         // And it stops at either end.
         assert_eq!(nearer(5., -1), 5);
         assert_eq!(nearer(3600., 1), 3600);
+    }
+
+    #[test]
+    fn neither_arrow_moves_a_pause_longer_than_an_hour_the_wrong_way() {
+        // `wait 2h` in the file used to be treated as if it were the hour at
+        // the top of the list: the up arrow shortened it to an hour and the
+        // down arrow to half of one, skipping the hour in between.
+        assert_eq!(nearer(7200., 1), 7200);
+        assert_eq!(nearer(7200., -1), 3600);
+        assert_eq!(nearer(5400., 1), 5400);
+        assert_eq!(nearer(5400., -1), 3600);
     }
 }

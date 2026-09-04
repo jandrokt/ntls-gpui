@@ -80,6 +80,16 @@ pub fn parse_ports(spec: &str) -> Result<Vec<u16>, String> {
                 hi_s.parse().map_err(|_| format!("bad port {hi_s:?}"))?
             };
             let (lo, hi) = (lo.min(hi).max(1), hi.max(lo).min(65535));
+            // Clamping is right for a range that only overhangs an edge, but a
+            // range wholly outside the port space, "70000-80000" or "0-0",
+            // leaves the clamp with its ends crossed over, and such a range
+            // iterates over nothing at all. That is how "80,70000-80000" came
+            // to scan port 80 alone without a word about the rest, while a
+            // bare "70000" was refused outright. Crossed ends mean no overlap,
+            // so they earn the same refusal.
+            if lo > hi {
+                return Err(format!("port range {part:?} out of range (1-65535)"));
+            }
             for p in lo..=hi {
                 add(p, &mut out, &mut seen)?;
             }
@@ -253,6 +263,21 @@ mod tests {
     fn an_open_ended_range_takes_the_limit() {
         assert_eq!(*parse_ports("65533-").unwrap().last().unwrap(), 65535);
         assert_eq!(*parse_ports("-3").unwrap().first().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_range_that_overhangs_the_limit_is_clamped_to_it() {
+        assert_eq!(parse_ports("65534-70000").unwrap(), vec![65534, 65535]);
+        assert_eq!(parse_ports("0-2").unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_range_wholly_outside_the_port_space_is_refused_rather_than_dropped() {
+        assert!(parse_ports("70000-80000").is_err());
+        assert!(parse_ports("0-0").is_err());
+        // The one that mattered: alongside a port that does exist, the
+        // impossible range used to vanish and the scan ran on port 80 only.
+        assert!(parse_ports("80,70000-80000").is_err());
     }
 
     #[test]

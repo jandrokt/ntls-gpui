@@ -28,6 +28,16 @@ pub struct Http;
 /// and the download tool is the one that fetches files.
 const BODY_PREVIEW: usize = 2048;
 
+/// How much of the body is held on to: enough for the log, and for a value
+/// captured out of the JSON of any answer a service is meant to give.
+///
+/// The whole of it used to be kept, which is fine for an answer and not for
+/// what a URL sometimes turns out to point at: a disk image, or an endpoint
+/// that streams for as long as it is read. That grew in memory for as long as
+/// the timeout allowed and was then thrown away entirely, on a machine that
+/// is also running everything else the person is diagnosing.
+const BODY_KEEP: usize = 8 * 1024 * 1024;
+
 /// The methods a person actually sends by hand.
 const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 
@@ -345,11 +355,21 @@ fn json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_j
         if !name.is_empty() {
             at = at.get(name)?;
         }
+        // Each index is read from its opening bracket, because whatever
+        // follows an index has to be another index. Looking for the next `]`
+        // by itself and reading the number from one byte in went wrong the
+        // moment the brackets did not pair: `items[0]]` sliced `1..0` of a
+        // lone `]` and `items[0]é]` cut a character in half, and either one
+        // panicked. A path is typed by hand into a box, so a path like that
+        // arrives, and the panic killed the request without the run ever
+        // reporting that it had finished.
         let mut rest = rest;
-        while let Some(close) = rest.find(']') {
-            let index: usize = rest[1..close].trim().parse().ok()?;
+        while !rest.is_empty() {
+            let inside = rest.strip_prefix('[')?;
+            let close = inside.find(']')?;
+            let index: usize = inside[..close].trim().parse().ok()?;
             at = at.get(index)?;
-            rest = &rest[close + 1..];
+            rest = &inside[close + 1..];
         }
     }
     Some(at)
@@ -482,7 +502,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                 );
                 emit.err(format!("{method} {url}: {}", why(&e)));
             }
-            Ok(response) => {
+            Ok(mut response) => {
                 let code = response.status();
                 let landed = response.url().to_string();
                 let kind = header(&response, reqwest::header::CONTENT_TYPE);
@@ -507,14 +527,23 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                 }
 
                 let show_body = n == 0 && p.bool("showbody");
-                let body = match cancel.run(response.bytes()).await {
+                let body = match cancel.run(read_body(&mut response)).await {
                     None => break,
-                    Some(Ok(bytes)) => bytes,
+                    Some(Ok(body)) => body,
                     Some(Err(e)) => {
                         emit.warn(format!("the body did not arrive whole: {}", why(&e)));
-                        Default::default()
+                        Body::default()
                     }
                 };
+                // Said once, because an empty captured value out of an answer
+                // this big is the cap and not the path.
+                if n == 0 && !body.whole() {
+                    emit.warn(format!(
+                        "the body is {}: only the first {} of it was kept",
+                        crate::dl::names::bytes(body.len),
+                        crate::dl::names::bytes(BODY_KEEP as u64)
+                    ));
+                }
                 let took = began.elapsed();
                 times.push(took.as_secs_f64() * 1000.);
 
@@ -522,7 +551,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                 if as_asked {
                     met += 1;
                 }
-                let value = capture(&capturing, code.as_u16(), &headers_back, &body);
+                let value = capture(&capturing, code.as_u16(), &headers_back, &body.kept);
                 if !value.is_empty() {
                     last_value = value.clone();
                 }
@@ -547,7 +576,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                         index,
                         format!("{}", code.as_u16()),
                         ms(took),
-                        crate::dl::names::bytes(body.len() as u64),
+                        crate::dl::names::bytes(body.len),
                         short(&kind),
                         value.clone(),
                         detail
@@ -643,9 +672,49 @@ fn short(kind: &str) -> String {
     kind.split(';').next().unwrap_or(kind).trim().to_string()
 }
 
+/// What came back, and how much of it there was.
+///
+/// The two are not the same number: the row says the size the server sent,
+/// and only the start of it is held in memory.
+#[derive(Default)]
+struct Body {
+    /// The first [`BODY_KEEP`] of the body, which is what the log shows and
+    /// what a value is captured out of.
+    kept: Vec<u8>,
+    /// How long the whole body was, kept or not.
+    len: u64,
+}
+
+impl Body {
+    fn take(&mut self, chunk: &[u8]) {
+        self.len += chunk.len() as u64;
+        let room = BODY_KEEP.saturating_sub(self.kept.len());
+        if room > 0 {
+            self.kept.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+    }
+
+    /// Whether what is kept is all of it.
+    fn whole(&self) -> bool {
+        self.len <= BODY_KEEP as u64
+    }
+}
+
+/// Reads the body to the end, holding on to the start of it.
+///
+/// It is read to the end rather than dropped at the cap so that the size in
+/// the row, and the timing beside it, are still about the whole answer.
+async fn read_body(response: &mut reqwest::Response) -> reqwest::Result<Body> {
+    let mut body = Body::default();
+    while let Some(chunk) = response.chunk().await? {
+        body.take(&chunk);
+    }
+    Ok(body)
+}
+
 /// The start of the body, as lines in the log.
-fn preview(body: &[u8], emit: &Emitter) {
-    let text = String::from_utf8_lossy(&body[..body.len().min(BODY_PREVIEW)]);
+fn preview(body: &Body, emit: &Emitter) {
+    let text = String::from_utf8_lossy(&body.kept[..body.kept.len().min(BODY_PREVIEW)]);
     if text.trim().is_empty() {
         emit.info("the body is empty");
         return;
@@ -653,10 +722,13 @@ fn preview(body: &[u8], emit: &Emitter) {
     for line in text.lines().take(40) {
         emit.info(line.to_string());
     }
-    if body.len() > BODY_PREVIEW {
+    // Counted off the whole body and not off what was kept of it, so the line
+    // is about how much there is left to read rather than how much of it this
+    // tool happens to be holding.
+    if body.len > BODY_PREVIEW as u64 {
         emit.info(format!(
             "… and {} more",
-            crate::dl::names::bytes((body.len() - BODY_PREVIEW) as u64)
+            crate::dl::names::bytes(body.len - BODY_PREVIEW as u64)
         ));
     }
 }
@@ -768,6 +840,69 @@ mod tests {
         // itself was still an answer.
         assert_eq!(capture("data.missing", 200, &headers, body), "");
         assert_eq!(capture("", 200, &headers, body), "");
+    }
+
+    #[test]
+    fn a_capture_path_whose_brackets_do_not_pair_is_nothing_rather_than_a_panic() {
+        let body = br#"{"items": [{"id": "a"}], "data": {"queue": 12}}"#;
+        let headers = reqwest::header::HeaderMap::new();
+
+        // A path is typed by hand, so it arrives half-finished and it arrives
+        // wrong. None of these is a path, and none of them may take the run
+        // down with it.
+        assert_eq!(capture("items[0]]", 200, &headers, body), "");
+        assert_eq!(capture("items[0]]x", 200, &headers, body), "");
+        assert_eq!(capture("items[0]é]", 200, &headers, body), "");
+        assert_eq!(capture("items[]", 200, &headers, body), "");
+        assert_eq!(capture("items[0", 200, &headers, body), "");
+        assert_eq!(capture("items]", 200, &headers, body), "");
+
+        // And one that is one still reads.
+        assert_eq!(capture("items[0].id", 200, &headers, body), "a");
+        assert_eq!(capture("data.queue", 200, &headers, body), "12");
+    }
+
+    #[test]
+    fn a_body_past_what_is_kept_is_counted_in_full_and_held_in_part() {
+        let mut body = Body::default();
+        body.take(b"{\"queue\": 12}");
+        assert!(body.whole());
+        assert_eq!(body.len, 13);
+        assert_eq!(body.kept, b"{\"queue\": 12}");
+
+        // What a URL sometimes turns out to point at. The size is the size
+        // that arrived; the memory is not.
+        let mut body = Body::default();
+        let chunk = vec![b'x'; BODY_KEEP / 2 + 1];
+        for _ in 0..4 {
+            body.take(&chunk);
+        }
+        assert_eq!(body.len, 4 * (BODY_KEEP / 2 + 1) as u64);
+        assert_eq!(body.kept.len(), BODY_KEEP);
+        assert!(!body.whole());
+    }
+
+    #[test]
+    fn the_log_says_how_much_of_the_body_it_is_not_showing() {
+        // The start of something far larger, which is what a capped read
+        // leaves behind.
+        let body = Body { kept: b"first line\nsecond line\n".to_vec(), len: 5_000_000_000 };
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&lines);
+        preview(
+            &body,
+            &Emitter::new(move |e: Event| {
+                if let Event::Log { text, .. } = e {
+                    sink.lock().unwrap().push(text);
+                }
+            }),
+        );
+        let logged = lines.lock().unwrap();
+        assert_eq!(logged[0], "first line");
+        assert_eq!(logged[1], "second line");
+        // The remainder is what is left of the answer, not what is left of
+        // the 23 bytes that were kept of it.
+        assert_eq!(logged[2], "… and 4.7 GB more");
     }
 
     #[test]

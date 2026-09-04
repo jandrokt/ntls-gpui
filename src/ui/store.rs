@@ -617,10 +617,17 @@ pub fn load_all() -> Vec<Loaded> {
     dirs.sort();
 
     dirs.into_iter()
-        .filter_map(|dir| {
-            let record = read_workspace(&dir)?;
+        .map(|dir| {
+            // A workspace file that cannot be read is not a reason to lose the
+            // workspace. The directory is known to have one, so failing to
+            // parse it means it is corrupt, and dropping the whole directory
+            // for that took every tool in it out of the side bar with no
+            // message at all -- while every one of those tool files was still
+            // perfectly readable. What is lost is the name, the colour, the
+            // notes and the variables. What is kept is the work.
+            let record = read_workspace(&dir).unwrap_or_default();
             let jobs = load_jobs(&dir);
-            Some((dir, record, jobs))
+            (dir, record, jobs)
         })
         .collect()
 }

@@ -59,6 +59,29 @@ impl std::fmt::Display for Direction {
     }
 }
 
+/// The only test lengths the two ends can agree on. The greeting carries whole
+/// seconds, so anything shorter than one has no representation on the wire at
+/// all, and the ceiling keeps a mistyped "10m" from holding a link and a
+/// socket for the rest of the afternoon.
+const MIN_DURATION: Duration = Duration::from_secs(1);
+const MAX_DURATION: Duration = Duration::from_secs(300);
+
+/// Rounds a requested test length to one both ends will actually run.
+///
+/// Every caller clamps before it announces a length or sets a deadline, and the
+/// server clamps what it is handed the same way. That agreement is the whole
+/// point: a length one end silently replaces with a different one leaves the
+/// two measuring different windows, with nothing on the wire to say so.
+pub fn clamp_duration(d: Duration) -> Duration {
+    // Through seconds as a float rather than whole seconds, so half a second
+    // becomes the one second that can be sent instead of the zero that
+    // truncation gave. The cast saturates, so an absurd number lands on the
+    // ceiling.
+    let secs =
+        (d.as_secs_f64().round() as u64).clamp(MIN_DURATION.as_secs(), MAX_DURATION.as_secs());
+    Duration::from_secs(secs)
+}
+
 /// The fixed 16-byte greeting.
 fn marshal_header(dir: Direction, seconds: u16) -> [u8; 16] {
     let mut b = [0u8; 16];
@@ -103,6 +126,28 @@ impl Peer {
 /// small enough to respect the deadline closely.
 const BLOCK: usize = 256 << 10;
 
+/// How long the accept loop waits after a failure before looking for the next
+/// connection, and how many failures with nothing accepted in between mean the
+/// listening socket itself is gone rather than one arrival having gone wrong.
+const ACCEPT_RETRY_WAIT: Duration = Duration::from_millis(100);
+const ACCEPT_GIVE_UP: u32 = 20;
+
+/// Whether a failed accept leaves a listening socket worth going back to.
+///
+/// Connection-level failures say nothing about the listener: the connection
+/// that caused them is already gone and the next accept takes the next one, so
+/// however many of them arrive they never end the server. Anything else is
+/// retried too, because nearly every accept error is momentary, but only for a
+/// run of tries; a socket that has genuinely stopped accepting has to be
+/// reported rather than retried for the rest of the afternoon.
+fn accept_again(e: &std::io::Error, consecutive: u32) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::Interrupted
+    ) || consecutive < ACCEPT_GIVE_UP
+}
+
 /// Accepts throughput tests and answers discovery broadcasts, running until
 /// cancelled.
 pub async fn serve(
@@ -120,15 +165,50 @@ pub async fn serve(
     let name = hostname();
     on_event(format!("listening on {bind} as {name:?}"));
 
-    let discovery = tokio::spawn(answer_discovery(cancel.clone(), port, name.clone()));
+    let discovery = tokio::spawn(answer_discovery(
+        cancel.clone(),
+        port,
+        DEFAULT_DISCOVERY_PORT,
+        name.clone(),
+        on_event.clone(),
+    ));
 
+    let mut failures = 0u32;
     loop {
         let accepted = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
             a = listener.accept() => a,
         };
-        let Ok((conn, remote)) = accepted else { break };
+        let (conn, remote) = match accepted {
+            Ok(pair) => {
+                failures = 0;
+                pair
+            }
+            Err(e) => {
+                // A failed accept is nearly always about the arrival rather
+                // than the listener: a client that reset between the handshake
+                // and the accept, a signal, a moment without a spare
+                // descriptor. Leaving the loop on the first of them stopped
+                // this machine answering for good, and serve() then returned
+                // Ok, so the window that had said "listening" simply went
+                // quiet while every peer got connection refused, with nothing
+                // anywhere saying why.
+                failures += 1;
+                on_event(format!("could not accept a connection: {e}"));
+                if !accept_again(&e, failures) {
+                    discovery.abort();
+                    return Err(format!("stopped listening on port {port}: {e}"));
+                }
+                // A listener that fails instantly and endlessly would spin a
+                // core here, so wait a little first. Stop is still answered
+                // while we do.
+                if !cancel.sleep(ACCEPT_RETRY_WAIT).await {
+                    break;
+                }
+                continue;
+            }
+        };
         let (on_event, on_result, cancel) = (on_event.clone(), on_result.clone(), cancel.clone());
         tokio::spawn(async move {
             if let Err(e) = handle(cancel, conn, remote.ip(), &on_event, &on_result).await {
@@ -155,10 +235,12 @@ async fn handle(
         .map_err(|e| e.to_string())?;
     let (dir, seconds) = parse_header(&head)?;
 
-    let mut duration = Duration::from_secs(seconds as u64);
-    if duration.is_zero() || duration > Duration::from_secs(300) {
-        duration = Duration::from_secs(10);
-    }
+    // A greeting asking for no time at all, or for hours, gets the nearest
+    // length this end is willing to run. It used to substitute an unrelated
+    // ten seconds, so a client asking for half a second measured half a second
+    // while this end blasted for ten, and only this end's own log ever
+    // mentioned it.
+    let duration = clamp_duration(Duration::from_secs(seconds as u64));
     on_event(format!("{remote} is running a {dir} test for {duration:?}"));
 
     let deadline = Instant::now() + duration;
@@ -181,9 +263,30 @@ async fn handle(
 
 /// Replies to broadcast searches so a peer can be found without anyone typing
 /// an address.
-async fn answer_discovery(cancel: Cancel, data_port: u16, name: String) {
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_DISCOVERY_PORT);
-    let Ok(sock) = UdpSocket::bind(bind).await else { return };
+async fn answer_discovery(
+    cancel: Cancel,
+    data_port: u16,
+    disc_port: u16,
+    name: String,
+    on_event: Arc<dyn Fn(String) + Send + Sync>,
+) {
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), disc_port);
+    // Losing the discovery port is the difference between a listener anybody
+    // can find and one that has to be typed in by address, so it has to be
+    // said out loud. Anything else holding the port, another ntls or a
+    // previous one still winding down, used to end this task without a word:
+    // the server said it was listening, was perfectly reachable, and answered
+    // nobody's search, with nothing on screen to connect the two.
+    let sock = match UdpSocket::bind(bind).await {
+        Ok(sock) => sock,
+        Err(e) => {
+            on_event(format!(
+                "cannot answer discovery on UDP port {disc_port}: {e}; \
+                 peers will have to be given this machine's address"
+            ));
+            return;
+        }
+    };
     let _ = sock.set_broadcast(true);
     let self_id = instance_id();
 
@@ -194,7 +297,16 @@ async fn answer_discovery(cancel: Cancel, data_port: u16, name: String) {
             _ = cancel.cancelled() => return,
             r = sock.recv_from(&mut buf) => r,
         };
-        let Ok((n, from)) = received else { return };
+        // The same goes for a socket that stops receiving: the server carries
+        // on taking connections, so the only sign of it is that searches
+        // suddenly go unanswered.
+        let (n, from) = match received {
+            Ok(got) => got,
+            Err(e) => {
+                on_event(format!("no longer answering discovery: {e}"));
+                return;
+            }
+        };
         if n < DISCOVERY_QUERY.len() || &buf[..DISCOVERY_QUERY.len()] != DISCOVERY_QUERY {
             continue;
         }
@@ -283,7 +395,11 @@ pub async fn run_test(
         .map_err(|_| format!("cannot reach {peer}: timed out"))?
         .map_err(|e| format!("cannot reach {peer}: {e}"))?;
 
-    let header = marshal_header(dir, duration.as_secs().min(u16::MAX as u64) as u16);
+    // Clamped once, here, before the length is both sent and kept: the header
+    // and this end's own deadline have to be the same number, or the far end
+    // stops while this one is still counting.
+    let duration = clamp_duration(duration);
+    let header = marshal_header(dir, duration.as_secs() as u16);
     conn.write_all(&header).await.map_err(|e| e.to_string())?;
 
     let counted = Arc::new(AtomicU64::new(0));
@@ -293,15 +409,12 @@ pub async fn run_test(
     let start = Instant::now();
     let mut moved = if dir == Direction::ToServer {
         let n = blast(cancel, &mut conn, deadline, &counted).await;
-        // The server reports what it actually received.
-        let mut reply = [0u8; 8];
-        if conn.read_exact(&mut reply).await.is_ok() {
-            let received = u64::from_be_bytes(reply);
-            if received > 0 {
-                return finish(ticker, received, start.elapsed());
-            }
+        // The server reports what it actually received, and this end's own
+        // count stands in when that report never arrives.
+        match read_tally(cancel, &mut conn, TALLY_WAIT).await {
+            Some(received) if received > 0 => received,
+            _ => n,
         }
-        n
     } else {
         drain(&mut conn, deadline, &counted).await
     };
@@ -371,13 +484,25 @@ async fn blast(
     let mut block = vec![0u8; BLOCK];
     rand::fill(&mut block[..]);
 
-    while Instant::now() < deadline && !cancel.is_cancelled() {
-        match conn.write(&block).await {
-            Ok(0) => break,
-            Ok(n) => {
+    // The write has to be able to end. A peer that stops reading without
+    // closing the connection, a laptop that went to sleep or wireless that
+    // dropped, fills the send window and then leaves the write nothing to
+    // complete and no error to fail on. Since the deadline and Stop are only
+    // consulted between writes, a bare write parked in the middle of the loop
+    // for as long as the kernel kept retransmitting: the test ran on well past
+    // the length it had announced, Stop did nothing to it at all, and the
+    // socket outlived the window that had given up on it. Racing each write
+    // against the time that is left, and against cancellation, is what makes
+    // those two checks reachable again. A write that loses the race has
+    // written nothing, so no byte this end counted is lost with it.
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match cancel.run(tokio::time::timeout(remaining, conn.write(&block))).await {
+            Some(Ok(Ok(n))) if n > 0 => {
                 counted.fetch_add(n as u64, Ordering::Relaxed);
             }
-            Err(_) => break,
+            // Out of time, stopped, or the far end is gone: either way there
+            // is no more sending to do.
+            _ => break,
         }
     }
     // Half-closing tells the far end the stream is finished without tearing
@@ -400,6 +525,263 @@ async fn drain(conn: &mut TcpStream, deadline: Instant, counted: &Arc<AtomicU64>
     counted.load(Ordering::Relaxed)
 }
 
+/// How long the client waits for the server's byte count once its upload is
+/// over. The far end stops draining two seconds past the same deadline and
+/// answers immediately after, so this is only a generous outer edge.
+const TALLY_WAIT: Duration = Duration::from_secs(10);
+
+/// Reads the count the server sends at the end of an upload, if it sends one.
+///
+/// The wait has to be able to end. A peer that goes away mid-test without
+/// closing the connection, a sleeping laptop or wireless that dropped, leaves
+/// this read nothing to receive and no error to fail on, and so does anything
+/// that happens to be listening on the port without being ntls. A bare read
+/// of the eight bytes then waited for a number that was never coming: the
+/// test never finished, Stop did nothing to it, and the task and its socket
+/// stayed alive behind a window that had long since given up on them.
+async fn read_tally(cancel: &Cancel, conn: &mut TcpStream, wait: Duration) -> Option<u64> {
+    let mut reply = [0u8; 8];
+    let read = tokio::time::timeout(wait, conn.read_exact(&mut reply));
+    let arrived = matches!(cancel.run(read).await, Some(Ok(Ok(_))));
+    if arrived { Some(u64::from_be_bytes(reply)) } else { None }
+}
+
 fn hostname() -> String {
     crate::sys::hostname()
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::{MAX_DURATION, MIN_DURATION, clamp_duration};
+    use std::time::Duration;
+
+    #[test]
+    fn a_length_the_wire_cannot_carry_becomes_one_it_can() {
+        // The greeting carries whole seconds, so half a second used to arrive
+        // as no seconds at all, and the far end quietly substituted ten.
+        assert_eq!(clamp_duration(Duration::from_millis(500)), MIN_DURATION);
+        assert_eq!(clamp_duration(Duration::from_millis(1)), MIN_DURATION);
+        assert_eq!(clamp_duration(Duration::ZERO), MIN_DURATION);
+        // And an afternoon's worth comes back as the longest test on offer.
+        assert_eq!(clamp_duration(Duration::from_secs(600)), MAX_DURATION);
+        assert_eq!(clamp_duration(Duration::from_secs(u64::MAX)), MAX_DURATION);
+    }
+
+    #[test]
+    fn an_ordinary_length_is_left_alone() {
+        assert_eq!(clamp_duration(Duration::from_secs(8)), Duration::from_secs(8));
+        assert_eq!(clamp_duration(MAX_DURATION), MAX_DURATION);
+        // Rounded to the nearest second rather than truncated towards zero.
+        assert_eq!(clamp_duration(Duration::from_millis(7600)), Duration::from_secs(8));
+    }
+}
+
+#[cfg(test)]
+mod tally_tests {
+    use super::{TALLY_WAIT, read_tally};
+    use crate::core::Cancel;
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap()
+    }
+
+    /// A connected pair on the loopback: the client end an upload would read
+    /// its tally on, and the server end, which the caller keeps alive so the
+    /// connection stays open however the far end behaves.
+    async fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a loopback listener");
+        let addr = listener.local_addr().expect("the port it was given");
+        let client = TcpStream::connect(addr).await.expect("a loopback connection");
+        let (server, _) = listener.accept().await.expect("the other end of it");
+        (client, server)
+    }
+
+    #[test]
+    fn a_peer_that_never_reports_its_count_ends_the_test_rather_than_holding_it_open() {
+        runtime().block_on(async {
+            // The far end is connected and silent, which is what a machine
+            // that dropped off the network mid-test looks like from here:
+            // nothing to read, and no error saying so either.
+            let (mut client, _far_end) = pair().await;
+            let cancel = Cancel::new();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_tally(&cancel, &mut client, Duration::from_millis(100)),
+            )
+            .await;
+            assert_eq!(outcome, Ok(None), "the wait for a tally has to end on its own");
+        });
+    }
+
+    #[test]
+    fn stopping_the_run_gives_up_on_the_count_without_waiting_it_out() {
+        runtime().block_on(async {
+            let (mut client, _far_end) = pair().await;
+            let cancel = Cancel::new();
+            cancel.cancel();
+            let began = Instant::now();
+            let tally = read_tally(&cancel, &mut client, Duration::from_secs(30)).await;
+            assert_eq!(tally, None);
+            assert!(
+                began.elapsed() < Duration::from_secs(1),
+                "Stop was answered only after {:?}",
+                began.elapsed()
+            );
+        });
+    }
+
+    #[test]
+    fn the_count_the_server_reports_is_the_one_the_test_believes() {
+        runtime().block_on(async {
+            let (mut client, mut far_end) = pair().await;
+            far_end.write_all(&7_654_321u64.to_be_bytes()).await.expect("the tally to be sent");
+            let cancel = Cancel::new();
+            assert_eq!(read_tally(&cancel, &mut client, TALLY_WAIT).await, Some(7_654_321));
+        });
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::{ACCEPT_GIVE_UP, accept_again};
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn a_connection_lost_before_it_could_be_accepted_never_stops_the_server() {
+        // A client that resets between the handshake and the accept costs that
+        // one connection and nothing else; the listening socket is untouched.
+        // It used to take the whole server down with it, however many well
+        // behaved peers were still waiting to be served.
+        let aborted = Error::from(ErrorKind::ConnectionAborted);
+        assert!(accept_again(&aborted, 1));
+        assert!(accept_again(&aborted, ACCEPT_GIVE_UP + 1));
+        assert!(accept_again(&Error::from(ErrorKind::ConnectionReset), ACCEPT_GIVE_UP + 1));
+        assert!(accept_again(&Error::from(ErrorKind::Interrupted), ACCEPT_GIVE_UP + 1));
+    }
+
+    #[test]
+    fn a_listener_that_fails_every_single_time_is_reported_rather_than_retried_forever() {
+        let broken = Error::from(ErrorKind::PermissionDenied);
+        assert!(accept_again(&broken, 1), "one odd failure is still worth another try");
+        assert!(!accept_again(&broken, ACCEPT_GIVE_UP));
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::{DEFAULT_PORT, answer_discovery};
+    use crate::core::Cancel;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap()
+    }
+
+    #[test]
+    fn a_taken_discovery_port_is_reported_instead_of_leaving_the_listener_unfindable() {
+        runtime().block_on(async {
+            // Something else already holds the port searches are answered on,
+            // which on a machine that has just restarted ntls is the previous
+            // process on its way out.
+            let squatter =
+                UdpSocket::bind("0.0.0.0:0").await.expect("a udp port of our own to sit on");
+            let taken = squatter.local_addr().expect("the port it was given").port();
+
+            let said: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let on_event: Arc<dyn Fn(String) + Send + Sync> = {
+                let said = said.clone();
+                Arc::new(move |msg| said.lock().expect("the event log").push(msg))
+            };
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                answer_discovery(Cancel::new(), DEFAULT_PORT, taken, "here".to_string(), on_event),
+            )
+            .await
+            .expect("the responder to give up rather than hang");
+
+            let said = said.lock().expect("the event log");
+            assert!(
+                said.iter().any(|m| m.contains(&taken.to_string())),
+                "the listener is undiscoverable and said nothing about it: {said:?}"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod blast_tests {
+    use super::blast;
+    use crate::core::Cancel;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::time::{Duration, Instant};
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap()
+    }
+
+    /// A connected pair on the loopback whose far end is never read from,
+    /// which is what a peer that stopped taking data mid-test looks like from
+    /// this end: the connection is open, the window fills, and nothing drains
+    /// it again.
+    async fn unread_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a loopback listener");
+        let addr = listener.local_addr().expect("the port it was given");
+        let client = TcpStream::connect(addr).await.expect("a loopback connection");
+        let (server, _) = listener.accept().await.expect("the other end of it");
+        (client, server)
+    }
+
+    #[test]
+    fn a_peer_that_stops_reading_does_not_hold_the_send_past_its_deadline() {
+        runtime().block_on(async {
+            let (mut client, _far_end) = unread_pair().await;
+            let cancel = Cancel::new();
+            let counted = Arc::new(AtomicU64::new(0));
+            let deadline = Instant::now() + Duration::from_millis(300);
+            let ended = tokio::time::timeout(
+                Duration::from_secs(10),
+                blast(&cancel, &mut client, deadline, &counted),
+            )
+            .await;
+            assert!(ended.is_ok(), "the send has to end when the test it belongs to does");
+        });
+    }
+
+    #[test]
+    fn stopping_the_run_ends_the_send_even_with_the_far_end_taking_nothing() {
+        runtime().block_on(async {
+            let (mut client, _far_end) = unread_pair().await;
+            let cancel = Cancel::new();
+            let counted = Arc::new(AtomicU64::new(0));
+            // Far enough off that only Stop can end this one.
+            let deadline = Instant::now() + Duration::from_secs(600);
+            {
+                let cancel = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    cancel.cancel();
+                });
+            }
+            let began = Instant::now();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                blast(&cancel, &mut client, deadline, &counted),
+            )
+            .await
+            .expect("Stop to be answered while a write is stuck");
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "Stop was answered only after {:?}",
+                began.elapsed()
+            );
+        });
+    }
 }

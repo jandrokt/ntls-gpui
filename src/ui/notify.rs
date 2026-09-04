@@ -74,6 +74,19 @@ impl Notice {
 /// pane's do.
 const MAX: usize = 200;
 
+/// How long past its deadline a notice still asks the window to repaint.
+///
+/// The window draws only when it is told to, and the frame that leaves a
+/// spent notice out of the corner can only be drawn after its deadline has
+/// passed. Asking for nothing the moment the deadline lands meant no such
+/// frame was ever asked for: the last one drawn still had the toast in it, so
+/// on a machine nobody was touching it sat in the corner until something
+/// unrelated happened to repaint the window. This is longer than the
+/// half-second tick that does the asking, so at least one frame arrives
+/// after the deadline, and short enough that a notice nobody is waiting on
+/// stops costing frames.
+const LINGER: Duration = Duration::from_secs(1);
+
 /// The notices raised so far, oldest first.
 #[derive(Default)]
 pub struct Notices {
@@ -145,7 +158,7 @@ impl Notices {
         let now = Instant::now();
         self.items
             .iter()
-            .any(|n| n.showing(now) && n.until.is_some())
+            .any(|n| !n.read && n.until.is_some_and(|until| until + LINGER > now))
     }
 
     pub fn get(&self, id: usize) -> Option<&Notice> {
@@ -223,6 +236,60 @@ mod tests {
         assert!(n.showing(8).is_empty(), "its time is up");
         assert_eq!(n.newest_first().count(), 1, "but it is still news");
         assert_eq!(n.unread(), 1);
+    }
+
+    #[test]
+    fn one_whose_time_is_up_still_asks_for_the_frame_that_takes_it_off_the_screen() {
+        let mut n = notices();
+        n.push(
+            Level::Good,
+            "Ping finished",
+            "",
+            None,
+            Some(Duration::from_millis(0)),
+        );
+        // Its time is up, so it is not drawn any more; but the frame that
+        // stops drawing it has still to be asked for, and the deadline is
+        // already behind us.
+        assert!(n.showing(8).is_empty());
+        assert!(n.any_fading(), "the corner still has to be redrawn once");
+    }
+
+    #[test]
+    fn one_long_past_its_deadline_stops_asking_for_frames() {
+        let mut n = notices();
+        n.push(
+            Level::Good,
+            "Ping finished",
+            "",
+            None,
+            Some(Duration::from_secs(6)),
+        );
+        let Some(long_ago) = n.items[0].at.checked_sub(LINGER * 4) else {
+            // The clock cannot go that far back, which is only true within a
+            // few seconds of boot. Nothing to say here then.
+            return;
+        };
+        n.items[0].until = Some(long_ago);
+        assert!(
+            !n.any_fading(),
+            "news nobody is waiting to see leave should not keep the window busy"
+        );
+    }
+
+    #[test]
+    fn one_that_never_expires_never_asks_for_frames() {
+        let mut n = notices();
+        n.push(
+            Level::Error,
+            "IP scan failed",
+            "no route to host",
+            None,
+            None,
+        );
+        // It stays until it is dismissed, and dismissing it repaints the
+        // window itself, so there is nothing to count down to.
+        assert!(!n.any_fading());
     }
 
     #[test]

@@ -875,19 +875,22 @@ impl App {
                 content[i] = content[i].max(wanted);
             }
         }
-        let widths = column_widths(&columns, &content, &[]);
+        let layout = diff_columns(&columns, &content);
+        // A row lays out the tool's own columns between the change pill and
+        // the target; those two have their width from the layout itself.
+        let widths: Vec<Option<Pixels>> =
+            layout.iter().skip(1).take(columns.len()).map(|(_, w)| *w).collect();
         let summary = diff.summary();
 
-        let headers: Vec<AnyElement> = columns
+        let headers: Vec<AnyElement> = layout
             .iter()
-            .zip(&widths)
-            .map(|(column, width)| {
+            .map(|(title, width)| {
                 let cell = div()
                     .px(px(7.))
                     .text_caps()
                     .text_color(theme.faint)
                     .whitespace_nowrap()
-                    .child(column.title);
+                    .child(*title);
                 match width {
                     Some(w) => cell.w(*w).flex_shrink_0().into_any_element(),
                     None => cell.flex_1().min_w_0().into_any_element(),
@@ -972,15 +975,6 @@ impl App {
                         .px(px(GUTTER))
                         .pb(px(6.))
                         .flex_shrink_0()
-                        .child(
-                            div()
-                                .w(px(76.))
-                                .flex_shrink_0()
-                                .px(px(7.))
-                                .text_caps()
-                                .text_color(theme.faint)
-                                .child("CHANGE"),
-                        )
                         .children(headers),
                 )
                 .child(
@@ -1373,6 +1367,29 @@ fn progress_cell(raw: &str, fill: gpui::Hsla, theme: &Theme) -> gpui::Div {
         )
 }
 
+/// The width of the change pill's column, and of the target the two runs
+/// were matched on at the far end of the row.
+const CHANGE_WIDTH: Pixels = px(76.);
+const TARGET_WIDTH: Pixels = px(180.);
+
+/// Every column of a comparison, left to right: what became of the target,
+/// the tool's own columns, and the target itself.
+///
+/// The heading row and the rows below it are laid out from this one list.
+/// The target used to be a cell no heading knew about, and a cell the heading
+/// row does not have takes its width out of the flexible column's share, so
+/// every column a tool declares after its flexible one — a sweep's SEEN,
+/// after VENDOR — sat well to the left of its own heading, and by a
+/// different amount on each row, the target being as wide as whatever
+/// address was in it.
+fn diff_columns(columns: &[Column], content: &[usize]) -> Vec<(&'static str, Option<Pixels>)> {
+    let mut layout = Vec::with_capacity(columns.len() + 2);
+    layout.push(("CHANGE", Some(CHANGE_WIDTH)));
+    layout.extend(columns.iter().map(|c| c.title).zip(column_widths(columns, content, &[])));
+    layout.push(("TARGET", Some(TARGET_WIDTH)));
+    layout
+}
+
 /// One line of a comparison: what became of a target, and what it says now.
 fn diff_row(
     index: usize,
@@ -1424,17 +1441,20 @@ fn diff_row(
         .rounded(px(5.))
         .child(
             div()
-                .w(px(76.))
+                .w(CHANGE_WIDTH)
                 .flex_shrink_0()
                 .px(px(7.))
                 .child(pill(entry.change.label(), colour, theme.status_soft(entry.change.status()))),
         )
         .children(cells)
         // The target is what the two runs were matched on, so it is worth
-        // stating for a row whose first cell is something else.
+        // stating for a row whose first cell is something else. It takes the
+        // same width on every row, headings included: sized to whatever
+        // address it held, it moved the columns beside it around as you read
+        // down the table.
         .child(
             div()
-                .max_w(px(180.))
+                .w(TARGET_WIDTH)
                 .flex_shrink_0()
                 .px(px(7.))
                 .mono()
@@ -1650,5 +1670,40 @@ fn selected_desc(field: &crate::core::Field, job: Option<&Job>) -> String {
     match field.options.iter().find(|o| o.value == current) {
         Some(o) if !o.desc.is_empty() => format!("{}. {}", field.help, o.desc),
         _ => field.help.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::col;
+
+    #[test]
+    fn every_column_a_compared_row_lays_out_is_named_in_the_heading_row() {
+        // A sweep declares a fixed column after its flexible one, which is
+        // the arrangement the unnamed target column showed up in: the
+        // target's width came out of VENDOR's share on the rows but not in
+        // the heading, so SEEN and the word SEEN were nowhere near each
+        // other.
+        let columns = vec![col("HOST", 16), col("VENDOR", 0), col("SEEN", 12)];
+        let layout = diff_columns(&columns, &[0, 0, 0]);
+
+        assert_eq!(
+            layout.iter().map(|(title, _)| *title).collect::<Vec<_>>(),
+            vec!["CHANGE", "HOST", "VENDOR", "SEEN", "TARGET"]
+        );
+    }
+
+    #[test]
+    fn the_two_columns_a_comparison_adds_have_a_fixed_width() {
+        // Only the tool's own flexible column may take up the slack. Either
+        // of these left to size itself to its contents would divide the
+        // leftover space differently on every row.
+        let columns = vec![col("HOST", 16), col("BANNER", 0)];
+        let layout = diff_columns(&columns, &[]);
+
+        assert_eq!(layout.first().map(|(_, w)| *w), Some(Some(CHANGE_WIDTH)));
+        assert_eq!(layout.last().map(|(_, w)| *w), Some(Some(TARGET_WIDTH)));
+        assert_eq!(layout.iter().filter(|(_, w)| w.is_none()).count(), 1);
     }
 }

@@ -132,9 +132,18 @@ fn list_item(line: &str) -> Option<(Option<String>, &str)> {
 
 /// Splits a line into its emphasised, code and linked runs.
 pub fn spans(line: &str) -> Vec<Span> {
-    let chars: Vec<char> = line.chars().collect();
     let mut out: Vec<Span> = Vec::new();
     let mut plain = String::new();
+    // A byte offset into `line`, which is the unit `find` answers in.
+    //
+    // This used to be an index into the line's characters while every `find`
+    // below returned a byte offset, and the two were added together. So every
+    // character wider than one byte inside a code span, an emphasis run or a
+    // link pushed the position too far and quietly ate the text after it:
+    // "in the *café* last night" rendered as "in the cafélast night". The
+    // document pipeline writes such characters itself, an unrepresentable
+    // figure coming out as an em dash, so a note need not contain an accent
+    // to lose words this way.
     let mut at = 0usize;
 
     let push = |plain: &mut String, out: &mut Vec<Span>| {
@@ -144,8 +153,8 @@ pub fn spans(line: &str) -> Vec<Span> {
         }
     };
 
-    while at < chars.len() {
-        let rest: String = chars[at..].iter().collect();
+    while at < line.len() {
+        let rest = &line[at..];
 
         if rest.starts_with('`')
             && let Some(end) = rest[1..].find('`')
@@ -156,6 +165,7 @@ pub fn spans(line: &str) -> Vec<Span> {
             continue;
         }
 
+        let mut emphasised = false;
         for (mark, bold) in [("**", true), ("__", true), ("*", false), ("_", false)] {
             if rest.starts_with(mark)
                 && let Some(end) = rest[mark.len()..].find(mark)
@@ -165,13 +175,17 @@ pub fn spans(line: &str) -> Vec<Span> {
                 let inner = &rest[mark.len()..mark.len() + end];
                 out.push(Span { bold, italic: !bold, ..Span::plain(inner) });
                 at += mark.len() * 2 + end;
+                emphasised = true;
                 break;
             }
         }
-        if at >= chars.len() {
-            break;
+        // The line is started over from the new position rather than falling
+        // through to the link test and then taking one character as plain.
+        // Falling through meant a code span or a second emphasis run standing
+        // directly after an emphasis run had its marks drawn as literal text.
+        if emphasised {
+            continue;
         }
-        let rest: String = chars[at..].iter().collect();
 
         // `[text](target)`
         if rest.starts_with('[')
@@ -186,8 +200,9 @@ pub fn spans(line: &str) -> Vec<Span> {
             continue;
         }
 
-        plain.push(chars[at]);
-        at += 1;
+        let ch = rest.chars().next().unwrap_or_default();
+        plain.push(ch);
+        at += ch.len_utf8();
     }
 
     push(&mut plain, &mut out);
@@ -199,6 +214,32 @@ pub fn spans(line: &str) -> Vec<Span> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_character_wider_than_a_byte_does_not_eat_the_text_after_it() {
+        // The position was counted in characters and advanced in bytes, so
+        // anything accented inside markup swallowed what followed it.
+        let flat = |line: &str| {
+            super::spans(line).iter().map(|s| s.text.clone()).collect::<Vec<_>>().join("")
+        };
+        assert_eq!(flat("Latency was **fine** in the *café* last night"),
+                   "Latency was fine in the café last night");
+        assert_eq!(flat("**—** and the rest"), "— and the rest");
+        assert_eq!(flat("a `café` b"), "a café b");
+        assert_eq!(flat("see [café](https://x/café) now"), "see café now");
+    }
+
+    #[test]
+    fn markup_directly_after_markup_is_still_markup() {
+        // After an emphasis run the reader used to take the next character as
+        // plain text without looking, so a code span touching one had its
+        // backticks drawn.
+        let spans = super::spans("**a**`b`");
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "b"]);
+        assert!(spans[0].bold);
+        assert!(spans[1].code);
+    }
     use super::*;
 
     fn text_of(spans: &[Span]) -> String {

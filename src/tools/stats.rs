@@ -109,14 +109,37 @@ pub fn elapsed(d: Duration) -> String {
     } else if secs < 60.0 {
         format!("{secs:.1}s")
     } else {
-        format!("{}m{:02}s", (secs / 60.0) as u64, (secs % 60.0).round() as u64)
+        // Rounding the seconds apart from the minutes let the two disagree: at
+        // 119.7s the minute count truncated to 1 while the remainder rounded up
+        // to 60, and a running scan showed "1m60s" for the last half second of
+        // every minute. Round once, then split the whole seconds.
+        let whole = secs.round() as u64;
+        format!("{}m{:02}s", whole / 60, whole % 60)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ms, parse_ms};
+    use super::{elapsed, ms, parse_ms};
     use std::time::Duration;
+
+    #[test]
+    fn an_elapsed_time_past_a_minute_never_shows_sixty_seconds() {
+        // A scan's progress line walks through every fraction of a second, so
+        // the half second before each minute rolls over got rendered too.
+        for tenths in 600..1_800u64 {
+            let text = elapsed(Duration::from_millis(tenths * 100));
+            let seconds = text
+                .split('m')
+                .nth(1)
+                .and_then(|s| s.strip_suffix('s'))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("{text} is not m/s"));
+            assert!(seconds < 60, "{:?} rendered as {text}", tenths as f64 / 10.0);
+        }
+        assert_eq!(elapsed(Duration::from_secs_f64(119.7)), "2m00s");
+        assert_eq!(elapsed(Duration::from_secs(90)), "1m30s");
+    }
 
     #[test]
     fn a_round_trip_reads_back_the_way_it_was_written() {

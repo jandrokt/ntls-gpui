@@ -1,6 +1,8 @@
 //! Working out what to call a file, and where to put it.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use percent_encoding::percent_decode_str;
 
@@ -110,26 +112,78 @@ pub fn is_markup(mime: &str) -> bool {
     matches!(mime.as_str(), "text/html" | "application/xhtml+xml" | "text/xml" | "application/xml" | "")
 }
 
-/// A path in `dir` that nothing occupies, by adding ` (2)`, ` (3)` and so on
-/// before the extension.
-pub fn unused(dir: &Path, name: &str) -> PathBuf {
-    let direct = dir.join(name);
-    if !direct.exists() {
-        return direct;
+/// The destinations transfers in this process have already taken.
+///
+/// Asking the filesystem whether a name is free cannot decide this on its
+/// own. A transfer's file does not appear under its final name until the
+/// rename at the very end, so for as long as a download runs the name it is
+/// going to take still looks free. Two links whose names agree, whether that
+/// is the same address pasted twice, two hosts both serving `report.pdf`, or
+/// two nameless links that both fall back to the same word, were handed the
+/// same destination, shared one part file and one ledger, and wrote over each
+/// other's bytes, with whichever finished first announced as a success.
+static CLAIMED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// A destination held for one transfer. The part file and the ledger hang off
+/// this path by suffix, so holding it holds all three.
+pub struct Claim {
+    path: PathBuf,
+}
+
+impl Claim {
+    /// Where the finished file goes.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
-    let path = Path::new(name);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
-    let ext = path.extension().and_then(|e| e.to_str());
-    for n in 2..10_000 {
-        let candidate = match ext {
-            Some(e) => dir.join(format!("{stem} ({n}).{e}")),
-            None => dir.join(format!("{stem} ({n})")),
-        };
-        if !candidate.exists() {
-            return candidate;
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        // A guard rather than a pair of calls, because the name has to come
+        // back whichever way the transfer ended: delivered, failed part way
+        // through, or cancelled. A poisoned lock is ignored rather than
+        // unwrapped, since this runs while unwinding and a second panic there
+        // would end the process.
+        if let Ok(mut held) = CLAIMED.lock() {
+            held.remove(&self.path);
         }
     }
-    direct
+}
+
+/// Reserves a path in `dir` for `name`, adding ` (2)`, ` (3)` and so on before
+/// the extension until it reaches one that nothing occupies and no other
+/// transfer in this process is already using. The name is held until the
+/// returned [`Claim`] is dropped.
+///
+/// `overwrite` says the user asked to replace what is on disk, so a file
+/// already sitting there is not in the way. A transfer running beside this one
+/// still is: two of them sharing a part file corrupt it.
+pub fn claim(dir: &Path, name: &str, overwrite: bool) -> Claim {
+    let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let ext = Path::new(name).extension().and_then(|e| e.to_str());
+    // Testing and taking under one lock is the whole point. Checking first and
+    // reserving afterwards is the bug this replaces.
+    let mut held = CLAIMED.lock().expect("claims");
+    for n in 1..10_000u32 {
+        let candidate = match (n, ext) {
+            (1, _) => dir.join(name),
+            (_, Some(e)) => dir.join(format!("{stem} ({n}).{e}")),
+            (_, None) => dir.join(format!("{stem} ({n})")),
+        };
+        // A part file left behind by an interrupted transfer does not make a
+        // name occupied. It is exactly what a resumed transfer picks up, so
+        // only the finished file counts.
+        if held.contains(&candidate) || (!overwrite && candidate.exists()) {
+            continue;
+        }
+        held.insert(candidate.clone());
+        return Claim { path: candidate };
+    }
+    // Ten thousand files of one name in one folder deserves no failure path
+    // that it did not have before: the plain name is where it goes.
+    let path = dir.join(name);
+    held.insert(path.clone());
+    Claim { path }
 }
 
 /// Where downloads go unless the user says otherwise.
@@ -243,6 +297,51 @@ mod tests {
     fn a_url_names_a_file_by_its_last_segment() {
         assert_eq!(from_url("https://h.example/a/b/my%20file.zip").as_deref(), Some("my file.zip"));
         assert_eq!(from_url("https://h.example/").as_deref(), None);
+    }
+
+    #[test]
+    fn two_transfers_asking_for_the_same_name_at_once_are_given_separate_files() {
+        // While a transfer runs, its final name is not on disk yet, so a name
+        // checked only against the filesystem looks free to a second
+        // transfer. Both then wrote into one part file, and one was reported
+        // as finished while the other overwrote it.
+        let dir = std::env::temp_dir().join("ntls-claim-same-name");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("the directory");
+
+        let first = super::claim(&dir, "report.pdf", false);
+        let second = super::claim(&dir, "report.pdf", false);
+        assert_ne!(first.path(), second.path());
+        assert_eq!(first.path(), dir.join("report.pdf"));
+        assert_eq!(second.path(), dir.join("report (2).pdf"));
+
+        // A name comes back the moment its transfer ends, however it ended.
+        let taken = first.path().to_path_buf();
+        drop(first);
+        let third = super::claim(&dir, "report.pdf", false);
+        assert_eq!(third.path(), taken);
+
+        drop(second);
+        drop(third);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_already_there_is_stepped_over_unless_replacing_it_was_asked_for() {
+        let dir = std::env::temp_dir().join("ntls-claim-existing");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("the directory");
+        std::fs::write(dir.join("report.pdf"), b"old").expect("a file");
+
+        let stepped = super::claim(&dir, "report.pdf", false);
+        assert_eq!(stepped.path(), dir.join("report (2).pdf"));
+        drop(stepped);
+
+        // Asked to replace it, the name on disk is not in the way.
+        let over = super::claim(&dir, "report.pdf", true);
+        assert_eq!(over.path(), dir.join("report.pdf"));
+        drop(over);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

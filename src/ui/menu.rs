@@ -185,19 +185,51 @@ pub fn for_workspace(index: usize, tag: Tag, closable: bool) -> Vec<Item> {
     items
 }
 
-/// The menu for a tool, wherever it is clicked: the side bar or its tab.
+/// Which way a thing can be moved in the side bar, if either.
 ///
-/// `others` are the runs of the same tool it could be read against, and
-/// `comparing` says whether it already is.
-pub fn for_job(
-    id: usize,
-    tag: Tag,
-    running: bool,
-    favourite: bool,
-    open: bool,
-    comparable: bool,
-    comparing: bool,
-) -> Vec<Item> {
+/// Asked before the menu is built so that a move which would not move
+/// anything is left out of it. An item that does nothing when it is chosen is
+/// worse than no item at all: it says the thing is possible.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CanMove {
+    pub up: bool,
+    pub down: bool,
+}
+
+/// What a tool's menu needs to know about the tool.
+///
+/// A struct rather than a row of booleans. There were seven of them and
+/// nothing at the call site said which was which.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JobMenu {
+    pub id: usize,
+    pub tag: Tag,
+    pub running: bool,
+    pub favourite: bool,
+    /// Whether it has a tab in the editor.
+    pub open: bool,
+    /// Whether there is another run of the same tool to read this one
+    /// against, and whether it already is being read against one.
+    pub comparable: bool,
+    pub comparing: bool,
+    pub can_move: CanMove,
+}
+
+/// The move items, and only the ones that would move something.
+fn move_items(can: CanMove, up: Act, down: Act) -> Vec<Item> {
+    let mut items = Vec::with_capacity(2);
+    if can.up {
+        items.push(Item::choice("Move up", "chevron-up", up));
+    }
+    if can.down {
+        items.push(Item::choice("Move down", "chevron-down", down));
+    }
+    items
+}
+
+/// The menu for a tool, wherever it is clicked: the side bar or its tab.
+pub fn for_job(job: JobMenu) -> Vec<Item> {
+    let JobMenu { id, tag, running, favourite, open, comparable, comparing, can_move } = job;
     let mut items = vec![
         if running {
             Item::choice("Stop", "stop", Act::StopJob(id))
@@ -212,8 +244,9 @@ pub fn for_job(
         Item::Separator,
         Item::Colours { current: tag, act: Act::TagJob, subject: id },
         Item::Separator,
-        Item::choice("Move up", "chevron-up", Act::MoveJobUp(id)),
-        Item::choice("Move down", "chevron-down", Act::MoveJobDown(id)),
+    ];
+    items.extend(move_items(can_move, Act::MoveJobUp(id), Act::MoveJobDown(id)));
+    items.extend([
         Item::choice("Move to folder\u{2026}", "folder-open", Act::AskMove(id)),
         Item::Separator,
         Item::choice("Duplicate", "plus", Act::DuplicateJob(id)),
@@ -221,7 +254,7 @@ pub fn for_job(
         Item::choice("Export as CSV\u{2026}", "download", Act::ExportJob(id)),
         Item::choice("Reveal in file manager", "link", Act::RevealJob(id)),
         Item::Separator,
-    ];
+    ]);
     // Comparing is only offered where there is something to compare with:
     // another run of the same tool, in the same workspace. Which one is asked
     // in a searchable list instead of in a submenu that a workspace of thirty
@@ -245,8 +278,8 @@ pub fn for_job(
 }
 
 /// The menu for a document.
-pub fn for_doc(id: usize, tag: Tag, favourite: bool) -> Vec<Item> {
-    vec![
+pub fn for_doc(id: usize, tag: Tag, favourite: bool, can_move: CanMove) -> Vec<Item> {
+    let mut items = vec![
         Item::choice("Open", "note", Act::OpenDoc(id)),
         Item::choice("Rename\u{2026}", "gear", Act::RenameDoc(id)),
         Item::plain(
@@ -257,8 +290,9 @@ pub fn for_doc(id: usize, tag: Tag, favourite: bool) -> Vec<Item> {
         Item::Colours { current: tag, act: Act::TagDoc, subject: id },
         Item::Separator,
         Item::choice("Open in another editor\u{2026}", "link", Act::EditDoc(id)),
-        Item::choice("Move up", "chevron-up", Act::MoveDocUp(id)),
-        Item::choice("Move down", "chevron-down", Act::MoveDocDown(id)),
+    ];
+    items.extend(move_items(can_move, Act::MoveDocUp(id), Act::MoveDocDown(id)));
+    items.extend([
         Item::choice("Move to folder\u{2026}", "folder-open", Act::AskMoveDoc(id)),
         Item::choice("Reveal in file manager", "link", Act::RevealDoc(id)),
         Item::Separator,
@@ -266,12 +300,19 @@ pub fn for_doc(id: usize, tag: Tag, favourite: bool) -> Vec<Item> {
         // The same rule as a tool: this moves the file into the workspace's
         // own `.closed` folder and does not destroy it.
         Item::danger("Delete document", "close", Act::DeleteDoc(id)),
-    ]
+    ]);
+    items
 }
 
 /// The menu for a workflow.
-pub fn for_flow(id: usize, running: bool, tag: Tag, favourite: bool) -> Vec<Item> {
-    vec![
+pub fn for_flow(
+    id: usize,
+    running: bool,
+    tag: Tag,
+    favourite: bool,
+    can_move: CanMove,
+) -> Vec<Item> {
+    let mut items = vec![
         if running {
             Item::choice("Stop", "stop", Act::StopFlow(id))
         } else {
@@ -287,14 +328,16 @@ pub fn for_flow(id: usize, running: bool, tag: Tag, favourite: bool) -> Vec<Item
         Item::Colours { current: tag, act: Act::TagFlow, subject: id },
         Item::Separator,
         Item::choice("Open in another editor\u{2026}", "link", Act::EditFlow(id)),
-        Item::choice("Move up", "chevron-up", Act::MoveFlowUp(id)),
-        Item::choice("Move down", "chevron-down", Act::MoveFlowDown(id)),
+    ];
+    items.extend(move_items(can_move, Act::MoveFlowUp(id), Act::MoveFlowDown(id)));
+    items.extend([
         Item::choice("Move to folder\u{2026}", "folder-open", Act::AskMoveFlow(id)),
         Item::choice("Reveal in file manager", "link", Act::RevealFlow(id)),
         Item::Separator,
         Item::choice("Close tab", "close", Act::CloseFlowTab(id)),
         Item::danger("Delete workflow", "close", Act::DeleteFlow(id)),
-    ]
+    ]);
+    items
 }
 
 /// The menu for one step of a workflow, wherever it is clicked.
@@ -476,17 +519,17 @@ mod tests {
 
     #[test]
     fn a_running_tool_offers_stop_and_a_stopped_one_offers_run() {
-        let running = for_job(1, Tag::None, true, false, true, false, false);
+        let running = for_job(JobMenu { id: 1, running: true, open: true, ..Default::default() });
         assert!(matches!(&running[0], Item::Choice { act: Act::StopJob(1), .. }));
 
-        let idle = for_job(1, Tag::None, false, false, true, false, false);
+        let idle = for_job(JobMenu { id: 1, open: true, ..Default::default() });
         assert!(matches!(&idle[0], Item::Choice { act: Act::RunJob(1), .. }));
     }
 
     #[test]
     fn closing_a_tab_and_removing_a_tool_are_offered_separately() {
         // Only one of them touches the file, so only one of them is red.
-        let open = for_job(1, Tag::None, false, false, true, false, false);
+        let open = for_job(JobMenu { id: 1, open: true, ..Default::default() });
         assert!(open.iter().any(|i| matches!(i, Item::Choice { act: Act::CloseTab(1), .. })));
         assert!(
             open.iter()
@@ -494,7 +537,7 @@ mod tests {
         );
 
         // A tool with no tab has no tab to close.
-        let shut = for_job(1, Tag::None, false, false, false, false, false);
+        let shut = for_job(JobMenu { id: 1, ..Default::default() });
         assert!(!shut.iter().any(|i| matches!(i, Item::Choice { act: Act::CloseTab(_), .. })));
     }
 
@@ -504,20 +547,20 @@ mod tests {
         // pointer or upwards from it.
         let short = Menu::new(Default::default(), vec![Item::plain("One", Act::NewWorkspace)]);
         let long =
-            Menu::new(Default::default(), for_job(1, Tag::None, false, false, true, false, false));
+            Menu::new(Default::default(), for_job(JobMenu { id: 1, open: true, ..Default::default() }));
         assert!(long.height() > short.height());
     }
 
     #[test]
     fn comparing_is_offered_only_where_there_is_something_to_compare_with() {
-        let alone = for_job(1, Tag::None, false, false, true, false, false);
+        let alone = for_job(JobMenu { id: 1, open: true, ..Default::default() });
         assert!(!alone.iter().any(|i| matches!(i, Item::Choice { act: Act::AskCompare(_), .. })));
 
-        let paired = for_job(1, Tag::None, false, false, true, true, false);
+        let paired = for_job(JobMenu { id: 1, open: true, comparable: true, ..Default::default() });
         assert!(paired.iter().any(|i| matches!(i, Item::Choice { act: Act::AskCompare(1), .. })));
 
         // While comparing, the offer is to stop.
-        let comparing = for_job(1, Tag::None, false, false, true, true, true);
+        let comparing = for_job(JobMenu { id: 1, open: true, comparable: true, comparing: true, ..Default::default() });
         assert!(
             comparing.iter().any(|i| matches!(i, Item::Choice { act: Act::StopComparing(1), .. }))
         );
@@ -527,10 +570,55 @@ mod tests {
     }
 
     #[test]
+    fn a_move_that_would_not_move_anything_is_not_offered() {
+        // A menu item that does nothing when it is chosen is worse than no
+        // item: it says the thing is possible. The top of a group has nowhere
+        // above it, and neither has the first unstarred tool in one, because
+        // the row above that is the last starred one and the favourites sort
+        // would put the pair straight back.
+        let up = |items: &[Item]| {
+            items.iter().any(|i| matches!(i, Item::Choice { act: Act::MoveJobUp(_), .. }))
+        };
+        let down = |items: &[Item]| {
+            items.iter().any(|i| matches!(i, Item::Choice { act: Act::MoveJobDown(_), .. }))
+        };
+
+        let stuck = for_job(JobMenu { id: 1, open: true, ..Default::default() });
+        assert!(!up(&stuck) && !down(&stuck), "neither way is offered");
+
+        let both = for_job(JobMenu {
+            id: 1,
+            open: true,
+            can_move: CanMove { up: true, down: true },
+            ..Default::default()
+        });
+        assert!(up(&both) && down(&both));
+
+        let only_down = for_job(JobMenu {
+            id: 1,
+            open: true,
+            can_move: CanMove { up: false, down: true },
+            ..Default::default()
+        });
+        assert!(!up(&only_down) && down(&only_down));
+
+        // And the same for a document and a workflow, whose stars live in the
+        // workspace's marks rather than on the thing itself.
+        let doc = for_doc(1, Tag::None, false, CanMove::default());
+        assert!(!doc.iter().any(|i| matches!(i, Item::Choice { act: Act::MoveDocUp(_), .. })));
+        let flow = for_flow(1, false, Tag::None, false, CanMove { up: true, down: false });
+        assert!(flow.iter().any(|i| matches!(i, Item::Choice { act: Act::MoveFlowUp(_), .. })));
+        assert!(!flow.iter().any(|i| matches!(i, Item::Choice { act: Act::MoveFlowDown(_), .. })));
+
+        // Taking the items out does not disturb what sits around them.
+        assert!(stuck.iter().any(|i| matches!(i, Item::Choice { act: Act::AskMove(1), .. })));
+    }
+
+    #[test]
     fn a_tool_can_be_copied_and_the_copy_started_in_one_go() {
         // Re-running a scan without losing the one already there is two
         // clicks otherwise, and the second is easy to forget.
-        let items = for_job(1, Tag::None, false, false, true, false, false);
+        let items = for_job(JobMenu { id: 1, open: true, ..Default::default() });
         let at = |want: &Act| items.iter().position(|i| matches!(i, Item::Choice { act, .. } if act == want));
         let copy = at(&Act::DuplicateJob(1)).expect("duplicate");
         let copy_run = at(&Act::DuplicateRunJob(1)).expect("duplicate and run");

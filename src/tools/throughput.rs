@@ -177,7 +177,19 @@ async fn measure(
     src: Option<std::net::Ipv4Addr>,
 ) -> anyhow::Result<()> {
     let mut peer_spec = p.str("peer");
-    let duration = p.dur("duration", Duration::from_secs(8));
+    // The duration field takes anything that parses, including "500ms" and
+    // "10m", but a test only exists in whole seconds between one and three
+    // hundred. Clamping before announcing a length means the line printed is
+    // the test that runs, rather than one the other machine quietly rewrites.
+    let requested = p.dur("duration", Duration::from_secs(8));
+    let duration = lanspeed::clamp_duration(requested);
+    if duration != requested {
+        emit.warn(format!(
+            "{} is not a length this test can run; using {}",
+            elapsed(requested),
+            elapsed(duration)
+        ));
+    }
 
     if peer_spec.is_empty() || peer_spec.eq_ignore_ascii_case(DISCOVER) {
         let discovery = lanspeed::discover_peers(

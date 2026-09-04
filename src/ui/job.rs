@@ -383,18 +383,8 @@ impl Job {
             }
             Event::Upsert(row) => {
                 self.widen(&row);
-                // What counts as the same row is the row's own idea of its
-                // identity: its target, unless it says otherwise.
-                match self.rows.iter_mut().find(|r| r.identity() == row.identity()) {
-                    // Rewriting a row in place must not disturb the order the
-                    // table is sorted or filtered into, so the view is only
-                    // marked stale when a row is genuinely new.
-                    Some(existing) => *existing = row,
-                    None => {
-                        let at = place(&self.rows, &row.target);
-                        self.rows.insert(at, row);
-                        self.view_dirty = true;
-                    }
+                if upsert(&mut self.rows, row) {
+                    self.view_dirty = true;
                 }
             }
             Event::Stats(stats) => self.stats = stats,
@@ -612,23 +602,122 @@ fn place(rows: &[Row], target: &str) -> usize {
     }
 }
 
+/// Folds an upserted row into the table, saying whether the filtered, sorted
+/// view has to be built again.
+///
+/// What counts as the same row is the row's own idea of its identity: its
+/// target, unless it says otherwise.
+///
+/// A rewrite in place counts as much as an arrival. The view is built from the
+/// cells and the target and from nothing else, so rewriting either of them
+/// changes which rows belong in it and what order they come in; treating a
+/// rewrite as invisible left a filtered table showing rows whose new contents
+/// no longer match, counting them in the header, and never showing the ones
+/// that have only just come to match. A transfer that failed under a "failed"
+/// filter never appeared, and a sweep's closing pass that dates every row it
+/// did not hear from this time reached nobody who had typed in the box, because
+/// in both of those tables nothing else ever happens to make the view stale.
+fn upsert(rows: &mut Vec<Row>, row: Row) -> bool {
+    match rows.iter_mut().find(|r| r.identity() == row.identity()) {
+        Some(existing) => {
+            let changed = existing.cells != row.cells || existing.target != row.target;
+            // The note on a row belongs to whoever wrote it, not to the tool.
+            // Every upsert arrives with none, so replacing the row wholesale
+            // threw away what somebody had typed about that host the moment
+            // the scan reported it again.
+            let note = existing.note.take();
+            *existing = row;
+            if existing.note.is_none() {
+                existing.note = note;
+            }
+            changed
+        }
+        None => {
+            let at = place(rows, &row.target);
+            rows.insert(at, row);
+            true
+        }
+    }
+}
+
 fn cell(rows: &[Row], index: usize, column: usize) -> &str {
     rows.get(index).and_then(|r| r.cells.get(column)).map(String::as_str).unwrap_or("")
 }
 
-/// Compares two cells the way a person reads them: numbers numerically, IP
-/// addresses by their parts, everything else as text. Sorting "10" after "9"
-/// is the whole point of a sortable port column.
+/// Where one cell sits in the order.
+///
+/// Worked out once for the cell, and not afresh for each pair it is compared
+/// with. That distinction is the whole point: choosing how to compare from
+/// what the two cells happened to be meant the answer depended on the pair,
+/// and an order that depends on the pair is not an order at all. A DNS column
+/// holding `5 alt1.aspmx.l.google.com.`, `10 mail.example.com.` and
+/// `3.4.5.6` gave the first below the second by their figures, the second
+/// below the third as text, and the third below the first as text. Sorting a
+/// cycle is what the standard library aborts the program over, so one click
+/// on that column header took the window and every run in it.
+enum Key {
+    /// A cell that begins with a figure, by that figure.
+    Num(f64),
+    /// An address, by its parts.
+    Ip(std::net::IpAddr),
+    /// Anything else, as text.
+    Text(String),
+}
+
+impl Key {
+    /// Which kind of cell this is, so that unlike kinds still have an order.
+    fn rank(&self) -> u8 {
+        match self {
+            Key::Num(_) => 0,
+            Key::Ip(_) => 1,
+            Key::Text(_) => 2,
+        }
+    }
+}
+
+impl Ord for Key {
+    fn cmp(&self, other: &Key) -> std::cmp::Ordering {
+        match (self, other) {
+            // `total_cmp` and not `partial_cmp`: it is an order over every
+            // `f64` there is, which is what makes this whole thing total.
+            (Key::Num(x), Key::Num(y)) => x.total_cmp(y),
+            (Key::Ip(x), Key::Ip(y)) => x.cmp(y),
+            (Key::Text(x), Key::Text(y)) => x.cmp(y),
+            _ => self.rank().cmp(&other.rank()),
+        }
+    }
+}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, other: &Key) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Key) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for Key {}
+
+/// Reads a cell the way a person reads it: a number as a number, an address
+/// by its parts, anything else as text.
+fn sort_key(s: &str) -> Key {
+    if let Some(n) = leading_number(s) {
+        return Key::Num(n);
+    }
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return Key::Ip(ip);
+    }
+    Key::Text(s.to_lowercase())
+}
+
+/// Compares two cells. Sorting "10" after "9" is the whole point of a
+/// sortable port column.
 fn compare(a: &str, b: &str) -> std::cmp::Ordering {
-    if let (Some(x), Some(y)) = (leading_number(a), leading_number(b))
-        && x != y
-    {
-        return x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal);
-    }
-    if let (Ok(x), Ok(y)) = (a.parse::<std::net::IpAddr>(), b.parse::<std::net::IpAddr>()) {
-        return x.cmp(&y);
-    }
-    a.to_lowercase().cmp(&b.to_lowercase())
+    sort_key(a).cmp(&sort_key(b))
 }
 
 /// The number a cell starts with, so "18.12 ms" and "443/tcp" both sort by
@@ -651,10 +740,85 @@ fn leading_number(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Row, place, shorten};
+    use super::{Row, compare, place, shorten, upsert};
+
+    #[test]
+    fn a_column_of_mixed_cells_has_an_order_and_does_not_abort() {
+        // These three used to make a cycle: the first below the second by
+        // their figures, the second below the third as text, the third below
+        // the first as text. Sorting a cycle is what the standard library
+        // ends the program over.
+        let mut values = vec![
+            "5 alt1.aspmx.l.google.com.",
+            "3.4.5.6",
+            "10 mail.example.com.",
+            "1.2.3.4",
+            "alpha",
+            "",
+            "-",
+            "9",
+            "10",
+            "192.168.1.20",
+        ];
+        // Every pair agrees with itself and with the reverse of its opposite.
+        for a in &values {
+            for b in &values {
+                assert_eq!(compare(a, b), compare(b, a).reverse(), "{a:?} vs {b:?}");
+            }
+        }
+        // And the order is transitive, which is what was actually broken.
+        for a in &values {
+            for b in &values {
+                for c in &values {
+                    if compare(a, b).is_lt() && compare(b, c).is_lt() {
+                        assert!(compare(a, c).is_lt(), "{a:?} < {b:?} < {c:?}");
+                    }
+                }
+            }
+        }
+        // Sorting it is what would previously abort.
+        values.sort_by(|a, b| compare(a, b));
+        // A figure still sorts as a figure, which is the point of the column.
+        let ports = &mut ["10", "9", "100", "2"];
+        ports.sort_by(|a, b| compare(a, b));
+        assert_eq!(ports, &["2", "9", "10", "100"]);
+    }
+
 
     fn row(target: &str) -> Row {
         Row { target: target.into(), ..Row::default() }
+    }
+
+    fn row_with(target: &str, cells: &[&str]) -> Row {
+        Row {
+            target: target.into(),
+            cells: cells.iter().map(|c| c.to_string()).collect(),
+            ..Row::default()
+        }
+    }
+
+    #[test]
+    fn a_row_rewritten_in_place_says_the_filtered_view_has_to_be_built_again() {
+        let mut rows = vec![row_with("10.0.0.1", &["10.0.0.1", "queued"])];
+        // The same row said again, word for word: there is nothing here for a
+        // filter or a sort to change its mind about.
+        assert!(!upsert(&mut rows, row_with("10.0.0.1", &["10.0.0.1", "queued"])));
+        // The same row with a new cell. A filter reads cells, so whatever the
+        // view said about this row before it was rewritten it no longer says.
+        assert!(upsert(&mut rows, row_with("10.0.0.1", &["10.0.0.1", "failed"])));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cells[1], "failed");
+        // A row nobody has seen before, which always did rebuild the view.
+        assert!(upsert(&mut rows, row_with("10.0.0.2", &["10.0.0.2", "queued"])));
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn rewriting_a_row_keeps_the_note_somebody_typed_on_it() {
+        let mut rows = vec![row_with("10.0.0.1", &["10.0.0.1", "queued"])];
+        rows[0].note = Some("the noisy printer".into());
+        upsert(&mut rows, row_with("10.0.0.1", &["10.0.0.1", "done"]));
+        assert_eq!(rows[0].note.as_deref(), Some("the noisy printer"));
     }
 
     #[test]

@@ -309,9 +309,19 @@ impl Params {
 
 /// Parses a transfer rate into bytes per second: `2MB`, `500KB`, `1.5MB/s`, a
 /// bare number of bytes. The trailing `/s` is optional because a rate is the
-/// only thing this field could mean.
+/// only thing this field could mean. A rate written in bits — `10Mbps`,
+/// `10Mb/s` — is converted to the bytes per second it amounts to.
 pub fn parse_rate(s: &str) -> Option<u64> {
-    let s = s.trim().trim_end_matches("/s").trim_end_matches("ps").trim();
+    let s = s.trim();
+    // A link is advertised in bits, and the app itself reports speeds as
+    // "5.0 Mbps", so a speed limit gets typed that way too. The lowercase `b`
+    // in `10Mbps` or `10Mb/s` is what says bits, and it survives only until
+    // the unit is folded to lower case, so it is read here: taking those as
+    // bytes handed the transfer a ceiling eight times higher than the one
+    // asked for. Only that spelling counts, so `2MB`, `2MBps` and a casually
+    // lowercased `2mb` still mean bytes.
+    let bits = s.ends_with("bps") || s.ends_with("b/s");
+    let s = s.trim_end_matches("/s").trim_end_matches("ps").trim();
     if s.is_empty() {
         return None;
     }
@@ -328,7 +338,16 @@ pub fn parse_rate(s: &str) -> Option<u64> {
         "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
         _ => return None,
     };
-    Some((value * scale) as u64)
+    let per_second = (value * scale / if bits { 8.0 } else { 1.0 }) as u64;
+    // "0" is refused as a rate, and a rate smaller than a byte is the same
+    // request written differently: it arrived as a limit of zero, the token
+    // bucket floored it at one byte a second, and the transfer sat there
+    // making no progress that anyone watching could see. Better to say the
+    // limit is unusable while the form can still be corrected.
+    if per_second == 0 {
+        return None;
+    }
+    Some(per_second)
 }
 
 /// Parses a Go-flavoured duration: `500ms`, `1.5s`, `2m`, or a bare
@@ -402,5 +421,34 @@ mod rate_tests {
         assert!(Validator::Rate.check("2MB").is_ok());
         assert!(Validator::Rate.check("fast").is_err());
         assert!(Validator::Rate.check("0").is_err());
+    }
+
+    #[test]
+    fn a_rate_typed_in_bits_is_not_read_as_eight_times_as_many_bytes() {
+        // The parser has always taken the "bps" spelling, and reading its
+        // lowercase "b" as bytes made every such limit eight times looser
+        // than the one that was typed.
+        assert_eq!(parse_rate("10Mbps"), Some(10 * 1024 * 1024 / 8));
+        assert_eq!(parse_rate("10Mb/s"), Some(10 * 1024 * 1024 / 8));
+        assert_eq!(parse_rate("800kbps"), Some(800 * 1024 / 8));
+        // The byte spellings are untouched, including a capital "B" in front
+        // of the same per-second suffix and a carelessly lowercased unit.
+        assert_eq!(parse_rate("2MBps"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_rate("2mb"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_rate("2MB/s"), Some(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn a_rate_below_one_byte_a_second_is_refused_rather_than_rounded_to_a_stall() {
+        // Half a byte a second truncated to a limit of zero, which the token
+        // bucket floored at one byte a second: the transfer made no visible
+        // progress at all. A limit that cannot be honoured is an error while
+        // the form is still open.
+        assert_eq!(parse_rate("0.5"), None);
+        assert_eq!(parse_rate("0.0004k"), None);
+        assert_eq!(parse_rate("4bps"), None);
+        assert!(Validator::Rate.check("0.5").is_err());
+        // One byte a second is absurd but expressible, so it is honoured.
+        assert_eq!(parse_rate("1"), Some(1));
     }
 }

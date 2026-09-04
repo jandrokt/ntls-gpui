@@ -60,6 +60,32 @@ struct Cache {
     read: Instant,
 }
 
+impl Cache {
+    /// Whether what we are holding is old enough to be worth reading again.
+    fn stale(&self, ttl: Duration) -> bool {
+        self.read.elapsed() > ttl
+    }
+
+    /// Takes the outcome of one neighbour-table read.
+    ///
+    /// The stamp moves whether or not the read produced anything, because a
+    /// read that failed is still a read that was attempted. It used to move
+    /// only on success, so a system where the read can never succeed - no
+    /// `/proc/net/arp`, no `arp` on the path - was permanently overdue for a
+    /// refresh, and the probe loop, which asks again every forty milliseconds
+    /// and has as many loops running as there are hosts in the sweep, tried
+    /// the read again on every single poll for the whole length of the scan.
+    ///
+    /// A read that said nothing is also no reason to forget what was already
+    /// known: the table stays as it was until something replaces it.
+    fn adopt(&mut self, read: Result<HashMap<IpAddr, String>, String>) {
+        if let Ok(table) = read {
+            self.table = table;
+        }
+        self.read = Instant::now();
+    }
+}
+
 /// How the prober is asking.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -84,25 +110,37 @@ pub struct ArpProber {
     /// Why the raw socket was unavailable, when it was.
     raw_error: Option<String>,
     cache: Mutex<Cache>,
+    /// Held for the length of a neighbour-table read, so that a sweep's many
+    /// probes make one read between them instead of one apiece.
+    refreshing: tokio::sync::Mutex<()>,
     baseline: HashMap<IpAddr, String>,
     /// How long a neighbour-table read is reused. A scan probes many hosts at
     /// once and this keeps it to a handful of reads.
     ttl: Duration,
-    /// Records that the table could not be seen at all, which on recent macOS
-    /// means the cache is simply not readable.
-    empty_table: bool,
+    /// The address the nudge below goes out from, so that resolution happens
+    /// on the interface the scan was told to use.
+    src: Option<Ipv4Addr>,
+    /// Records that no hardware address is ever going to come out of the
+    /// neighbour table, so the empty column can be explained before the
+    /// results arrive.
+    withheld: bool,
+    /// Why the table could not be read, when that is the reason it will not
+    /// answer. Worth quoting: somebody whose `arp` is not on the path is not
+    /// helped by being told about privileges.
+    table_error: Option<String>,
 }
 
 impl ArpProber {
     /// Prepares a prober for the network reached through `interface`, whose
     /// address on it is `src`.
     ///
-    /// Only the BSD family can open a raw link socket here, so `interface` and
-    /// `src` are only read there. Everywhere else the neighbour table is the
-    /// whole of what is available.
+    /// Only the BSD family can open a raw link socket here, so `interface` is
+    /// only read there. Everywhere else the neighbour table is the whole of
+    /// what is available, and `src` is what keeps that path on the chosen
+    /// interface.
     pub fn new(
         #[allow(unused_variables)] interface: Option<&str>,
-        #[allow(unused_variables)] src: Option<Ipv4Addr>,
+        src: Option<Ipv4Addr>,
     ) -> Result<ArpProber, String> {
         if !supported() {
             return Err("ARP probing is not supported on this platform".into());
@@ -128,7 +166,10 @@ impl ArpProber {
         // The neighbour table is still worth reading: it costs nothing and on
         // the platforms that expose it, it answers for hosts that have been
         // spoken to recently without a single packet of ours.
-        let baseline = read_neighbours().unwrap_or_default();
+        let read = read_neighbours();
+        let withheld = table_withheld(&read, EMPTY_TABLE_MEANS_WITHHELD);
+        let table_error = read.as_ref().err().cloned();
+        let baseline = read.unwrap_or_default();
 
         Ok(ArpProber {
             #[cfg(any(
@@ -140,10 +181,13 @@ impl ArpProber {
             ))]
             link,
             raw_error,
-            empty_table: baseline.is_empty(),
+            withheld,
+            table_error,
             cache: Mutex::new(Cache { table: baseline.clone(), read: Instant::now() }),
+            refreshing: tokio::sync::Mutex::new(()),
             baseline,
             ttl: Duration::from_millis(250),
+            src,
         })
     }
 
@@ -162,9 +206,9 @@ impl ArpProber {
     }
 
     /// Reports that hardware addresses will be missing: no raw socket, and no
-    /// readable neighbour table either.
+    /// neighbour table that is going to answer either.
     pub fn blind(&self) -> bool {
-        self.mode() == Mode::Neighbour && self.empty_table
+        self.mode() == Mode::Neighbour && self.withheld
     }
 
     /// Caveats worth showing the user before results arrive.
@@ -190,11 +234,19 @@ impl ArpProber {
                 "no raw link-layer socket ({e}); reading the kernel neighbour table instead, whose entries may be minutes old"
             ));
         }
-        if self.empty_table {
-            out.push(
-                "this system will not show hardware addresses to an unprivileged process. Join the access_bpf group (Wireshark's ChmodBPF installs it) or run as root, and ntls will ask the wire directly"
+        if self.withheld {
+            // The privilege advice belongs only to the system that answered
+            // the read and said nothing, which is macOS withholding the cache
+            // from an unprivileged process. A read that failed outright has a
+            // reason of its own, and naming it beats sending somebody after a
+            // group and an installer that only exist on another platform.
+            out.push(match &self.table_error {
+                Some(e) => format!(
+                    "the kernel neighbour table cannot be read ({e}); hardware addresses will be missing"
+                ),
+                None => "this system will not show hardware addresses to an unprivileged process. Join the access_bpf group (Wireshark's ChmodBPF installs it) or run as root, and ntls will ask the wire directly"
                     .to_string(),
-            );
+            });
         }
         out
     }
@@ -245,10 +297,10 @@ impl ArpProber {
         }
 
         let was_cached = self.baseline.contains_key(&dst);
-        nudge(dst);
+        nudge(dst, self.src);
 
         loop {
-            if let Some(mac) = self.lookup(dst) {
+            if let Some(mac) = self.lookup(dst).await {
                 return Ok(ArpResult { mac, fresh: !was_cached, rtt: start.elapsed(), note: String::new() });
             }
             if start.elapsed() >= timeout {
@@ -258,24 +310,78 @@ impl ArpProber {
         }
     }
 
-    fn lookup(&self, dst: IpAddr) -> Option<String> {
-        let mut c = self.cache.lock().unwrap();
-        if c.read.elapsed() > self.ttl
-            && let Ok(t) = read_neighbours()
-        {
-            c.table = t;
-            c.read = Instant::now();
+    /// The hardware address the neighbour table has for `dst`, reading the
+    /// table again first if what we are holding has gone stale.
+    ///
+    /// Everywhere but Linux that read means forking `arp` and waiting for it,
+    /// which has no business happening on a runtime thread: one pool serves
+    /// every open job, and a sweep polling here from dozens of tasks at once
+    /// stopped all of them - the progress bar and whatever else was running
+    /// included - for as long as the subprocess took, which on Windows is
+    /// tens of milliseconds a time. The read goes to the blocking pool, and
+    /// only one goes at a time so that the tasks which arrive together do not
+    /// each fork an `arp` of their own.
+    async fn lookup(&self, dst: IpAddr) -> Option<String> {
+        if self.stale() {
+            let _one_at_a_time = self.refreshing.lock().await;
+            // Whoever waited for that is very likely to find the read someone
+            // else was making already done.
+            if self.stale() {
+                let read = match tokio::task::spawn_blocking(read_neighbours).await {
+                    Ok(read) => read,
+                    Err(e) => Err(format!("read neighbour table: {e}")),
+                };
+                self.cache.lock().unwrap().adopt(read);
+            }
         }
-        c.table.get(&dst).cloned()
+        self.cached(dst)
+    }
+
+    fn stale(&self) -> bool {
+        self.cache.lock().unwrap().stale(self.ttl)
+    }
+
+    /// What the table says right now, with nothing read on the way.
+    fn cached(&self, dst: IpAddr) -> Option<String> {
+        self.cache.lock().unwrap().table.get(&dst).cloned()
     }
 }
 
 /// Provokes link-layer resolution without sending anything meaningful. Port 9
 /// is discard; the payload is irrelevant and a closed port is fine, because
 /// the ARP exchange happens before the UDP datagram leaves the host.
-fn nudge(dst: IpAddr) {
-    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return };
-    let _ = sock.send_to(&[0], SocketAddr::new(dst, 9));
+///
+/// It goes out of the chosen interface first, and out of whatever the routing
+/// table prefers only if that interface cannot carry it: an explicit range
+/// need not lie on the chosen interface's own network, and a host that some
+/// other interface can reach must not be timed out for that.
+fn nudge(dst: IpAddr, src: Option<Ipv4Addr>) {
+    let to = SocketAddr::new(dst, 9);
+    if let Some(sock) = nudge_socket(src)
+        && sock.send_to(&[0], to).is_ok()
+    {
+        return;
+    }
+    if src.is_none() {
+        return;
+    }
+    if let Some(sock) = nudge_socket(None) {
+        let _ = sock.send_to(&[0], to);
+    }
+}
+
+/// The socket a nudge goes out of, bound to the address of the interface the
+/// scan was told to use.
+///
+/// Leaving it unbound left the choice to the routing table, which is not the
+/// interface the user picked whenever the two disagree. On a machine
+/// multi-homed onto networks that overlap - a wired LAN and a tunnel both
+/// numbered 192.168.1.0/24, say - the resolution then happened on the other
+/// link, and the address that came back over it belonged to a different host
+/// altogether. A bind that fails, for an address that has just gone away with
+/// its interface, is no reason not to ask at all.
+fn nudge_socket(src: Option<Ipv4Addr>) -> Option<UdpSocket> {
+    UdpSocket::bind(SocketAddr::new(IpAddr::V4(src.unwrap_or(Ipv4Addr::UNSPECIFIED)), 0)).ok()
 }
 
 /// Opens a link-layer handle on the right interface.
@@ -333,6 +439,41 @@ fn supported() -> bool {
         target_os = "netbsd",
         target_os = "dragonfly"
     ))
+}
+
+/// Whether a neighbour table that reads as empty is a system refusing to show
+/// it. Recent macOS, and the BSDs that share its routing socket, answer the
+/// read and say nothing whatever has just been spoken to. Linux and Windows
+/// hand over what they hold, so an empty table there is only a cold one and
+/// the nudge fills it.
+const EMPTY_TABLE_MEANS_WITHHELD: bool = cfg!(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+));
+
+/// Whether one neighbour-table read means no hardware address is ever going to
+/// come out of the table, as against a table that has nothing in it yet.
+///
+/// The two used to be one thing, and the warning that followed told whoever
+/// saw it to join `access_bpf` and install Wireshark's ChmodBPF - a group and
+/// an installer that exist only on macOS, along with the raw-socket path they
+/// unlock. On Linux and Windows an empty table at the start of a scan is
+/// merely a cold cache, so anyone scanning from a machine that had not spoken
+/// to a neighbour yet was sent after a privilege that would have changed
+/// nothing, for a column that filled in by itself a moment later.
+fn table_withheld(
+    read: &Result<HashMap<IpAddr, String>, String>,
+    empty_means_withheld: bool,
+) -> bool {
+    match read {
+        // A read that failed outright means the same everywhere: nothing is
+        // going to come out of a table we cannot open.
+        Err(_) => true,
+        Ok(table) => empty_means_withheld && table.is_empty(),
+    }
 }
 
 /// The current IPv4 neighbour table, keyed by address. Incomplete entries are
@@ -461,5 +602,114 @@ mod tests {
         // An unresolved entry says nothing about what is there.
         assert_eq!(normalize_mac("00:00:00:00:00:00"), None);
         assert_eq!(normalize_mac("(incomplete)"), None);
+    }
+
+    fn table(addr: &str, mac: &str) -> HashMap<IpAddr, String> {
+        HashMap::from([(addr.parse::<IpAddr>().expect("an address"), mac.to_string())])
+    }
+
+    #[test]
+    fn a_neighbour_table_read_that_failed_still_puts_the_next_one_off() {
+        let known = table("10.0.0.1", "a4:83:e7:01:02:03");
+        let mut c = Cache { table: known.clone(), read: Instant::now() };
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(c.stale(Duration::from_millis(1)), "the table has aged past its lifetime");
+
+        c.adopt(Err("read neighbour table: No such file or directory".into()));
+
+        // Otherwise the probe loop, which polls every forty milliseconds and
+        // runs once per host in a sweep, reads the table again on every poll
+        // for the whole scan, on exactly the systems where reading it cannot
+        // work.
+        assert!(!c.stale(Duration::from_millis(500)), "a read that failed was still a read");
+        // And a read that said nothing says nothing about what was known.
+        assert_eq!(c.table, known);
+    }
+
+    #[test]
+    fn a_neighbour_table_read_that_worked_replaces_what_was_there() {
+        let mut c = Cache { table: table("10.0.0.1", "a4:83:e7:01:02:03"), read: Instant::now() };
+        let now = table("10.0.0.2", "b8:27:eb:04:05:06");
+
+        c.adopt(Ok(now.clone()));
+
+        assert_eq!(c.table, now);
+        assert!(!c.stale(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn a_cold_neighbour_table_is_not_a_system_withholding_it() {
+        // Linux and Windows: an empty table at the start of a scan is a cache
+        // nothing has been resolved into yet, and the nudge fills it.
+        assert!(!table_withheld(&Ok(HashMap::new()), false));
+        // macOS answers the read and says nothing however busy the link is.
+        assert!(table_withheld(&Ok(HashMap::new()), true));
+        // A table that cannot be opened will not answer anywhere.
+        assert!(table_withheld(&Err("read neighbour table: not found".into()), false));
+        // And a table with entries in it is answering, whatever the platform.
+        assert!(!table_withheld(&Ok(table("10.0.0.1", "a4:83:e7:01:02:03")), true));
+    }
+
+    /// A prober that got no raw socket, as every Linux and Windows one does,
+    /// holding the given verdict about the neighbour table.
+    fn neighbour_prober(withheld: bool, table_error: Option<&str>) -> ArpProber {
+        ArpProber {
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ))]
+            link: None,
+            raw_error: None,
+            withheld,
+            table_error: table_error.map(str::to_string),
+            cache: Mutex::new(Cache { table: HashMap::new(), read: Instant::now() }),
+            refreshing: tokio::sync::Mutex::new(()),
+            baseline: HashMap::new(),
+            ttl: Duration::from_millis(250),
+            src: None,
+        }
+    }
+
+    #[test]
+    fn a_table_that_cannot_be_read_says_why_rather_than_naming_a_group_the_system_has_not_got() {
+        let notes = neighbour_prober(true, Some("read neighbour table: No such file")).notes();
+
+        assert_eq!(notes.len(), 1, "one caveat, not two: {notes:?}");
+        assert!(notes[0].contains("No such file"), "the reason it will not answer: {}", notes[0]);
+        assert!(!notes[0].contains("access_bpf"), "no such group off macOS: {}", notes[0]);
+        assert!(!notes[0].contains("ChmodBPF"), "a macOS installer: {}", notes[0]);
+    }
+
+    #[test]
+    fn a_table_the_kernel_answers_and_leaves_empty_is_the_one_worth_asking_for_privilege_over() {
+        let notes = neighbour_prober(true, None).notes();
+
+        assert_eq!(notes.len(), 1, "one caveat: {notes:?}");
+        assert!(notes[0].contains("access_bpf"), "{}", notes[0]);
+    }
+
+    #[test]
+    fn a_table_that_will_answer_is_no_caveat_at_all() {
+        assert!(neighbour_prober(false, None).notes().is_empty());
+    }
+
+    #[test]
+    fn the_nudge_leaves_from_the_address_the_scan_was_told_to_send_from() {
+        // Unbound, the routing table chooses, and on a machine multi-homed
+        // onto overlapping networks its choice is not the interface the user
+        // picked: the resolution goes out on the wrong link.
+        let sock = nudge_socket(Some(Ipv4Addr::LOCALHOST)).expect("a socket");
+        assert_eq!(sock.local_addr().expect("its address").ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        // "auto" still means whatever the routing table prefers.
+        let any = nudge_socket(None).expect("a socket");
+        assert_eq!(any.local_addr().expect("its address").ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+
+        // An address this host does not hold cannot be bound, and the caller
+        // falls back to sending unbound rather than not asking at all.
+        assert!(nudge_socket(Some(Ipv4Addr::new(192, 0, 2, 1))).is_none());
     }
 }

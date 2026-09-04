@@ -160,7 +160,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
     // changed joins it, and a record that has stopped being returned stays:
     // which is the whole of what a document says about a zone over time.
     let keep = r.keep;
-    let before = Answered::of(&r.prior);
+    let mut before = Answered::of(&r.prior);
     if keep && !before.is_empty() {
         emit.info(format!(
             "keeping {} answer(s) from earlier lookups; nothing already in the table is removed",
@@ -208,10 +208,15 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
             let cells = cells![r.name, r.rtype, format_ttl(r.ttl), r.section, r.value];
             if keep {
                 let key = record_key(&cells);
-                match before.row_for(&key) {
+                // An answer whose row cannot be rewritten is still an answer
+                // that was already there, so whether it is new is asked of
+                // the table and not of whether a row was found for it.
+                let known = before.has(&key);
+                let claimed = before.claim_row(&key);
+                match claimed {
                     Some(row) => emit.upsert_as(row, status, handoff_target(r), cells),
                     None => {
-                        if !before.is_empty() {
+                        if !before.is_empty() && !known {
                             fresh += 1;
                             if before.knows(&r.name, &r.rtype) {
                                 changed += 1;
@@ -266,6 +271,9 @@ struct Answered {
     /// The name and type of every answer already there, so an answer that is
     /// new can be told from one that has changed.
     subjects: std::collections::HashSet<(String, String)>,
+    /// Which answer has taken each of those rows over during this lookup,
+    /// because a row can only be rewritten by one of them.
+    claimed: std::collections::HashMap<String, String>,
 }
 
 impl Answered {
@@ -273,6 +281,7 @@ impl Answered {
         let mut out = Answered {
             rows: std::collections::HashMap::new(),
             subjects: std::collections::HashSet::new(),
+            claimed: std::collections::HashMap::new(),
         };
         for row in rows {
             out.rows.insert(record_key(&row.cells), row.identity().to_string());
@@ -292,8 +301,30 @@ impl Answered {
         self.rows.len()
     }
 
-    fn row_for(&self, key: &str) -> Option<String> {
-        self.rows.get(key).cloned()
+    /// Whether this exact answer is already in the table, whether or not
+    /// there is a row of it this lookup can address.
+    fn has(&self, key: &str) -> bool {
+        self.rows.contains_key(key)
+    }
+
+    /// The row this answer should rewrite, or none, meaning it takes a row of
+    /// its own.
+    ///
+    /// A row is only ever found by the identity it goes by, and the rows of
+    /// lookups made before this switch existed go by their hand-off target,
+    /// which several records of one name share: every TXT record of a name
+    /// hands off that name, and two mail exchangers on one host hand off that
+    /// host. Giving a second answer the identity a first had just taken sent
+    /// it to the same row, so a name with three TXT records came back as its
+    /// last record three times over with the other two nowhere in the table.
+    /// An identity is therefore taken once, and the answers behind it get
+    /// rows of their own; the same answer arriving twice in one lookup, as a
+    /// CNAME does when auto asks both A and AAAA, still lands on the row it
+    /// took the first time.
+    fn claim_row(&mut self, key: &str) -> Option<String> {
+        let row = self.rows.get(key)?.clone();
+        let owner = self.claimed.entry(row.clone()).or_insert_with(|| key.to_string());
+        if owner.as_str() == key { Some(row) } else { None }
     }
 
     /// Whether this name was already answering for this type, which makes a
@@ -350,16 +381,16 @@ mod tests {
     fn the_same_answer_returned_again_rewrites_the_row_it_already_had() {
         // Only its time to live has moved, and a table with the same A record
         // in it forty times is not a record of anything.
-        let before = Answered::of(&[row("example.com", "A", "5m", "1.2.3.4", None)]);
+        let mut before = Answered::of(&[row("example.com", "A", "5m", "1.2.3.4", None)]);
         let again = cells!["example.com", "A", "1m", "answer", "1.2.3.4"];
-        assert_eq!(before.row_for(&record_key(&again)).as_deref(), Some("1.2.3.4"));
+        assert_eq!(before.claim_row(&record_key(&again)).as_deref(), Some("1.2.3.4"));
     }
 
     #[test]
     fn an_answer_that_has_changed_joins_the_one_it_replaced() {
-        let before = Answered::of(&[row("example.com", "A", "5m", "1.2.3.4", None)]);
+        let mut before = Answered::of(&[row("example.com", "A", "5m", "1.2.3.4", None)]);
         let moved = cells!["example.com", "A", "5m", "answer", "5.6.7.8"];
-        assert_eq!(before.row_for(&record_key(&moved)), None, "it is a row of its own");
+        assert_eq!(before.claim_row(&record_key(&moved)), None, "it is a row of its own");
         // And it is a change instead of an addition, because the name was
         // already answering for this type.
         assert!(before.knows("example.com", "A"));
@@ -374,5 +405,50 @@ mod tests {
         // The section is part of it: an authority record is not an answer.
         let authority = cells!["example.com", "A", "5m", "authority", "1.2.3.4"];
         assert_ne!(record_key(&a), record_key(&authority));
+    }
+
+    /// A row of a lookup made with the switch off, which goes by its hand-off
+    /// target and not by which answer it holds.
+    fn untagged(rtype: &str, value: &str, target: &str) -> Row {
+        Row {
+            cells: cells!["example.com", rtype, "5m", "answer", value],
+            status: Status::Up,
+            target: target.into(),
+            note: None,
+            key: None,
+        }
+    }
+
+    #[test]
+    fn two_answers_that_hand_off_the_same_thing_do_not_take_one_another_s_row() {
+        // Every TXT record of a name hands off that name, so the rows of a
+        // lookup made before the switch was on all go by the same identity.
+        // The second answer used to be sent to the row the first had just
+        // taken, which left the table holding one record twice over and the
+        // other not at all.
+        let mut before = Answered::of(&[
+            untagged("TXT", "v=spf1 -all", "example.com"),
+            untagged("TXT", "verify=x", "example.com"),
+        ]);
+        let spf = record_key(&["example.com".into(), "TXT".into(), "1m".into(), "answer".into(), "v=spf1 -all".into()]);
+        let token = record_key(&["example.com".into(), "TXT".into(), "1m".into(), "answer".into(), "verify=x".into()]);
+        assert_eq!(before.claim_row(&spf).as_deref(), Some("example.com"));
+        assert_eq!(before.claim_row(&token), None, "it gets a row of its own instead");
+        // And it is neither new nor changed: it was in the table all along.
+        assert!(before.has(&token));
+    }
+
+    #[test]
+    fn the_same_answer_reaching_the_table_twice_in_one_lookup_keeps_to_one_row() {
+        // Auto asks for A and AAAA, and an alias answers both with the same
+        // CNAME record, so that record is written twice in one lookup and
+        // must go to the row it took the first time rather than to a second
+        // row beside it.
+        let mut before =
+            Answered::of(&[untagged("CNAME", "target.example.net", "target.example.net")]);
+        let cname =
+            record_key(&["example.com".into(), "CNAME".into(), "1m".into(), "answer".into(), "target.example.net".into()]);
+        assert_eq!(before.claim_row(&cname).as_deref(), Some("target.example.net"));
+        assert_eq!(before.claim_row(&cname).as_deref(), Some("target.example.net"));
     }
 }

@@ -10,6 +10,7 @@
 //! (notes and workflows, kilobytes not megabytes) reshaping the
 //! visible lines on each keystroke is not something anyone can perceive.
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::path::PathBuf;
 
@@ -221,7 +222,7 @@ impl Editor {
     pub fn new(cx: &mut Context<Self>, text: &str, path: PathBuf, language: Language) -> Editor {
         Editor {
             focus_handle: cx.focus_handle(),
-            text: text.to_string(),
+            text: flattened(text).into_owned(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -263,10 +264,11 @@ impl Editor {
     /// Replaces everything, as when the file changed underneath, or when the
     /// same workflow was changed with the controls beside it.
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        if self.text == text {
+        let text = flattened(text);
+        if self.text.as_str() == &*text {
             return;
         }
-        self.text = text.to_string();
+        self.text = text.into_owned();
         self.selected_range = 0..0;
         self.marked_range = None;
         self.offering.clear();
@@ -554,6 +556,16 @@ impl Editor {
     /// Inserts whatever is highlighted. Returns whether there was anything.
     fn take_offer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(candidate) = self.offering.get(self.offering_at).cloned() else { return false };
+        // An offer belongs to the word right before the caret, and changing
+        // the selection does not work one out again: a shift-arrow, a drag or
+        // a double click leaves the list describing a word the caret has left.
+        // Taking it then counted those same bytes back from the new caret and
+        // wrote over whatever was sitting there, and dropped the selected text
+        // instead of replacing it. In a workflow something is offered almost
+        // everywhere, so a double click and then tab silently mangled a line.
+        if !self.selected_range.is_empty() {
+            return false;
+        }
         let back = replacing(&self.offer_context);
         let at = self.cursor();
         let start = self.clamp(at.saturating_sub(back));
@@ -826,7 +838,8 @@ impl EntityInputHandler for Editor {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.text.replace_range(range.clone(), new_text);
+        let new_text = flattened(new_text);
+        self.text.replace_range(range.clone(), &new_text);
         let at = range.start + new_text.len();
         self.selected_range = at..at;
         self.selection_reversed = false;
@@ -853,10 +866,7 @@ impl EntityInputHandler for Editor {
 
         self.text.replace_range(range.clone(), new_text);
         self.marked_range = (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|r| range.start + r.start..range.start + r.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selected_range = marked_caret(range.start, new_text, new_selected_range_utf16.as_ref());
         self.dirty = true;
         self.revision += 1;
         cx.notify();
@@ -884,6 +894,53 @@ impl EntityInputHandler for Editor {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         Some(self.offset_to_utf16(self.offset_for(point)))
+    }
+}
+
+/// Text arriving from outside, with Windows line endings flattened to bare
+/// line feeds.
+///
+/// A line boundary here is one `\n` and every position is a byte offset, so a
+/// `\r\n` — out of a file written on Windows, or pasted from a Windows program
+/// or a browser — left the carriage return sitting at the end of the line's own
+/// text, where nothing could tell it from a character anyone typed. End put the
+/// caret between the two bytes, as did a click past the end of the line, and
+/// the next character typed there went in between them: the line ending was
+/// split and a stray carriage return was left in the middle of a line, which
+/// the colouring, the completion and the file that was then written all read as
+/// text. A lone carriage return is left as it is, since it is not a line ending
+/// here and inventing a line break the document never had would be a worse
+/// guess than showing the character.
+fn flattened(text: &str) -> Cow<'_, str> {
+    if text.contains('\r') { Cow::Owned(text.replace("\r\n", "\n")) } else { Cow::Borrowed(text) }
+}
+
+/// Where the selection the IME asks for inside the text it has just marked
+/// falls in the document.
+///
+/// `at` is where that text starts, and the range the platform gives is counted
+/// in UTF-16 units from there, not in bytes. Adding those units straight onto
+/// a byte offset agrees only for text that is ASCII: two Japanese characters
+/// are two units and six bytes, so the caret was left two bytes into the first
+/// of them, inside a character. Anything that then sliced the document there,
+/// the next edit's `replace_range` or working out which line the caret is on,
+/// panicked, so composing a word and carrying on typing took the program down.
+fn marked_caret(at: usize, marked: &str, selected_utf16: Option<&Range<usize>>) -> Range<usize> {
+    let byte_of = |wanted: usize| {
+        let (mut utf8, mut utf16) = (0, 0);
+        for ch in marked.chars() {
+            if utf16 >= wanted {
+                break;
+            }
+            utf16 += ch.len_utf16();
+            utf8 += ch.len_utf8();
+        }
+        utf8
+    };
+    match selected_utf16 {
+        Some(range) => at + byte_of(range.start)..at + byte_of(range.end),
+        // Nothing said where to put it, so it goes after what was marked.
+        None => at + marked.len()..at + marked.len(),
     }
 }
 
@@ -1168,5 +1225,84 @@ impl Render for Editor {
 impl Focusable for Editor {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_caret_the_ime_asks_for_while_composing_japanese_stays_on_a_character() {
+        // The platform counts the caret in UTF-16 units from the start of the
+        // text it marked. Two Japanese characters are two of those units and
+        // six bytes, so taking the count for a count of bytes left the caret
+        // two bytes into the first character, and the next thing to slice the
+        // document there brought the program down.
+        let document = "ab にほ";
+        let caret = marked_caret(3, "にほ", Some(&(2..2)));
+        assert_eq!(caret, 9..9);
+        assert_eq!(document.len(), 9);
+        assert!(document.is_char_boundary(caret.start));
+    }
+
+    #[test]
+    fn the_segment_the_ime_is_converting_lands_on_character_boundaries() {
+        // The segment being converted is underlined, and it arrives in UTF-16
+        // units as well: the second and third characters of "にほん" are bytes
+        // 3 to 9, not bytes 1 to 3.
+        let marked = "にほん";
+        assert_eq!(marked_caret(0, marked, Some(&(0..1))), 0..3);
+        assert_eq!(marked_caret(0, marked, Some(&(1..3))), 3..9);
+        for range in [0..1, 1..3, 0..3] {
+            let caret = marked_caret(4, marked, Some(&range));
+            assert!(marked.is_char_boundary(caret.start - 4));
+            assert!(marked.is_char_boundary(caret.end - 4));
+        }
+    }
+
+    #[test]
+    fn a_character_outside_the_basic_plane_is_two_units_and_four_bytes() {
+        // An emoji is one character and four bytes, but the platform counts it
+        // as the two UTF-16 units a surrogate pair takes.
+        assert_eq!(marked_caret(0, "🙂", Some(&(2..2))), 4..4);
+        assert_eq!(marked_caret(0, "🙂", Some(&(0..2))), 0..4);
+    }
+
+    #[test]
+    fn nothing_asked_for_leaves_the_caret_after_what_was_marked() {
+        assert_eq!(marked_caret(7, "にほ", None), 13..13);
+    }
+
+    #[test]
+    fn typing_at_the_end_of_a_line_from_a_windows_file_keeps_the_line_ending_whole() {
+        // End puts the caret at the end of the line, which is worked out by
+        // looking for the `\n`. On "one\r\ntwo" that byte is one past the
+        // carriage return, so what was typed there went between the two halves
+        // of the line ending and left a stray carriage return in the middle of
+        // the line above it.
+        let mut document = flattened("one\r\ntwo").into_owned();
+        let end_of_first_line = document.find('\n').unwrap_or(document.len());
+        document.insert(end_of_first_line, '!');
+        assert_eq!(document, "one!\ntwo");
+    }
+
+    #[test]
+    fn a_document_written_on_windows_arrives_with_no_carriage_returns_in_it() {
+        let document = flattened("alpha\r\nbeta\r\n");
+        assert_eq!(&*document, "alpha\nbeta\n");
+        assert!(!document.contains('\r'));
+    }
+
+    #[test]
+    fn a_document_that_already_uses_bare_line_feeds_is_not_copied() {
+        assert!(matches!(flattened("alpha\nbeta\n"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_carriage_return_with_no_line_feed_after_it_stays_the_character_it_is() {
+        // It is not a line ending here, and showing a line break the document
+        // does not have is a worse guess than showing the character.
+        assert_eq!(&*flattened("one\rtwo"), "one\rtwo");
     }
 }

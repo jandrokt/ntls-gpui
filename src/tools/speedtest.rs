@@ -164,6 +164,14 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
         transfer(&cancel, &emit, &client, &summary, "download", &down_url, streams, duration, false)
             .await;
     }
+    // Stopping the run stops the whole run, not just the leg that was in
+    // flight. Carrying on regardless started an upload leg that could not
+    // move a byte: every stream saw the cancellation and returned at once,
+    // and the empty transfer that came back was announced and then posted as
+    // a finished result reading "0 bps".
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     if direction == "both" || direction == "up" {
         if up_url.is_empty() {
             emit.info("a custom server has no upload endpoint, so only download was measured");
@@ -239,6 +247,16 @@ async fn transfer(
             }
         }
         Ok(t) => {
+            // A leg that was stopped before anything moved is not a
+            // measurement. The client has no error to report in that case, so
+            // it hands back a transfer of nothing, which used to close the
+            // progress bar at the full duration and post a green result row
+            // reading "0 bps · 0 B" for a run the user had already stopped.
+            // A leg stopped part way did measure something, and that figure
+            // says over how long it was taken, so it still gets its row.
+            if t.bytes == 0 && cancel.is_cancelled() {
+                return;
+            }
             emit.emit(Event::progress_label(1, 1, format!("{} of {}", elapsed(duration), elapsed(duration))));
             report(emit, name, url, streams, t);
         }
@@ -280,4 +298,92 @@ fn report_latency(emit: &Emitter, latencies: &[Duration]) {
             )
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::core::{Params, Run};
+
+    /// Collects everything a run emits.
+    fn sink() -> (Emitter, Arc<Mutex<Vec<Event>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let held = events.clone();
+        (Emitter::new(move |e| held.lock().expect("events").push(e)), events)
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("a runtime")
+    }
+
+    /// A leg that never got going has moved nothing, and there is no error to
+    /// report either, so what comes back is a transfer of zero bytes. That is
+    /// not a result and must not be presented as one. Nothing here reaches
+    /// the network: an already stopped transfer opens no connection.
+    #[test]
+    fn a_leg_stopped_before_it_moved_anything_reports_no_result() {
+        let (emit, events) = sink();
+        let cancel = Cancel::new();
+        cancel.cancel();
+
+        rt().block_on(async {
+            let client = SpeedClient::new(None, Duration::from_secs(5)).expect("a client");
+            let summary = Arc::new(Mutex::new(Summary::default()));
+            transfer(
+                &cancel,
+                &emit,
+                &client,
+                &summary,
+                "upload",
+                CF_UP,
+                1,
+                Duration::from_millis(50),
+                true,
+            )
+            .await;
+        });
+
+        let events = events.lock().expect("events").clone();
+        assert!(
+            events.iter().all(|e| !matches!(e, Event::Row(_))),
+            "a stopped leg posted a result row: {events:?}"
+        );
+        assert!(
+            events.iter().all(|e| !matches!(e, Event::Progress { .. })),
+            "a stopped leg closed the progress bar as though it had finished: {events:?}"
+        );
+    }
+
+    /// Stopping the run during the first leg ends it. A custom server stands
+    /// in for the real one because it skips the latency probe, so the whole
+    /// run happens without touching the network; its second leg is the line
+    /// explaining that a custom server has no upload endpoint, and a stopped
+    /// run should not be reaching that line at all.
+    #[test]
+    fn a_run_stopped_in_the_download_leg_does_not_start_the_second_leg() {
+        let (emit, events) = sink();
+        let cancel = Cancel::new();
+        cancel.cancel();
+
+        let mut params = Params::defaults(&Tool::fields(&SpeedTest));
+        params.set("server", "custom");
+        params.set("url", "http://127.0.0.1:9/large.bin");
+        params.set("direction", "both");
+        params.set("duration", "50ms");
+        params.set("streams", "1");
+
+        rt().block_on(run(Run::fresh(cancel, params), emit)).expect("the run to end cleanly");
+
+        let events = events.lock().expect("events").clone();
+        assert!(
+            events.iter().all(|e| !matches!(e, Event::Row(_))),
+            "a stopped run posted a result row: {events:?}"
+        );
+        let mentioned_upload = events
+            .iter()
+            .any(|e| matches!(e, Event::Log { text, .. } if text.contains("upload")));
+        assert!(!mentioned_upload, "a stopped run carried on to the upload leg: {events:?}");
+    }
 }

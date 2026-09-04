@@ -91,6 +91,20 @@ fn seed(prior: &[crate::core::Row]) -> (usize, RttStats) {
     (highest.max(prior.len()), stats)
 }
 
+/// Lets go of the probes that have already answered.
+///
+/// The list exists only so the run can wait for the last few probes before it
+/// writes its summary. But a ping with no count runs until somebody presses
+/// Stop, and a task whose handle is never awaited keeps its allocation until
+/// that handle is dropped, so the list was growing by one entry for every
+/// probe ever sent and giving none of them back: an overnight ping at the
+/// default second apart held tens of thousands of them, and one ten
+/// milliseconds apart got there in minutes. Only the probes still waiting for
+/// a reply are worth keeping.
+fn reap(inflight: &mut Vec<tokio::task::JoinHandle<()>>) {
+    inflight.retain(|h| !h.is_finished());
+}
+
 async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
     let (cancel, p) = (r.cancel.clone(), r.params.clone());
     let addrs = resolve_targets(&p.str("target"), &p.str("iface"), &emit).map_err(anyhow::Error::msg)?;
@@ -131,7 +145,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
         ]);
     };
 
-    let mut inflight = Vec::new();
+    let mut inflight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut seq = already;
 
     loop {
@@ -144,6 +158,11 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
         if count > 0 {
             emit.progress(sent, count);
         }
+
+        // What is left after this is the probes still out on the wire, which
+        // is a handful at most: a run that never ends would otherwise carry
+        // every probe it has ever sent for as long as it lasts.
+        reap(&mut inflight);
 
         let (prober, emit, st, cancel_probe) =
             (prober.clone(), emit.clone(), st.clone(), cancel.clone());
@@ -216,6 +235,8 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::core::{Row, Status};
 
     fn row(seq: usize, rtt: &str) -> Row {
@@ -247,5 +268,39 @@ mod tests {
         let (already, stats) = super::seed(&[]);
         assert_eq!(already, 0);
         assert_eq!(stats.sent, 0);
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("a runtime")
+    }
+
+    /// A run with no count sends probes for as long as it is left alone, so
+    /// the list it keeps them in has to stay the size of what is actually
+    /// outstanding. Nothing here touches the network: the two tasks that
+    /// finish stand in for probes that have answered, and the one that sleeps
+    /// for a probe still waiting.
+    #[test]
+    fn a_ping_that_runs_until_stopped_lets_go_of_the_probes_that_have_answered() {
+        rt().block_on(async {
+            let mut inflight = vec![
+                tokio::spawn(async {}),
+                tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await }),
+                tokio::spawn(async {}),
+            ];
+
+            // Spawning does not run anything by itself, so give the two short
+            // tasks the chance to be over before asking which of them are.
+            for _ in 0..500 {
+                if inflight[0].is_finished() && inflight[2].is_finished() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            super::reap(&mut inflight);
+
+            assert_eq!(inflight.len(), 1, "only the probe still waiting for a reply is kept");
+            assert!(!inflight[0].is_finished(), "and it is the one that has not finished");
+        });
     }
 }

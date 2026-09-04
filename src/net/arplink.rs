@@ -109,38 +109,73 @@ struct Waiter {
 
 static NEXT_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Every hardware address this process has heard on the wire, and when.
+/// Which link an address was heard on.
+///
+/// An address on its own does not identify a host: 192.168.1.1 is the router
+/// here and a different router in the next building along, and the handful of
+/// prefixes consumer routers hand out are the same everywhere. The interface
+/// name alone will not separate them either, because joining another Wi-Fi
+/// network keeps `en0`. What does separate them is the address this machine
+/// holds on the link, which came from that network's own DHCP server, together
+/// with the interface it came in on, which separates two networks attached at
+/// the same time.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct LinkId {
+    interface: String,
+    src_ip: Ipv4Addr,
+}
+
+/// Every hardware address this process has heard on the wire, and when, kept
+/// per link.
 ///
 /// A BPF handle lives as long as the run that opened it, so without this every
 /// scan starts knowing nothing and has to ask the link again for every host,
 /// and a host that answers slowly, which over Wi-Fi is most of them, is missed
 /// as often as not. Remembering what has already been established makes the
 /// second scan of a network at least as complete as the first.
-static REMEMBERED: Mutex<Option<HashMap<Ipv4Addr, ([u8; 6], Instant)>>> = Mutex::new(None);
+///
+/// Per link, and not per address, because it used to be per address: then
+/// unplugging at home and joining a network handing out the same prefix
+/// reported the old gateway's hardware address, and its vendor, against the
+/// new one, and an address simply vacant on the new network came back as a
+/// host that was there. Two interfaces on overlapping networks at once had the
+/// same problem without any unplugging at all. Time alone cannot tell those
+/// apart: the entry is not old, it is about somewhere else.
+static REMEMBERED: Mutex<Option<HashMap<LinkId, HashMap<Ipv4Addr, ([u8; 6], Instant)>>>> =
+    Mutex::new(None);
 
 /// How long a remembered address is still worth offering. Long enough to cover
 /// a session of scanning the same network, short enough that a device swapped
 /// out this morning is not still being reported this afternoon.
 const REMEMBER_FOR: Duration = Duration::from_secs(600);
 
-fn remember(ip: Ipv4Addr, mac: [u8; 6]) {
+fn remember(link: &LinkId, ip: Ipv4Addr, mac: [u8; 6]) {
     let mut held = REMEMBERED.lock().unwrap();
     let table = held.get_or_insert_with(HashMap::new);
-    table.insert(ip, (mac, Instant::now()));
+    table.entry(link.clone()).or_default().insert(ip, (mac, Instant::now()));
 }
 
-/// What we last heard from this address, if it was recent enough to repeat.
-fn remembered(ip: Ipv4Addr) -> Option<[u8; 6]> {
+/// What this link last heard from this address, if it was recent enough to
+/// repeat.
+fn remembered(link: &LinkId, ip: Ipv4Addr) -> Option<[u8; 6]> {
     let mut held = REMEMBERED.lock().unwrap();
     let table = held.as_mut()?;
-    table.retain(|_, (_, at)| at.elapsed() < REMEMBER_FOR);
-    table.get(&ip).map(|(mac, _)| *mac)
+    for seen in table.values_mut() {
+        seen.retain(|_, (_, at)| at.elapsed() < REMEMBER_FOR);
+    }
+    // A link nobody is on any more, whose addresses have all expired, is not
+    // worth a row of its own.
+    table.retain(|_, seen| !seen.is_empty());
+    table.get(link)?.get(&ip).map(|(mac, _)| *mac)
 }
 
 struct Inner {
     fd: RawFd,
     src_mac: [u8; 6],
     src_ip: Ipv4Addr,
+    /// Which link this is, so what the reader overhears is filed under the
+    /// network it was overheard on and not offered to a different one.
+    link: LinkId,
     /// Every sender seen on the wire, not just the ones we asked about. A
     /// sweep provokes a great deal of ARP traffic and listening to all of it
     /// means most hosts are already known by the time we ask.
@@ -171,6 +206,7 @@ impl ArpLink {
             fd,
             src_mac,
             src_ip,
+            link: LinkId { interface: interface.to_string(), src_ip },
             learned: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
@@ -223,19 +259,21 @@ impl ArpLink {
         };
 
         if let Ok(Some(mac)) = tokio::time::timeout(timeout, waiting).await {
-            remember(dst, mac);
+            remember(&self.inner.link, dst, mac);
             return Some(Answer { mac, rtt: start.elapsed(), fresh: true });
         }
 
         self.forget_waiter(dst, id);
         if let Some(mac) = self.inner.learned.lock().unwrap().get(&dst).copied() {
-            remember(dst, mac);
+            remember(&self.inner.link, dst, mac);
             return Some(Answer { mac, rtt: start.elapsed(), fresh: true });
         }
-        // Nothing answered now. What this address was last seen to be is
-        // better than an empty column, as long as it is offered as history
-        // instead of as an observation.
-        remembered(dst).map(|mac| Answer { mac, rtt: start.elapsed(), fresh: false })
+        // Nothing answered now. What this address was last seen to be on this
+        // link is better than an empty column, as long as it is offered as
+        // history instead of as an observation. What another link heard is not
+        // history about this one, so it is not asked for.
+        remembered(&self.inner.link, dst)
+            .map(|mac| Answer { mac, rtt: start.elapsed(), fresh: false })
     }
 
     /// Takes one caller's registration away, leaving anybody else waiting on
@@ -404,7 +442,7 @@ fn dispatch(inner: &Inner, data: &[u8]) {
 
         if let Some((ip, mac)) = parse_reply(&data[off + hdrlen..off + hdrlen + caplen]) {
             inner.learned.lock().unwrap().insert(ip, mac);
-            remember(ip, mac);
+            remember(&inner.link, ip, mac);
             if let Some(waiters) = inner.waiters.lock().unwrap().remove(&ip) {
                 for w in waiters {
                     let _ = w.tx.send(mac);
@@ -445,12 +483,65 @@ fn parse_reply(frame: &[u8]) -> Option<(Ipv4Addr, [u8; 6])> {
     Some((ip, mac))
 }
 
+/// What each interface was last found to hold, and when it was asked.
+static OWN_MACS: Mutex<Option<HashMap<String, (Option<[u8; 6]>, Instant)>>> = Mutex::new(None);
+
+/// How long an answer about this machine's own hardware stands before the
+/// system is asked again.
+///
+/// A burned-in address does not change while the application runs, so this
+/// could nearly be forever, but an interface name can end up on different
+/// hardware: unplug a USB Ethernet adapter and the next one is `en5` as well.
+/// Long enough that drawing never pays for it twice, short enough that a
+/// swapped adapter is not reported as the old one for the rest of the session.
+const OWN_MAC_FOR: Duration = Duration::from_secs(60);
+
 /// This machine's real hardware address on an interface.
 ///
 /// `getifaddrs` reports `02:00:00:00:00:00` on recent macOS, which is useless
 /// as the sender of an ARP request, so the configuration database is asked
 /// instead, which still tells the truth.
+///
+/// The answer is kept, because asking is not cheap. `networksetup` is a
+/// separate program, and forking and executing it costs some tens of
+/// milliseconds whether it comes back with an address or with an error. The
+/// interfaces page reads this machine's hardware address while it is building
+/// a frame, and a frame is built on every hover, resize and notification, so
+/// asking each time meant a process forked per interface on the thread that
+/// draws and a window that stopped answering the mouse for as long as that
+/// took.
 pub fn real_mac(interface: &str) -> Option<[u8; 6]> {
+    if let Some(known) = recently_asked(interface) {
+        return known;
+    }
+    // Deliberately not under the lock: a scan opening a link and a frame being
+    // drawn ask about the same interface at the same time, and making one wait
+    // on the other's fork is the stall this is here to avoid. Two answers to
+    // the same question cost one extra fork and agree with each other.
+    let found = ask_the_system(interface);
+    OWN_MACS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(interface.to_string(), (found, Instant::now()));
+    found
+}
+
+/// What an interface was last found to hold, if it was asked recently enough
+/// not to ask again.
+///
+/// Having no address is remembered too. Establishing that a tunnel has no
+/// hardware costs the same fork and exec as reading a real port's address, and
+/// a Mac carries several tunnels, so forgetting the empty answers would leave
+/// most of the cost in place.
+fn recently_asked(interface: &str) -> Option<Option<[u8; 6]>> {
+    let mut held = OWN_MACS.lock().unwrap();
+    let table = held.as_mut()?;
+    table.retain(|_, (_, at)| at.elapsed() < OWN_MAC_FOR);
+    table.get(interface).map(|(mac, _)| *mac)
+}
+
+fn ask_the_system(interface: &str) -> Option<[u8; 6]> {
     #[cfg(target_os = "macos")]
     if let Some(mac) = mac_from_networksetup(interface) {
         return Some(mac);
@@ -543,17 +634,80 @@ mod tests {
         // A BPF handle lives as long as one scan, so without this the second
         // scan of a network starts knowing nothing and has to ask again for
         // every host, which left the hardware column half empty.
+        let link = LinkId { interface: "en0".into(), src_ip: Ipv4Addr::new(198, 51, 100, 20) };
         let addr = Ipv4Addr::new(198, 51, 100, 7);
-        assert_eq!(remembered(addr), None);
-        remember(addr, [1, 2, 3, 4, 5, 6]);
-        assert_eq!(remembered(addr), Some([1, 2, 3, 4, 5, 6]));
+        assert_eq!(remembered(&link, addr), None);
+        remember(&link, addr, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(remembered(&link, addr), Some([1, 2, 3, 4, 5, 6]));
 
         // And forgotten once it is old enough to be about a different device.
-        REMEMBERED.lock().unwrap().as_mut().expect("the table").insert(
-            addr,
-            ([1, 2, 3, 4, 5, 6], Instant::now() - REMEMBER_FOR - Duration::from_secs(1)),
+        REMEMBERED
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("the table")
+            .get_mut(&link)
+            .expect("what this link heard")
+            .insert(
+                addr,
+                ([1, 2, 3, 4, 5, 6], Instant::now() - REMEMBER_FOR - Duration::from_secs(1)),
+            );
+        assert_eq!(remembered(&link, addr), None);
+    }
+
+    #[test]
+    fn what_one_network_said_is_not_offered_to_another() {
+        // The same address on two networks is two different hosts, and the
+        // prefixes consumer routers hand out are the same everywhere. Keyed on
+        // the address alone, unplugging at home and joining a network with the
+        // same prefix reported the old gateway's hardware address, and its
+        // vendor, against the new one.
+        let home = LinkId { interface: "en0".into(), src_ip: Ipv4Addr::new(192, 168, 1, 40) };
+        let away = LinkId { interface: "en0".into(), src_ip: Ipv4Addr::new(192, 168, 1, 77) };
+        let gateway = Ipv4Addr::new(192, 168, 1, 1);
+
+        remember(&home, gateway, [0xaa; 6]);
+        assert_eq!(remembered(&home, gateway), Some([0xaa; 6]));
+        // A different link has heard nothing about it, so it says nothing.
+        assert_eq!(remembered(&away, gateway), None);
+
+        // And each link keeps its own answer.
+        remember(&away, gateway, [0xbb; 6]);
+        assert_eq!(remembered(&home, gateway), Some([0xaa; 6]));
+        assert_eq!(remembered(&away, gateway), Some([0xbb; 6]));
+    }
+
+    #[test]
+    fn the_system_is_not_asked_for_our_own_hardware_address_once_per_frame() {
+        // The interfaces page reads this machine's hardware address while it
+        // is building a frame, and asking means forking and executing
+        // networksetup, tens of milliseconds per interface on the thread that
+        // draws. Planting an answer the system could not possibly give and
+        // seeing it come back is how we know it is asked once and not again.
+        let planted = [0x84, 0x2f, 0x57, 0x42, 0x58, 0xf4];
+        OWN_MACS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert("no-such-if0".to_string(), (Some(planted), Instant::now()));
+        assert_eq!(real_mac("no-such-if0"), Some(planted));
+
+        // An interface with no address to give has to be remembered as well:
+        // coming back empty costs the same fork as coming back with an
+        // address, and it is the tunnels that come back empty.
+        assert_eq!(real_mac("no-such-if1"), None);
+        assert!(
+            OWN_MACS.lock().unwrap().as_ref().expect("the table").contains_key("no-such-if1"),
+            "an interface with no hardware address was not remembered as having none"
         );
-        assert_eq!(remembered(addr), None);
+
+        // And once it is old enough the system is asked again, so a name given
+        // to different hardware is not answered for out of date for ever.
+        OWN_MACS.lock().unwrap().as_mut().expect("the table").insert(
+            "no-such-if0".to_string(),
+            (Some(planted), Instant::now() - OWN_MAC_FOR - Duration::from_secs(1)),
+        );
+        assert_eq!(real_mac("no-such-if0"), None);
     }
 
     #[test]

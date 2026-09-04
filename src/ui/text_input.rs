@@ -242,7 +242,7 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
+            self.replace_text_in_range(None, &one_line(&text), window, cx);
         }
     }
 
@@ -350,6 +350,45 @@ impl TextInput {
     }
 }
 
+/// What a paste becomes in a field that is only one line high.
+///
+/// A line break has nowhere to go here, so it becomes the space that separated
+/// the two lines. The carriage return has to be named alongside the newline:
+/// text copied out of a Windows file, a terminal or a mail client ends its
+/// lines with both, and flattening only the newline left a bare carriage
+/// return sitting in the value. It shapes to nothing, so the field looks like
+/// what was copied, and it is then saved into a variable or sent as part of a
+/// header exactly as if it had been typed. A `\r\n` pair is one break between
+/// two lines and so becomes one space, not two.
+fn one_line(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\r', '\n'], " ")
+}
+
+/// Where the selection an IME reports for its marked text lands in the value,
+/// given that the marked text was put at byte offset `at`.
+///
+/// The IME counts that selection in UTF-16 units from the start of the text it
+/// just marked, not from the start of the value, so it has to be measured
+/// inside `marked` and only then shifted to where `marked` was placed. The
+/// units are also the IME's own idea of the string, so an offset past its end
+/// stops at the end rather than running off it.
+fn marked_selection(at: usize, marked: &str, selected_utf16: &Range<usize>) -> Range<usize> {
+    let byte_offset = |units: usize| {
+        let (mut utf8, mut utf16) = (0, 0);
+        for ch in marked.chars() {
+            if utf16 >= units {
+                break;
+            }
+            utf16 += ch.len_utf16();
+            utf8 += ch.len_utf8();
+        }
+        utf8
+    };
+    let start = byte_offset(selected_utf16.start);
+    let end = byte_offset(selected_utf16.end).max(start);
+    at + start..at + end
+}
+
 impl EntityInputHandler for TextInput {
     fn text_for_range(
         &mut self,
@@ -422,10 +461,15 @@ impl EntityInputHandler for TextInput {
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
+        // The selection was read as if the IME counted it from the start of
+        // the whole value and then had `range.end` added to its end, which
+        // pushed it past the end of the content and often into the middle of a
+        // character: composing one Japanese syllable into an empty field left
+        // the selection at 3..4 over three bytes, and the next insertion, copy
+        // or cancelled composition sliced the string out of bounds.
         self.selected_range = new_selected_range_utf16
             .as_ref()
-            .map(|r| self.range_from_utf16(r))
-            .map(|r| r.start + range.start..r.end + range.end)
+            .map(|r| marked_selection(range.start, new_text, r))
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.revision += 1;
         cx.notify();
@@ -452,9 +496,17 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
+        // `localize` has already answered the question: it gives the point
+        // measured from the field's own origin, which is the coordinate the
+        // shaped line indexes by. Subtracting it from the window point again
+        // cancelled the pointer out and left the field's left edge, so every
+        // lookup the system makes here, the dictionary panel or an IME asking
+        // what sits under the pointer, was answered about a position that
+        // depended on where the field happened to be on screen rather than on
+        // where the pointer was.
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        let utf8_index = last_layout.index_for_x(line_point.x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -667,5 +719,75 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pasting_a_windows_line_break_leaves_no_carriage_return_in_the_value() {
+        // Copying one line out of a CRLF file takes its ending with it. Only
+        // the newline used to be flattened, so what landed in the field was
+        // "10.0.0.1\r ": a host name that looks right, resolves to nothing,
+        // and is saved to the workspace with the carriage return still in it.
+        assert_eq!(one_line("10.0.0.1\r\n"), "10.0.0.1 ");
+        // Two lines are one break apart, so they end up one space apart.
+        assert_eq!(one_line("a\r\nb"), "a b");
+        // A carriage return can also arrive on its own.
+        assert_eq!(one_line("a\rb"), "a b");
+        assert!(!one_line("a\r\nb\rc\nd").contains('\r'));
+        // A plain newline still becomes the single space it always did, and a
+        // paste that was one line to begin with is untouched.
+        assert_eq!(one_line("a\nb"), "a b");
+        assert_eq!(one_line("10.0.0.1"), "10.0.0.1");
+    }
+
+    #[test]
+    fn a_marked_selection_is_measured_inside_the_text_that_was_marked() {
+        // One Japanese syllable: three bytes, one UTF-16 unit, with the caret
+        // reported at the end of the marked text.
+        assert_eq!(marked_selection(0, "\u{304b}", &(1..1)), 3..3);
+        // The same syllable composed further along the line. The offset is
+        // counted in the marked text and only then moved to where the marked
+        // text sits, so the three ASCII bytes before it do not shift it.
+        assert_eq!(marked_selection(3, "\u{304b}", &(1..1)), 6..6);
+        // A whole marked run selected rather than a caret inside it.
+        assert_eq!(marked_selection(3, "\u{304b}\u{306a}", &(0..2)), 3..9);
+    }
+
+    #[test]
+    fn a_composition_over_an_earlier_mark_leaves_a_selection_the_value_can_be_sliced_by() {
+        // Typing "k" and then "a" with a Japanese IME replaces the mark on
+        // "k" with "\u{304b}", so the value is three bytes long and the caret
+        // is reported one UTF-16 unit in. The end of the replaced range used
+        // to be added to the end of the selection, which gave 3..4 over three
+        // bytes and panicked the moment anything sliced the value by it.
+        let value = "\u{304b}";
+        let selection = marked_selection(0, value, &(1..1));
+        assert!(selection.start <= selection.end);
+        assert!(selection.end <= value.len());
+        assert!(value.is_char_boundary(selection.start) && value.is_char_boundary(selection.end));
+        assert_eq!(&value[selection], "");
+    }
+
+    #[test]
+    fn a_cancelled_composition_leaves_the_caret_where_the_marked_text_was() {
+        // An IME cancels by marking an empty string over the range it had
+        // marked before. That range was 3..6 in the old value, so adding its
+        // end left a 3..6 selection over a value only three bytes long.
+        let value = "abc";
+        let selection = marked_selection(3, "", &(0..0));
+        assert_eq!(selection, 3..3);
+        assert!(selection.end <= value.len());
+    }
+
+    #[test]
+    fn a_marked_selection_reported_past_the_end_of_the_marked_text_stops_at_its_end() {
+        assert_eq!(marked_selection(2, "ab", &(0..9)), 2..4);
+        // A reversed pair would produce a range that cannot index a string at
+        // all, so the end never precedes the start.
+        assert_eq!(marked_selection(2, "ab", &(2..0)), 4..4);
     }
 }

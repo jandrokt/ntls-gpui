@@ -184,12 +184,23 @@ fn tool_line(
                 .truncate()
                 .child(tool.desc()),
         )
-        // The first nine tools answer to a number key, so the number is worth
-        // showing where it can be learned.
-        .when(position < 9, |d| {
-            d.child(keycap(&crate::sys::shortcut_label(&format!("cmd-{}", position + 1)), theme))
-        })
+        // The tools a number key opens say so, since this page is the only
+        // place those keys are advertised.
+        .when_some(number_key(position), |d, key| d.child(keycap(&key, theme)))
         .into_any_element()
+}
+
+/// How many tools a number key opens: `app::bind_keys` binds ⌘1 through ⌘8,
+/// and there is no ninth action for a ninth key to reach.
+const NUMBER_KEYS: usize = 8;
+
+/// The number key that opens the tool in this position, labelled for this
+/// system, or nothing if no key reaches it.
+fn number_key(position: usize) -> Option<String> {
+    // This page counted to nine while the bindings stopped at eight, so the
+    // ninth tool wore a ⌘9 keycap that nothing answered to: the one place the
+    // number keys are taught was teaching a key that does nothing.
+    (position < NUMBER_KEYS).then(|| crate::sys::shortcut_label(&format!("cmd-{}", position + 1)))
 }
 
 fn shortcut(
@@ -215,4 +226,33 @@ fn shortcut(
         .child(div().flex_1().min_w_0().text_small().text_color(theme.text).truncate().child(label.to_string()))
         .when(!key.is_empty(), |d| d.child(keycap(key, theme)))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NUMBER_KEYS, number_key};
+
+    /// There are ten built-in tools and eight number keys, so the line
+    /// between a tool that has one and a tool that does not falls inside the
+    /// list and has to be drawn in the right place. A keycap on a tool past
+    /// the last binding is a shortcut the application will not honour.
+    #[test]
+    fn a_tool_is_given_a_keycap_only_when_a_number_key_actually_opens_it() {
+        for position in 0..NUMBER_KEYS {
+            assert!(number_key(position).is_some(), "tool {position} lost its number key");
+        }
+        assert_eq!(number_key(NUMBER_KEYS), None, "ninth tool advertises an unbound key");
+        assert_eq!(number_key(NUMBER_KEYS + 1), None);
+    }
+
+    /// The keycap counts from one while the position counts from zero, and
+    /// the keycap has to name the key `app::bind_keys` bound, not the one
+    /// next to it.
+    #[test]
+    fn the_keycap_names_the_key_that_opens_that_particular_tool() {
+        let first = crate::sys::shortcut_label("cmd-1");
+        let last = crate::sys::shortcut_label("cmd-8");
+        assert_eq!(number_key(0), Some(first));
+        assert_eq!(number_key(NUMBER_KEYS - 1), Some(last));
+    }
 }

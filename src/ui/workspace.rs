@@ -118,6 +118,9 @@ pub struct Workspace {
     pub vars: BTreeMap<String, store::Var>,
     /// The directory this workspace is, on disk.
     pub dir: PathBuf,
+    /// The folder names last read off disk, and when. Behind a cell because
+    /// the side bar asks for them while holding the workspace by reference.
+    disk_folders: std::cell::RefCell<Option<(std::time::Instant, Vec<String>)>>,
     /// The number the next tool's file is named with.
     next_index: usize,
 }
@@ -139,6 +142,7 @@ impl Workspace {
             vars: BTreeMap::new(),
             dir,
             next_index: 1,
+            disk_folders: std::cell::RefCell::new(None),
         }
     }
 
@@ -284,17 +288,11 @@ impl Workspace {
                 None => counts.push((target, 1)),
             }
         }
-        // The most-used target wins; ties go to whichever was opened first,
-        // the one the investigation started from.
-        counts
-            .into_iter()
-            .max_by_key(|(_, n)| *n)
-            .map(|(t, _)| t)
-            .unwrap_or_else(|| match self.jobs.len() {
-                0 => "New workspace".into(),
-                1 => self.jobs[0].name(),
-                n => format!("{n} tools"),
-            })
+        most_used(counts).unwrap_or_else(|| match self.jobs.len() {
+            0 => "New workspace".into(),
+            1 => self.jobs[0].name(),
+            n => format!("{n} tools"),
+        })
     }
 
     pub fn job(&self, id: usize) -> Option<&Job> {
@@ -357,83 +355,154 @@ impl Workspace {
             self.jobs.iter().filter_map(|j| j.folder.clone()).collect();
         names.extend(self.docs.iter().filter_map(|d| d.folder.clone()));
         names.extend(self.flows.iter().filter_map(|f| f.folder.clone()));
-        names.extend(store::folders(&self.dir));
+        names.extend(self.disk_folders());
         names.sort();
         names.dedup();
         names
     }
 
-    /// Reorders a job so it sits before/at target job.
+    /// The folder names on disk, remembered for a moment.
+    ///
+    /// Finding them is a walk of the workspace directory and everything
+    /// inside it, and the side bar asks every time it draws. So the answer is
+    /// kept briefly rather than the disk being walked afresh for every frame,
+    /// which on a workspace of any size is the difference between a side bar
+    /// that scrolls and one that stutters.
+    fn disk_folders(&self) -> Vec<String> {
+        const FRESH: std::time::Duration = std::time::Duration::from_millis(750);
+
+        let mut cached = self.disk_folders.borrow_mut();
+        if let Some((looked, names)) = cached.as_ref()
+            && looked.elapsed() < FRESH
+        {
+            return names.clone();
+        }
+        let names = store::folders(&self.dir);
+        *cached = Some((std::time::Instant::now(), names.clone()));
+        names
+    }
+
+    /// Forgets the folder list, so the next look is a fresh one.
+    ///
+    /// For when ntls has just made a folder itself: waiting out the moment
+    /// above would mean clicking "New folder" and watching nothing happen.
+    pub fn forget_folders(&self) {
+        *self.disk_folders.borrow_mut() = None;
+    }
+
+    /// Puts a tool down just after the tool it was dropped on, which is what
+    /// dropping one row onto another in the side bar means.
     pub fn reorder_job_after(&mut self, source_id: usize, target_id: usize) -> bool {
         let Some(from) = self.jobs.iter().position(|j| j.id == source_id) else { return false };
-        let job = self.jobs.remove(from);
-        let target_pos = self.jobs.iter().position(|j| j.id == target_id).unwrap_or(self.jobs.len());
-        self.jobs.insert(target_pos, job);
+        move_after(&mut self.jobs, from, |j| j.id == target_id);
         true
     }
 
     /// Moves a tool up or down within its group.
+    ///
+    /// Up and down mean what the side bar shows, and it lists a group with the
+    /// starred tools first. Stepping through the job vector instead moved a
+    /// tool past whatever happened to be next to it in the file order, which
+    /// in a group holding both starred and plain tools is not the row above or
+    /// below it on screen: the favourites sort put the pair straight back the
+    /// way they were, so the list looked untouched while the new order was
+    /// written to the workspace file all the same.
     pub fn move_job(&mut self, id: usize, delta: isize) -> bool {
-        let Some(pos) = self.jobs.iter().position(|j| j.id == id) else { return false };
+        let Some((pos, group)) = self.job_group(id) else { return false };
+        let Some((a, b)) = move_within_group(&group, pos, delta) else { return false };
+        self.jobs.swap(a, b);
+        true
+    }
+
+    /// Where a tool sits in the job vector, and the group the side bar draws
+    /// it in: the places its members hold and whether each is starred.
+    fn job_group(&self, id: usize) -> Option<(usize, Vec<(usize, bool)>)> {
+        let pos = self.jobs.iter().position(|j| j.id == id)?;
         let folder = self.jobs[pos].folder.clone();
         let stage = Stage::of(&self.jobs[pos].state);
-        let same_group: Vec<usize> = self
+        let group = self
             .jobs
             .iter()
             .enumerate()
             .filter(|(_, j)| j.folder == folder && Stage::of(&j.state) == stage)
-            .map(|(i, _)| i)
+            .map(|(i, j)| (i, j.favorite))
             .collect();
-        let Some(idx_in_group) = same_group.iter().position(|&i| i == pos) else { return false };
-        let target_idx = idx_in_group as isize + delta;
-        if target_idx < 0 || target_idx as usize >= same_group.len() {
-            return false;
-        }
-        let swap_with = same_group[target_idx as usize];
-        self.jobs.swap(pos, swap_with);
-        true
+        Some((pos, group))
+    }
+
+    /// Whether moving this tool would move it.
+    ///
+    /// Asked before the menu is built, so an item that cannot act is left out
+    /// of it. A tool at the top of its group has nowhere above it, and so has
+    /// the first unstarred tool, because the row above that one is the last
+    /// starred one and the favourites sort would put the pair straight back.
+    pub fn can_move_job(&self, id: usize, delta: isize) -> bool {
+        self.job_group(id)
+            .is_some_and(|(pos, group)| move_within_group(&group, pos, delta).is_some())
     }
 
     /// Moves a document up or down within its folder.
     pub fn move_doc(&mut self, id: usize, delta: isize) -> bool {
-        let Some(pos) = self.docs.iter().position(|d| d.id == id) else { return false };
+        let Some((pos, group)) = self.doc_group(id) else { return false };
+        let Some((a, b)) = move_within_group(&group, pos, delta) else { return false };
+        self.docs.swap(a, b);
+        true
+    }
+
+    /// The same for a document as [`Self::job_group`] is for a tool.
+    ///
+    /// A document's star is not on the document, which is a file on disk with
+    /// nowhere to keep one, so it is read out of the workspace's marks. That
+    /// is where the side bar reads it from too, and the side bar sorts by it,
+    /// which this used to ignore: stepping through the vector moved a document
+    /// past whichever one happened to be next to it in the file order, and the
+    /// favourites sort put the pair back, so the list did not change.
+    fn doc_group(&self, id: usize) -> Option<(usize, Vec<(usize, bool)>)> {
+        let pos = self.docs.iter().position(|d| d.id == id)?;
         let folder = self.docs[pos].folder.clone();
-        let same_group: Vec<usize> = self
+        let group = self
             .docs
             .iter()
             .enumerate()
             .filter(|(_, d)| d.folder == folder)
-            .map(|(i, _)| i)
+            .map(|(i, d)| (i, self.mark(Item::Doc(d.id)).favorite))
             .collect();
-        let Some(idx_in_group) = same_group.iter().position(|&i| i == pos) else { return false };
-        let target_idx = idx_in_group as isize + delta;
-        if target_idx < 0 || target_idx as usize >= same_group.len() {
-            return false;
-        }
-        let swap_with = same_group[target_idx as usize];
-        self.docs.swap(pos, swap_with);
-        true
+        Some((pos, group))
+    }
+
+    /// Whether moving this document would move it.
+    pub fn can_move_doc(&self, id: usize, delta: isize) -> bool {
+        self.doc_group(id)
+            .is_some_and(|(pos, group)| move_within_group(&group, pos, delta).is_some())
     }
 
     /// Moves a workflow up or down within its folder.
     pub fn move_flow(&mut self, id: usize, delta: isize) -> bool {
-        let Some(pos) = self.flows.iter().position(|f| f.id == id) else { return false };
+        let Some((pos, group)) = self.flow_group(id) else { return false };
+        let Some((a, b)) = move_within_group(&group, pos, delta) else { return false };
+        self.flows.swap(a, b);
+        true
+    }
+
+    /// The same for a workflow, whose star is kept in the marks as a
+    /// document's is.
+    fn flow_group(&self, id: usize) -> Option<(usize, Vec<(usize, bool)>)> {
+        let pos = self.flows.iter().position(|f| f.id == id)?;
         let folder = self.flows[pos].folder.clone();
-        let same_group: Vec<usize> = self
+        let group = self
             .flows
             .iter()
             .enumerate()
             .filter(|(_, f)| f.folder == folder)
-            .map(|(i, _)| i)
+            .map(|(i, f)| (i, self.mark(Item::Flow(f.id)).favorite))
             .collect();
-        let Some(idx_in_group) = same_group.iter().position(|&i| i == pos) else { return false };
-        let target_idx = idx_in_group as isize + delta;
-        if target_idx < 0 || target_idx as usize >= same_group.len() {
-            return false;
-        }
-        let swap_with = same_group[target_idx as usize];
-        self.flows.swap(pos, swap_with);
-        true
+        Some((pos, group))
+    }
+
+    /// Whether moving this workflow would move it.
+    pub fn can_move_flow(&self, id: usize, delta: isize) -> bool {
+        self.flow_group(id)
+            .is_some_and(|(pos, group)| move_within_group(&group, pos, delta).is_some())
     }
 
     /// Adds a job and selects it, since adding one is always to look at it.
@@ -638,6 +707,57 @@ fn neighbour(open: &[usize], closing: usize) -> Option<usize> {
     open.get(at + 1).or_else(|| at.checked_sub(1).and_then(|p| open.get(p))).copied()
 }
 
+/// Which two places in the job vector a move up or down exchanges.
+///
+/// The group arrives as the places its members hold in the vector and whether
+/// each is starred, and is walked in the order the side bar draws it: the
+/// starred ones first, then the rest as they come. The pair to exchange is
+/// therefore rarely the pair that sits together in the vector.
+///
+/// A step that would take a tool across the line the favourites sort draws is
+/// no move at all, since the sort hands the two back in the order they were
+/// already in, so it is refused instead of rewriting the saved order for a
+/// list that does not change.
+fn move_within_group(group: &[(usize, bool)], pos: usize, delta: isize) -> Option<(usize, usize)> {
+    let mut shown: Vec<(usize, bool)> = group.to_vec();
+    shown.sort_by_key(|&(_, favourite)| !favourite);
+    let at = shown.iter().position(|&(place, _)| place == pos)?;
+    let &(other, favourite) = shown.get(at.checked_add_signed(delta)?)?;
+    (favourite == shown[at].1).then_some((pos, other))
+}
+
+/// Which target the workspace is named after, out of the ones its tools are
+/// pointed at and how often each is used.
+///
+/// The most-used one wins, and a tie goes to whichever was counted first,
+/// since the tools are counted in the order they were opened and the first is
+/// the one the investigation started from. Asking for the greatest count
+/// instead took the last of the tied ones, because that is the one
+/// `max_by_key` hands back: with a tool each on two addresses, which is most
+/// of the time, the workspace was named after whichever tool had just been
+/// added and renamed itself out from under the user every time another
+/// address was pointed at. Reversing the count and asking for the least
+/// keeps the first of the tie.
+fn most_used(counts: Vec<(String, usize)>) -> Option<String> {
+    counts.into_iter().min_by_key(|(_, n)| std::cmp::Reverse(*n)).map(|(target, _)| target)
+}
+
+/// Lifts the thing at `from` out of a list and puts it back down just after
+/// the one `is_target` picks out, or on the end if that one has gone.
+///
+/// The target's place is read after the removal, so it is a place in the
+/// shortened list, and the thing dropped belongs one past it. Putting it at
+/// the target's own place instead left it above the row the pointer was over:
+/// dropping a tool onto the row below it then changed nothing at all, so the
+/// drop read as ignored, and every other drop landed the tool on the wrong
+/// side of the row it was aimed at and wrote that order to the workspace
+/// file, where it outlasted a restart.
+fn move_after<T>(items: &mut Vec<T>, from: usize, is_target: impl Fn(&T) -> bool) {
+    let item = items.remove(from);
+    let at = items.iter().position(is_target).map_or(items.len(), |place| place + 1);
+    items.insert(at, item);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,6 +776,28 @@ mod tests {
         // A name the user typed always wins.
         ws.name_override = Some("Home LAN".into());
         assert_eq!(ws.name(), "Home LAN");
+    }
+
+    #[test]
+    fn a_tie_between_two_targets_keeps_the_one_the_investigation_started_from() {
+        // The targets are counted in the order their tools were opened, so
+        // the first of a tie is the address the workspace was opened on.
+        // Asking for the greatest count hands back the last of the tied ones,
+        // which named a workspace after whichever tool had just been added.
+        fn counted(pairs: &[(&str, usize)]) -> Option<String> {
+            super::most_used(pairs.iter().map(|&(t, n)| (t.to_string(), n)).collect())
+        }
+        assert_eq!(
+            counted(&[("192.168.1.1", 1), ("1.1.1.1", 1)]).as_deref(),
+            Some("192.168.1.1")
+        );
+
+        // A clear winner wins wherever in the list it sits.
+        assert_eq!(counted(&[("192.168.1.1", 1), ("1.1.1.1", 3)]).as_deref(), Some("1.1.1.1"));
+        assert_eq!(counted(&[("1.1.1.1", 3), ("192.168.1.1", 1)]).as_deref(), Some("1.1.1.1"));
+
+        // Nothing pointed anywhere is nothing to be named after.
+        assert_eq!(counted(&[]), None);
     }
 
     #[test]
@@ -751,6 +893,51 @@ mod tests {
     }
 
     #[test]
+    fn a_starred_document_is_moved_against_the_order_the_side_bar_draws() {
+        // The side bar draws a folder with the starred documents first, and
+        // this used to step through the vector instead: a document was moved
+        // past whichever one happened to be next to it in the file order, the
+        // favourites sort put the pair straight back, and the list did not
+        // change while the new order was saved anyway.
+        let mut ws = workspace();
+        for id in 1..=3 {
+            ws.docs.push(crate::ui::notes::Doc {
+                id,
+                stem: format!("doc{id}"),
+                path: PathBuf::from(format!("/tmp/doc{id}.md")),
+                source: String::new(),
+                open: true,
+                folder: None,
+                seen: None,
+                scroll: gpui::ScrollHandle::new(),
+            });
+        }
+        // Star the last one, so the drawn order is 3, 1, 2.
+        ws.set_mark(Item::Doc(3), store::Mark { favorite: true, ..Default::default() });
+        let drawn = |ws: &Workspace| {
+            let mut ids: Vec<usize> = ws.docs_in(None).iter().map(|d| d.id).collect();
+            ids.sort_by_key(|id| !ws.mark(Item::Doc(*id)).favorite);
+            ids
+        };
+        assert_eq!(drawn(&ws), vec![3, 1, 2]);
+
+        // Document 1 is drawn second, and moving it down swaps it with 2.
+        assert!(ws.can_move_doc(1, 1));
+        assert!(ws.move_doc(1, 1));
+        assert_eq!(drawn(&ws), vec![3, 2, 1]);
+
+        // It is now last, so there is nowhere below it, and the menu is asked
+        // before it offers the move.
+        assert!(!ws.can_move_doc(1, 1));
+        assert!(!ws.move_doc(1, 1));
+
+        // And nothing crosses the line the favourites sort draws: the topmost
+        // unstarred document has the starred one above it and cannot pass it.
+        assert!(!ws.can_move_doc(2, -1));
+        assert!(!ws.can_move_doc(3, -1), "the starred one is already at the top");
+    }
+
+    #[test]
     fn documents_and_workflows_can_be_grouped_in_folders_and_reordered() {
         let mut ws = workspace();
         let doc1 = crate::ui::notes::Doc {
@@ -784,6 +971,63 @@ mod tests {
         assert!(ws.move_doc(1, 1));
         assert_eq!(ws.docs[0].id, 2);
         assert_eq!(ws.docs[1].id, 1);
+    }
+
+    #[test]
+    fn moving_a_tool_exchanges_it_with_the_row_the_side_bar_draws_beside_it() {
+        // A group of plain tools reads the same on screen as in the file, so
+        // neighbours there are neighbours here.
+        let plain = [(0usize, false), (1usize, false), (2usize, false)];
+        assert_eq!(super::move_within_group(&plain, 1, 1), Some((1, 2)));
+        assert_eq!(super::move_within_group(&plain, 1, -1), Some((1, 0)));
+        assert_eq!(super::move_within_group(&plain, 0, -1), None, "nothing above the first");
+        assert_eq!(super::move_within_group(&plain, 2, 1), None, "nothing below the last");
+
+        // With a plain tool sitting between two starred ones in the file, the
+        // side bar draws the starred pair together, and moving one down has to
+        // reach past the plain one to the other star. Taking the next place in
+        // the file instead swapped a star with the plain tool, which the
+        // favourites sort undid on the way back out.
+        let mixed = [(0usize, true), (1usize, false), (2usize, true)];
+        assert_eq!(super::move_within_group(&mixed, 0, 1), Some((0, 2)));
+        assert_eq!(super::move_within_group(&mixed, 2, -1), Some((2, 0)));
+
+        // A place that is not in the group is nothing to move.
+        assert_eq!(super::move_within_group(&mixed, 7, 1), None);
+    }
+
+    #[test]
+    fn a_tool_is_not_moved_across_the_line_the_favourites_sort_draws() {
+        // The file holds the plain tool first and the starred one second; the
+        // side bar shows them the other way round. Exchanging the two leaves
+        // the side bar exactly as it was, since the sort puts the star back on
+        // top, and the workspace file is rewritten for a list nobody saw
+        // change. There is nowhere for either of them to go.
+        let group = [(0usize, false), (1usize, true)];
+        assert_eq!(super::move_within_group(&group, 0, -1), None);
+        assert_eq!(super::move_within_group(&group, 0, 1), None);
+        assert_eq!(super::move_within_group(&group, 1, 1), None);
+        assert_eq!(super::move_within_group(&group, 1, -1), None);
+    }
+
+    #[test]
+    fn a_tool_dropped_onto_another_comes_to_rest_just_after_it() {
+        // Dragging the first tool onto the second puts it below the second.
+        // Landing it at the second's own place instead left the list exactly
+        // as it was, so the drop looked like nothing had happened.
+        let mut order = vec![1usize, 2, 3];
+        super::move_after(&mut order, 0, |&id| id == 2);
+        assert_eq!(order, vec![2, 1, 3]);
+
+        // Dragging up the list is the same rule read the other way: the tool
+        // follows the row it was dropped on.
+        super::move_after(&mut order, 2, |&id| id == 2);
+        assert_eq!(order, vec![2, 3, 1]);
+
+        // A row that went away while the drag was in the air is no anchor, so
+        // the tool goes back on the end rather than being lost.
+        super::move_after(&mut order, 0, |&id| id == 99);
+        assert_eq!(order, vec![3, 1, 2]);
     }
 
     #[test]

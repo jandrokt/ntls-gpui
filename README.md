@@ -455,10 +455,18 @@ Most of it needs nothing special. The exceptions are where the OS says so:
 | ARP sweep and hardware addresses | real ARP over BPF with ChmodBPF installed, otherwise the neighbour table | neighbour table from `/proc/net/arp` | neighbour table from `arp -a` |
 | Everything else | yes | yes | yes |
 
-MAC vendors are looked up in the IEEE registries, all ~54,000 prefixes compiled
-into the binary, so it's instant, works offline, and doesn't tell anyone what
-you're scanning. Addresses a device made up for itself are reported as
-`randomised` rather than guessed at.
+MAC vendors are looked up in a table of ~58,000 prefixes compiled into the
+binary, so it's instant, works offline, and doesn't tell anyone what you're
+scanning. The names come from the IEEE registries, which are authoritative but
+publish a block as "IEEE Registration Authority" once they've subdivided it, so
+several thousand small vendors' devices would otherwise be reported by the name
+of their registrar. Those placeholders are dropped and the finer assignments
+Wireshark maintains are merged in, which is what lets those devices be named.
+`packaging/oui/build-oui.py` rebuilds the table and explains the rest.
+
+Addresses a device made up for itself are reported as `randomised` rather than
+guessed at, and a block whose registrant asked the IEEE not to list them reads
+as `Private`, which is all anyone knows about it.
 
 The download tool will use [yt-dlp](https://github.com/yt-dlp/yt-dlp) and
 [gallery-dl](https://github.com/mikf/gallery-dl) if they're on your `PATH`, and

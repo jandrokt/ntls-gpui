@@ -281,6 +281,28 @@ impl Prober {
             .ok_or(ProbeError::Icmp(icmp::PingError::Cancelled))?
             .map_err(ProbeError::Icmp)?;
 
+        // What answered matters as much as that something answered. A router
+        // saying an address cannot be reached is not that address replying,
+        // and it was being counted as one: a dead host on a subnet whose
+        // router bothers to answer came back up, with the router's address in
+        // the FROM column and a real round-trip time beside it. A sweep of
+        // such a subnet called every empty address alive.
+        match rep.kind {
+            icmp::ReplyKind::Echo => {}
+            icmp::ReplyKind::Unreachable => {
+                return Err(ProbeError::Other(format!(
+                    "{}, from {}",
+                    icmp::unreachable_note(rep.code),
+                    rep.from
+                )));
+            }
+            // These go out with a full hop limit, so one running out is a
+            // packet that died on the way, not a host that answered.
+            icmp::ReplyKind::TimeExceeded => {
+                return Err(ProbeError::Other(format!("hop limit exceeded at {}", rep.from)));
+            }
+        }
+
         let mut out = Probe {
             rtt: rep.rtt,
             from: Some(rep.from),

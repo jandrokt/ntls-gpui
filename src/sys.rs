@@ -32,6 +32,16 @@ pub fn downloads() -> PathBuf {
 /// program's own. A peer list of several "ntls" beats a peer
 /// list of none.
 pub fn hostname() -> String {
+    // Worked out once. A machine does not change its name while the program
+    // is running, and the last resort here is starting another program to ask:
+    // the interfaces page shows this, so asking on every frame it drew meant
+    // spawning a process sixty times a second for an answer that never
+    // changed.
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(read_hostname).clone()
+}
+
+fn read_hostname() -> String {
     for key in ["COMPUTERNAME", "HOSTNAME"] {
         if let Some(name) = std::env::var_os(key)
             && !name.is_empty()

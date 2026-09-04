@@ -74,6 +74,22 @@ impl App {
             Suggest::Values { .. } => "Type any value",
         };
 
+        // A search offers up to forty rows and the card shows about nine of
+        // them, so the keyboard walks off the bottom of what is drawn long
+        // before it runs out of list: the highlight goes below the fold and
+        // Enter then runs a row nobody can see. Move the list to the row the
+        // keyboard is on.
+        let count = rows.len();
+        let scroll = LIST.with(|list| {
+            if let Some(row) = scroll_row(list.shown.get(), cursor, count) {
+                list.scroll.scroll_to_item(row);
+            }
+            if count > 0 {
+                list.shown.set(Some(cursor.min(count - 1)));
+            }
+            list.scroll.clone()
+        });
+
         div()
             .absolute()
             .inset_0()
@@ -170,6 +186,7 @@ impl App {
                             .gap(px(1.))
                             .p(px(6.))
                             .overflow_y_scroll()
+                            .track_scroll(&scroll)
                             .children(if rows.is_empty() {
                                 vec![
                                     div()
@@ -196,6 +213,43 @@ impl App {
             )
             .into_any_element()
     }
+}
+
+/// Where the suggestion list is scrolled to, and the row it was put there
+/// for. Both have to outlive the frame that drew them: a scroll position
+/// that is forgotten is a list that starts at the top again every frame, and
+/// a row that is forgotten is a list that is dragged back to the keyboard
+/// the instant anyone touches the wheel.
+///
+/// There is one palette, drawn over the whole window, so one of these serves
+/// it.
+struct List {
+    scroll: gpui::ScrollHandle,
+    shown: std::cell::Cell<Option<usize>>,
+}
+
+std::thread_local! {
+    static LIST: List = List {
+        scroll: gpui::ScrollHandle::new(),
+        shown: std::cell::Cell::new(None),
+    };
+}
+
+/// The row the list has to be moved to, if any: the row the keyboard is on,
+/// once that is somewhere other than where the list was last put for it.
+///
+/// Asking on every frame instead would take the list away from anyone
+/// scrolling it by hand, since the wheel would be undone as soon as the
+/// keyboard's row left the view.
+fn scroll_row(shown: Option<usize>, cursor: usize, rows: usize) -> Option<usize> {
+    // An empty list draws one line of apology and has no row to move to.
+    let last = rows.checked_sub(1)?;
+    let row = cursor.min(last);
+    // Nothing has been drawn yet, so the list is at the top with the cursor
+    // on the first row and is already where it should be. Asking now, before
+    // the rows have been laid out, would scroll against bounds that are
+    // still empty and leave the list at some arbitrary offset.
+    (shown? != row).then_some(row)
 }
 
 /// A row in the search results: what it is, what it is called, and where it
@@ -372,4 +426,44 @@ fn row_shell(id: String, on_cursor: bool, theme: &Theme) -> gpui::Stateful<gpui:
         .cursor_pointer()
         .when(on_cursor, |d| d.bg(theme.accent_soft))
         .when(!on_cursor, |d| d.hover(|s| s.bg(theme.hover)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scroll_row;
+
+    #[test]
+    fn walking_the_keyboard_below_the_visible_rows_moves_the_list_to_it() {
+        // Forty search hits and room for about nine of them: the twentieth
+        // row is drawn, but under the bottom edge of the card.
+        assert_eq!(scroll_row(Some(19), 20, 40), Some(20));
+    }
+
+    #[test]
+    fn wrapping_from_the_first_row_round_to_the_last_moves_the_list_to_it() {
+        // Up from the top row is the one jump that always lands out of sight.
+        assert_eq!(scroll_row(Some(0), 39, 40), Some(39));
+    }
+
+    #[test]
+    fn a_keyboard_that_has_not_moved_leaves_the_list_where_it_is() {
+        assert_eq!(scroll_row(Some(7), 7, 40), None);
+    }
+
+    #[test]
+    fn the_first_frame_leaves_the_list_where_it_is() {
+        assert_eq!(scroll_row(None, 0, 40), None);
+    }
+
+    #[test]
+    fn a_list_with_nothing_in_it_has_no_row_to_move_to() {
+        assert_eq!(scroll_row(Some(3), 0, 0), None);
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_of_a_shortened_list_moves_the_list_to_its_last_row() {
+        // The count the keyboard was bounded by and the rows now drawn can
+        // disagree for a frame while a query is being typed.
+        assert_eq!(scroll_row(Some(0), 12, 3), Some(2));
+    }
 }

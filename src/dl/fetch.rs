@@ -36,6 +36,11 @@ const SPLIT_ABOVE: u64 = 4 * 1024 * 1024;
 const FLUSH_AT: usize = 512 * 1024;
 /// How many times a segment may fail before the transfer does.
 const ATTEMPTS: usize = 5;
+/// How often the ledger is written while bytes are still arriving. Often
+/// enough that little is re-fetched after a transfer is killed, rarely enough
+/// that a fast transfer is not rewriting a small file hundreds of times a
+/// second on a filesystem that scans every write.
+const LEDGER_EVERY: Duration = Duration::from_secs(1);
 
 /// What the caller can set about a transfer.
 #[derive(Clone, Debug)]
@@ -103,19 +108,36 @@ impl Limit {
                 let now = std::time::Instant::now();
                 let elapsed = now.duration_since(bucket.at).as_secs_f64();
                 bucket.at = now;
-                bucket.tokens =
-                    (bucket.tokens + elapsed * self.per_second as f64).min(self.per_second as f64);
-
-                if bucket.tokens >= bytes as f64 {
-                    bucket.tokens -= bytes as f64;
-                    return;
+                match charge(&mut bucket, self.per_second as f64, bytes as f64, elapsed) {
+                    None => return,
+                    Some(wait) => wait,
                 }
-                let short = bytes as f64 - bucket.tokens;
-                Duration::from_secs_f64((short / self.per_second as f64).min(1.0))
             };
             tokio::time::sleep(wait).await;
         }
     }
+}
+
+/// Takes what the bucket has towards `bytes`, and says how long to wait for
+/// the rest.
+///
+/// The bucket holds a second's worth, or one request's worth when that is
+/// larger. Capping it at a second alone meant a request bigger than the limit
+/// could never be met however long it waited: a 1 KB/s limit against the 8 KB
+/// the reader hands over first sat in this loop for good, a few hundred bytes
+/// into the file, and Stop could not get it out either.
+///
+/// Free of the clock, so the arithmetic can be checked without a test having
+/// to wait out a real transfer.
+fn charge(bucket: &mut Bucket, per_second: f64, bytes: f64, elapsed: f64) -> Option<Duration> {
+    let capacity = per_second.max(bytes);
+    bucket.tokens = (bucket.tokens + elapsed * per_second).min(capacity);
+    if bucket.tokens >= bytes {
+        bucket.tokens -= bytes;
+        return None;
+    }
+    let short = bytes - bucket.tokens;
+    Some(Duration::from_secs_f64((short / per_second).min(1.0)))
 }
 
 /// How far along a transfer is. Shared with whoever is reporting on it.
@@ -208,11 +230,14 @@ pub async fn fetch(
         .with_context(|| format!("cannot create {}", opts.dir.display()))?;
 
     let name = pick_name(asset, &head);
-    let final_path = if opts.overwrite {
-        opts.dir.join(&name)
-    } else {
-        names::unused(&opts.dir, &name)
-    };
+    // Held for the whole of this function, so a transfer running beside this
+    // one cannot pick the same destination. Nothing on disk marks a
+    // destination as taken while a transfer is in flight, because the final
+    // name only appears at the rename right at the end, so two links with the
+    // same name otherwise opened one part file between them and wrote over
+    // each other's bytes while the first to finish was reported as done.
+    let claim = names::claim(&opts.dir, &name, opts.overwrite);
+    let final_path = claim.path().to_path_buf();
     let part = with_suffix(&final_path, ".ntlspart");
     let ledger_path = with_suffix(&final_path, ".ntlspart.json");
 
@@ -241,6 +266,11 @@ pub async fn fetch(
     let want = opts.connections.clamp(1, 16);
     let ledger = Ledger::open(&ledger_path, &head, total, want, &part)?;
     progress.done.store(ledger.done(), Ordering::Relaxed);
+
+    // Declared before the file it will remove, so that the last handle on the
+    // part file is closed before anything tries to unlink it: Windows refuses
+    // to unlink a file that is still open, and the removal is best effort.
+    let sweep = Sweep::new(&part, Some(ledger_path.as_path()), opts.keep_partial);
 
     let file = Arc::new(
         std::fs::OpenOptions::new()
@@ -277,13 +307,14 @@ pub async fn fetch(
 
     if cancel.is_cancelled() {
         drop(file);
-        if !opts.keep_partial {
-            std::fs::remove_file(&part).ok();
-            std::fs::remove_file(&ledger_path).ok();
-        }
         bail!("cancelled");
     }
     drop(file);
+    // Every byte is on disk now, so the sweep is called off before the move
+    // rather than after it: a rename that fails leaves the whole download
+    // sitting under its part name, where it can still be put in place by hand,
+    // and deleting it over a failed move would throw the transfer away.
+    sweep.done();
     std::fs::rename(&part, &final_path)
         .with_context(|| format!("cannot move {} into place", part.display()))?;
     std::fs::remove_file(&ledger_path).ok();
@@ -328,8 +359,8 @@ async fn segment(
         }
 
         match pull(
-            &client, &asset, &url, origin, start, end, limit.as_ref(), &file, &ledger, index,
-            &cancel, &progress,
+            &client, &asset, &url, origin, start, end, limit.as_ref(), &file, &ledger,
+            &ledger_path, index, &cancel, &progress,
         )
         .await
         {
@@ -360,6 +391,7 @@ async fn pull(
     limit: Option<&Arc<Limit>>,
     file: &Arc<std::fs::File>,
     ledger: &Arc<std::sync::Mutex<Ledger>>,
+    ledger_path: &Path,
     index: usize,
     cancel: &Cancel,
     progress: &Arc<Progress>,
@@ -389,17 +421,21 @@ async fn pull(
         let Some(chunk) = chunk else { break };
         let chunk = chunk?;
         if let Some(limit) = limit {
-            limit.take(chunk.len() as u64).await;
+            // Waiting for the limit is waiting, and a job that has been
+            // stopped should not go on doing it.
+            if cancel.run(limit.take(chunk.len() as u64)).await.is_none() {
+                break;
+            }
         }
         buffered.extend_from_slice(&chunk);
         if buffered.len() >= FLUSH_AT {
             at += flush(file, at, std::mem::take(&mut buffered), progress).await?;
-            note(ledger, index, at - origin);
+            note(ledger, ledger_path, index, at - origin);
         }
     }
     if !buffered.is_empty() {
         at += flush(file, at, buffered, progress).await?;
-        note(ledger, index, at - origin);
+        note(ledger, ledger_path, index, at - origin);
     }
 
     if cancel.is_cancelled() {
@@ -425,8 +461,18 @@ async fn flush(
     Ok(written)
 }
 
-fn note(ledger: &Arc<std::sync::Mutex<Ledger>>, index: usize, done: u64) {
-    ledger.lock().expect("ledger").segments[index].done = done;
+/// Records what a segment has on disk, and keeps the ledger on disk close
+/// behind it.
+///
+/// The ledger only reached the disk where a segment ended, so a transfer that
+/// was killed rather than stopped, by the app quitting while it ran or the
+/// machine losing power, left a part file with no ledger beside it. The next
+/// session then began the file again at byte zero, however many gigabytes were
+/// already sitting there.
+fn note(ledger: &Arc<std::sync::Mutex<Ledger>>, path: &Path, index: usize, done: u64) {
+    let mut held = ledger.lock().expect("ledger");
+    held.segments[index].done = done;
+    held.save_if_due(path);
 }
 
 /// The whole file in one stream, for servers that will not say how big it is.
@@ -447,6 +493,10 @@ async fn stream_whole(
         .ok_or_else(|| anyhow!("cancelled"))??
         .error_for_status()?;
 
+    // As on the split path, and declared ahead of the file for the same
+    // reason: nothing unlinks the part file while this function still holds it
+    // open.
+    let sweep = Sweep::new(part, None, opts.keep_partial);
     let mut file = std::fs::File::create(part)
         .with_context(|| format!("cannot open {}", part.display()))?;
     let mut written = 0u64;
@@ -454,7 +504,9 @@ async fn stream_whole(
     while let Some(Some(chunk)) = cancel.run(stream.next()).await {
         let chunk = chunk?;
         if let Some(limit) = &opts.limit {
-            limit.take(chunk.len() as u64).await;
+            if cancel.run(limit.take(chunk.len() as u64)).await.is_none() {
+                break;
+            }
         }
         file.write_all(&chunk)?;
         written += chunk.len() as u64;
@@ -466,9 +518,53 @@ async fn stream_whole(
     if cancel.is_cancelled() {
         bail!("cancelled");
     }
+    sweep.done();
     std::fs::rename(part, final_path)?;
     progress.total.store(written, Ordering::Relaxed);
     Ok(Fetched { path: final_path.to_path_buf(), bytes: written })
+}
+
+/// Takes an unfinished transfer's part file and ledger off the disk, for a
+/// queue that was told not to keep them.
+///
+/// The setting was only ever consulted where a transfer was cancelled, so a
+/// transfer that failed instead — a host that stopped answering, a segment out
+/// of its attempts — left its `.ntlspart` and the ledger beside it in the
+/// download folder for good, and so did every transfer of a file whose size
+/// the server would not give, which returns down a path that never reached
+/// that check at all. A guard rather than a call at each exit, because most of
+/// those exits are a `?` and the next one added would be missed the same way.
+struct Sweep<'a> {
+    part: &'a Path,
+    ledger: Option<&'a Path>,
+    armed: bool,
+}
+
+impl<'a> Sweep<'a> {
+    fn new(part: &'a Path, ledger: Option<&'a Path>, keep_partial: bool) -> Sweep<'a> {
+        Sweep { part, ledger, armed: !keep_partial }
+    }
+
+    /// The transfer got everything: what is on disk is the file itself and not
+    /// a leftover.
+    fn done(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Sweep<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best effort, as the cancel path always was: a part file that cannot
+        // be removed is untidy, and reporting that instead of why the transfer
+        // failed would be worse.
+        std::fs::remove_file(self.part).ok();
+        if let Some(ledger) = self.ledger {
+            std::fs::remove_file(ledger).ok();
+        }
+    }
 }
 
 /// What has already arrived, written beside the part file so an interrupted
@@ -479,6 +575,11 @@ struct Ledger {
     total: u64,
     tag: Option<String>,
     segments: Vec<Segment>,
+    /// When this session last wrote the ledger out. It says something about
+    /// this process, not about the transfer, so it is not part of what a later
+    /// session reads back.
+    #[serde(skip)]
+    written: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -508,7 +609,7 @@ impl Ledger {
             .map(|i| Segment { start: i * span, end: ((i + 1) * span - 1).min(total - 1), done: 0 })
             .filter(|s| s.start <= s.end)
             .collect();
-        Ok(Ledger { url: head.url.clone(), total, tag: head.tag.clone(), segments })
+        Ok(Ledger { url: head.url.clone(), total, tag: head.tag.clone(), segments, written: None })
     }
 
     fn done(&self) -> u64 {
@@ -520,6 +621,18 @@ impl Ledger {
         if let Ok(text) = serde_json::to_string(self) {
             std::fs::write(path, text).ok();
         }
+    }
+
+    /// The same, from the middle of a transfer, at most once every
+    /// [`LEDGER_EVERY`]. The clock is the whole transfer's, not one segment's,
+    /// so the cost does not grow with the number of connections.
+    fn save_if_due(&mut self, path: &Path) {
+        let now = std::time::Instant::now();
+        if self.written.is_some_and(|last| now.duration_since(last) < LEDGER_EVERY) {
+            return;
+        }
+        self.written = Some(now);
+        self.save(path);
     }
 }
 
@@ -659,6 +772,66 @@ mod tests {
     }
 
     #[test]
+    fn a_flush_partway_through_a_segment_is_on_disk_before_the_segment_ends() {
+        let dir = std::env::temp_dir().join("ntls-fetch-flush");
+        std::fs::create_dir_all(&dir).expect("the directory");
+        let part = dir.join("thing.ntlspart");
+        std::fs::write(&part, b"partial").expect("a part file");
+        let ledger_path = dir.join("thing.ntlspart.json");
+        std::fs::remove_file(&ledger_path).ok();
+
+        let same = head(Some(40 << 20), true);
+        let ledger = Arc::new(std::sync::Mutex::new(
+            Ledger::open(&ledger_path, &same, 40 << 20, 2, &part).expect("a ledger"),
+        ));
+
+        // Half a megabyte into a twenty megabyte segment: nothing has
+        // finished, and nothing is about to.
+        note(&ledger, &ledger_path, 0, 512 * 1024);
+
+        // What the next session sees. Written only at the end of a segment,
+        // this said zero, and a transfer the user quit out of was fetched
+        // again from the start.
+        let resumed = Ledger::open(&ledger_path, &same, 40 << 20, 2, &part).expect("a ledger");
+        assert_eq!(resumed.done(), 512 * 1024);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_transfer_that_failed_leaves_no_part_file_behind_when_part_files_are_not_kept() {
+        let dir = std::env::temp_dir().join("ntls-fetch-sweep");
+        std::fs::create_dir_all(&dir).expect("the directory");
+        let part = dir.join("thing.zip.ntlspart");
+        let ledger_path = dir.join("thing.zip.ntlspart.json");
+        let half = || {
+            std::fs::write(&part, b"half a file").expect("a part file");
+            std::fs::write(&ledger_path, b"{}").expect("a ledger");
+        };
+
+        // How a segment out of attempts, and how the stream of a file with no
+        // length, leave: through `?` or a `bail!`, without passing the one
+        // place the setting used to be read.
+        half();
+        drop(Sweep::new(&part, Some(ledger_path.as_path()), false));
+        assert!(!part.exists(), "the part file is swept");
+        assert!(!ledger_path.exists(), "and the ledger with it");
+
+        // Kept when the queue asked for them, which is what makes a stopped
+        // transfer resumable in a later session.
+        half();
+        drop(Sweep::new(&part, Some(ledger_path.as_path()), true));
+        assert!(part.exists(), "kept for a resume");
+
+        // And kept once the bytes are all there, so a rename that fails does
+        // not cost the download.
+        Sweep::new(&part, Some(ledger_path.as_path()), false).done();
+        assert!(part.exists(), "kept for the move");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn the_segments_cover_the_file_exactly_once() {
         let dir = std::env::temp_dir().join("ntls-fetch-tests");
         let total = 10_000_003;
@@ -669,5 +842,49 @@ mod tests {
         for pair in ledger.segments.windows(2) {
             assert_eq!(pair[0].end + 1, pair[1].start);
         }
+    }
+}
+
+
+
+#[cfg(test)]
+mod limit_tests {
+    use super::{Bucket, charge};
+
+    fn bucket(tokens: f64) -> Bucket {
+        Bucket { tokens, at: std::time::Instant::now() }
+    }
+
+    #[test]
+    fn a_chunk_larger_than_the_limit_is_still_let_through_eventually() {
+        // The reader hands over 8 KB at a time whatever the limit is, so a
+        // 1 KB/s limit has to admit one of those in the end. Capping the
+        // bucket at one second's worth meant it never could, and the transfer
+        // stopped a few hundred bytes in and could not even be cancelled.
+        let mut b = bucket(1024.0);
+        let mut waits = 0;
+        loop {
+            match charge(&mut b, 1024.0, 8192.0, 1.0) {
+                None => break,
+                Some(_) => {
+                    waits += 1;
+                    assert!(waits < 100, "never let through");
+                }
+            }
+        }
+        // Around eight seconds of credit for eight kilobytes at a kilobyte a
+        // second, which is the limit that was asked for.
+        assert!((6..=8).contains(&waits), "{waits}");
+    }
+
+    #[test]
+    fn the_limit_is_still_a_limit() {
+        // A full second's credit covers one second's worth and no more.
+        let mut b = bucket(1024.0);
+        assert_eq!(charge(&mut b, 1024.0, 1024.0, 0.0), None);
+        assert!(charge(&mut b, 1024.0, 1024.0, 0.0).is_some());
+        // And half a second buys half of it.
+        assert!(charge(&mut b, 1024.0, 1024.0, 0.5).is_some());
+        assert_eq!(charge(&mut b, 1024.0, 1024.0, 0.5), None);
     }
 }

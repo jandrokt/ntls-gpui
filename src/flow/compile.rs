@@ -53,9 +53,21 @@ pub enum Event {
     Skipped { step: usize, why: String },
     /// A `stop` was reached.
     Stopped { step: usize },
+    /// It was doing far too much to be doing anything useful, and was given up
+    /// on where it stood. `why` says so in words, for the trail to show.
+    Failed { step: usize, why: String },
     /// There is nothing left.
     Finished,
 }
+
+/// How many operations one run of a workflow may do before it is given up on.
+///
+/// Reading a file clamps one repeat to a hundred passes, and that is as far as
+/// clamping can go: nesting multiplies, so four repeats of a hundred inside
+/// one another are a hundred million passes over their body. A million
+/// operations is a few tens of milliseconds, which nobody sees, and further
+/// than any workflow that stops to run something ever gets.
+const MOST_OPERATIONS: usize = 1_000_000;
 
 /// A workflow part-way through.
 #[derive(Clone, Debug)]
@@ -64,12 +76,22 @@ pub struct Machine {
     pc: usize,
     /// How many passes each open loop has left.
     counters: Vec<usize>,
+    /// How many operations are left before it is given up on. For the whole
+    /// run and not for one call, since a loop going round for ever goes round
+    /// across as many calls as the caller cares to make.
+    operations_left: usize,
     done: bool,
 }
 
 impl Machine {
     pub fn new(steps: &[Step]) -> Machine {
-        Machine { program: compile(steps), pc: 0, counters: Vec::new(), done: false }
+        Machine {
+            program: compile(steps),
+            pc: 0,
+            counters: Vec::new(),
+            operations_left: MOST_OPERATIONS,
+            done: false,
+        }
     }
 
     /// Works forward until something has to happen outside the machine.
@@ -89,6 +111,24 @@ impl Machine {
             };
             self.pc += 1;
 
+            // Clamping one repeat's count does not bound the product of nested
+            // ones, and a body of nothing but loops and untaken branches asks
+            // the caller for nothing, so all hundred million passes happened
+            // inside this one call, which is made from the click that started
+            // the workflow, on the thread that draws the window. Nothing
+            // repainted, Stop could not be reached, and the application had to
+            // be killed. A workflow this far in is not going to finish, so it
+            // ends here and the trail says why rather than showing it as done.
+            if self.operations_left == 0 {
+                self.done = true;
+                let why = format!(
+                    "gave up after {MOST_OPERATIONS} operations: the repeats in it ask for \
+                     more passes than one run of a workflow may do"
+                );
+                return Event::Failed { step: line.step, why };
+            }
+            self.operations_left -= 1;
+
             match line.op {
                 Op::Run(name) => return Event::Run { step: line.step, name },
                 Op::Wait(seconds) => return Event::Wait { step: line.step, seconds },
@@ -99,7 +139,18 @@ impl Machine {
                 }
                 Op::Jump(to) => self.pc = to,
                 Op::Check { condition, otherwise } => {
-                    let guards = self.program.get(self.pc).is_some_and(|l| l.step == line.step);
+                    // A check that guards a step of its own stands directly in
+                    // front of that step's own work, which is a run or a stop.
+                    // Sharing the step number was not enough to tell the two
+                    // apart: a branch whose `then` half is empty puts its own
+                    // jump over the `else` half where that half would have
+                    // been, and the jump carries the branch's step number, so
+                    // `if up {} else { run B }` reported the branch as skipped
+                    // and then ran B. The trail said a step had not happened
+                    // while the workflow was doing it.
+                    let guards = self.program.get(self.pc).is_some_and(|l| {
+                        l.step == line.step && matches!(l.op, Op::Run(_) | Op::Halt)
+                    });
                     match truth(&condition) {
                         Ok(true) => {}
                         Ok(false) => {
@@ -255,6 +306,10 @@ mod tests {
                     seen.push("stop".into());
                     break;
                 }
+                Event::Failed { why, .. } => {
+                    seen.push(format!("gave up: {why}"));
+                    break;
+                }
                 Event::Finished => break,
             }
         }
@@ -294,6 +349,21 @@ mod tests {
         let source = "if up {\n  run A\n}\nrun B";
         assert_eq!(trace(source, &[("up", Ok(false))]), ["run B"]);
         assert_eq!(trace(source, &[("up", Ok(true))]), ["run A", "run B"]);
+    }
+
+    #[test]
+    fn a_branch_with_an_empty_then_half_is_not_called_skipped_while_its_else_half_runs() {
+        // A branch is added in the editor with both halves empty, and filling
+        // in only the else half is an ordinary thing to do. Such a branch has
+        // nothing between its check and the jump over the else half, and that
+        // jump belongs to the branch, so the trail marked the branch skipped
+        // in the same breath as running B.
+        let source = "if up {\n} else {\n  run B\n}\nrun C";
+        assert_eq!(trace(source, &[("up", Ok(false))]), ["run B", "run C"]);
+        assert_eq!(trace(source, &[("up", Ok(true))]), ["run C"]);
+        // A condition that cannot be answered takes the else half too, and
+        // says no more about it than a false one does.
+        assert_eq!(trace(source, &[("up", Err("no results yet"))]), ["run B", "run C"]);
     }
 
     #[test]
@@ -350,6 +420,35 @@ mod tests {
         machine.resume(false);
         assert_eq!(machine.next(&mut |_| Ok(true)), Event::Finished);
         assert!(machine.done);
+    }
+
+    #[test]
+    fn a_chained_branch_only_runs_its_side_when_its_own_condition_holds() {
+        // The second condition used to be dropped as the file was read, so
+        // this ran B whenever `a` was false, whatever `b` said.
+        let source = "if a {\n  run A\n} else if b {\n  run B\n} else {\n  run C\n}\nrun D";
+        assert_eq!(trace(source, &[("a", Ok(true)), ("b", Ok(true))]), ["run A", "run D"]);
+        assert_eq!(trace(source, &[("a", Ok(false)), ("b", Ok(true))]), ["run B", "run D"]);
+        assert_eq!(trace(source, &[("a", Ok(false)), ("b", Ok(false))]), ["run C", "run D"]);
+    }
+
+    #[test]
+    fn a_file_of_repeats_inside_repeats_gives_up_instead_of_hanging() {
+        // Clamping one repeat to a hundred passes does not bound the product
+        // of nested ones. Four of them are a hundred million passes over a
+        // body that asks the caller for nothing, so every one of those passes
+        // happened inside a single call, made from the click that started the
+        // workflow, on the thread that draws the window.
+        let source = "repeat 100 {\n repeat 100 {\n  repeat 100 {\n   repeat 100 {\n    if a {\n    }\n   }\n  }\n }\n}";
+        let seen = trace(source, &[("a", Ok(false))]);
+        assert!(
+            seen.iter().any(|line| line.starts_with("gave up")),
+            "it has to end rather than spin: {seen:?}"
+        );
+
+        // A repeat somebody actually meant still does every pass of it.
+        let runs = trace("repeat 100 {\n  run A\n}", &[]);
+        assert_eq!(runs.iter().filter(|line| *line == "run A").count(), 100);
     }
 
     #[test]

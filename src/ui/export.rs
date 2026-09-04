@@ -50,14 +50,38 @@ fn write_line(out: &mut String, mut fields: impl Iterator<Item = String>) {
     out.push_str("\r\n");
 }
 
-/// Quotes a field if it needs it, and doubles any quotes inside it.
+/// Quotes a field if it needs it, doubles any quotes inside it, and keeps a
+/// cell that reads as a formula from being one.
 fn field(value: &str) -> String {
     let needs_quoting =
         value.contains([',', '"', '\n', '\r']) || value.starts_with(' ') || value.ends_with(' ');
+    // Much of a cell is whatever the far end said about itself: a TXT record,
+    // a Server: header, a service banner. Quoting keeps such text inside its
+    // field but does nothing about the spreadsheet, which reads a cell
+    // opening with = + - @ as a formula and will happily run DDE or
+    // WEBSERVICE() out of it, so scanning a hostile host and exporting the
+    // table was enough to have the host's text execute when the file was
+    // opened. The apostrophe is the marker that says the cell is text.
+    let guard = if reads_as_formula(value) { "'" } else { "" };
     if !needs_quoting {
-        return value.to_string();
+        return format!("{guard}{value}");
     }
-    format!("\"{}\"", value.replace('"', "\"\""))
+    format!("\"{guard}{}\"", value.replace('"', "\"\""))
+}
+
+/// Whether a spreadsheet would take this cell for a formula rather than text.
+fn reads_as_formula(value: &str) -> bool {
+    match value.chars().next() {
+        // A leading tab or carriage return is thrown away before the rest of
+        // the cell is looked at, so it hides a formula instead of stopping
+        // one.
+        Some('=' | '+' | '@' | '\t' | '\r') => true,
+        // A lone dash is what a tool writes for "no answer" and a negative
+        // number is a measurement. Neither can carry a payload, and marking
+        // them as text would stop the column being added up.
+        Some('-') => value.len() > 1 && value.parse::<f64>().is_err(),
+        _ => false,
+    }
 }
 
 fn status_of(status: crate::core::Status) -> &'static str {
@@ -123,6 +147,42 @@ mod tests {
         assert_eq!(field("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(field("two\nlines"), "\"two\nlines\"");
         assert_eq!(field(" padded "), "\" padded \"");
+    }
+
+    #[test]
+    fn a_cell_the_scanned_host_wrote_cannot_arrive_as_a_live_formula() {
+        // A TXT record, a Server: header and a service banner all land in a
+        // cell exactly as they came off the wire.
+        assert_eq!(field("=cmd|'/c calc'!A0"), "'=cmd|'/c calc'!A0");
+        assert_eq!(field("+1+cmd|'/c calc'!A0"), "'+1+cmd|'/c calc'!A0");
+        assert_eq!(field("@SUM(A1)"), "'@SUM(A1)");
+        assert_eq!(field("-2+3+cmd|'/c calc'!A0"), "'-2+3+cmd|'/c calc'!A0");
+        // A tab in front is dropped by the spreadsheet, so it is a way of
+        // smuggling the same thing past a check on the first character.
+        assert_eq!(field("\t=1+1"), "'\t=1+1");
+    }
+
+    #[test]
+    fn a_guarded_cell_is_still_quoted_when_the_format_needs_it() {
+        assert_eq!(field("=A1,B1"), "\"'=A1,B1\"");
+        assert_eq!(field("=HYPERLINK(\"http://x\")"), "\"'=HYPERLINK(\"\"http://x\"\")\"");
+    }
+
+    #[test]
+    fn a_measurement_and_the_dash_that_means_no_answer_are_written_as_they_are() {
+        // Guarding these would turn a numeric column into text and leave an
+        // apostrophe in front of every failed row.
+        assert_eq!(field("-"), "-");
+        assert_eq!(field("-12.5"), "-12.5");
+        assert_eq!(field("2.4 ms"), "2.4 ms");
+    }
+
+    #[test]
+    fn the_guard_reaches_the_line_the_export_writes() {
+        let columns = [col("NAME", 20), col("VALUE", 40)];
+        let rows = [row(&["evil.example", "=cmd|'/c calc'!A0"], "evil.example", Status::Info)];
+        let out = csv(&columns, &rows.iter().collect::<Vec<_>>(), &BTreeMap::new());
+        assert!(out.contains("evil.example,'=cmd|'/c calc'!A0,"), "{out}");
     }
 
     #[test]

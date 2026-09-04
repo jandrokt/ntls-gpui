@@ -1,7 +1,7 @@
 //! Throughput against an HTTP endpoint.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::core::Cancel;
@@ -136,10 +136,18 @@ impl SpeedClient {
         let start = Instant::now();
         let sampler = spawn_sampler(cancel.clone(), counted.clone(), sample, deadline);
 
+        // Raised when a stream is told no, so the refusal outlives the task
+        // that saw it and can be weighed against the byte count below.
+        let refused = Arc::new(AtomicBool::new(false));
         let mut set = Vec::new();
         for _ in 0..streams.max(1) {
-            let (client, url, counted, cancel) =
-                (self.client.clone(), url.to_string(), counted.clone(), cancel.clone());
+            let (client, url, counted, cancel, refused) = (
+                self.client.clone(),
+                url.to_string(),
+                counted.clone(),
+                cancel.clone(),
+                refused.clone(),
+            );
             set.push(tokio::spawn(async move {
                 let mut first_err: Option<String> = None;
                 while Instant::now() < deadline && !cancel.is_cancelled() {
@@ -157,7 +165,18 @@ impl SpeedClient {
                     {
                         // Cancellation ends the run.
                         Ok(resp) => {
+                            let status = resp.status();
                             let _ = resp.bytes().await;
+                            // An endpoint that will not take the data has
+                            // measured nothing, and going straight back round
+                            // to post again turned a proxy or a rate limiter
+                            // answering 403 or 429 to every request into a
+                            // request flood that ran for the whole duration.
+                            if !status.is_success() {
+                                refused.store(true, Ordering::Relaxed);
+                                first_err.get_or_insert(format!("server returned {status}"));
+                                break;
+                            }
                         }
                         Err(e) => {
                             first_err.get_or_insert(e.to_string());
@@ -178,10 +197,7 @@ impl SpeedClient {
         sampler.abort();
 
         let total = counted.load(Ordering::Relaxed);
-        match (total, first_err) {
-            (0, Some(e)) => Err(e),
-            _ => Ok(Transfer { bytes: total, elapsed: start.elapsed() }),
-        }
+        upload_outcome(total, start.elapsed(), refused.load(Ordering::Relaxed), first_err)
     }
 
     /// Measures request round trips, the lag you notice even on a
@@ -213,6 +229,26 @@ impl SpeedClient {
             return Err(first_err.unwrap_or_else(|| "no samples".into()));
         }
         Ok(out)
+    }
+}
+
+/// What an upload reports, given the bytes it generated, how long it ran,
+/// whether any stream was refused, and the first thing that went wrong.
+///
+/// A refusal outweighs the byte count. The generator tallies bytes as it hands
+/// them to the body stream, not as the far end accepts them, so a POST that
+/// came back 403 leaves a healthy-looking total behind it all the same, and a
+/// run against an endpoint refusing every request was reported as a perfectly
+/// good upload speed.
+fn upload_outcome(
+    bytes: u64,
+    elapsed: Duration,
+    refused: bool,
+    first_err: Option<String>,
+) -> Result<Transfer, String> {
+    match first_err {
+        Some(e) if refused || bytes == 0 => Err(e),
+        _ => Ok(Transfer { bytes, elapsed }),
     }
 }
 
@@ -289,4 +325,56 @@ pub fn format_bytes(n: u64) -> String {
         exp += 1;
     }
     format!("{:.1} {}iB", n as f64 / div as f64, ["K", "M", "G", "T", "P"][exp])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An endpoint that refuses the POST has taken delivery of nothing,
+    /// however much the generator handed to the body stream on the way out.
+    /// Those bytes divided by the time they took looks exactly like a
+    /// throughput figure, which is how a proxy answering 403 to every upload
+    /// came back as a completed test instead of as the error it was.
+    #[test]
+    fn an_upload_the_server_refused_is_an_error_however_many_bytes_were_generated() {
+        let out = upload_outcome(
+            64 << 20,
+            Duration::from_secs(8),
+            true,
+            Some("server returned 403 Forbidden".into()),
+        );
+        assert_eq!(out.err(), Some("server returned 403 Forbidden".to_string()));
+    }
+
+    /// A stream that dropped part way through had already moved real bytes
+    /// that a real server accepted, and that is a measurement, so one broken
+    /// connection must not throw away what the run managed.
+    #[test]
+    fn an_upload_that_moved_bytes_before_a_connection_broke_still_reports_a_transfer() {
+        let out = upload_outcome(
+            1 << 20,
+            Duration::from_secs(8),
+            false,
+            Some("connection reset by peer".into()),
+        );
+        assert_eq!(out.expect("a transfer").bytes, 1 << 20);
+    }
+
+    /// Nothing moved at all and something went wrong, so there is no figure to
+    /// report, only the reason.
+    #[test]
+    fn an_upload_that_moved_nothing_reports_why_instead() {
+        let out = upload_outcome(0, Duration::from_secs(8), false, Some("dns failure".into()));
+        assert_eq!(out.err(), Some("dns failure".to_string()));
+    }
+
+    /// A clean run reports what it moved.
+    #[test]
+    fn an_upload_with_nothing_wrong_reports_what_it_moved() {
+        let out = upload_outcome(4 << 20, Duration::from_secs(2), false, None);
+        let t = out.expect("a transfer");
+        assert_eq!(t.bytes, 4 << 20);
+        assert_eq!(t.bits_per_second(), (4 << 20) as f64 * 8.0 / 2.0);
+    }
 }

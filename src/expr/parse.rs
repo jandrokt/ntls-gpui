@@ -15,8 +15,17 @@ pub enum Expr {
     Field(Box<Expr>, String),
     /// `subject[key]`: a list by position, a set of results by column name.
     Index(Box<Expr>, Box<Expr>),
-    /// `name(args…)`, and `subject.name(args…)` with the subject first.
+    /// `name(args...)`.
     Call(String, Vec<Expr>),
+    /// `subject.name(args...)`, with the subject kept apart from the
+    /// arguments.
+    ///
+    /// Folding the subject in as the first argument threw away the one thing
+    /// that tells a receiver from an argument, and the two are not read the
+    /// same way: a quoted receiver names a run, where a quoted argument is
+    /// only ever text. That is what made `"IP scan".count()` answer about the
+    /// name instead of about the run.
+    Method(Box<Expr>, String, Vec<Expr>),
     Unary(&'static str, Box<Expr>),
     Binary(&'static str, Box<Expr>, Box<Expr>),
     /// `if condition then a else b`
@@ -148,12 +157,12 @@ impl Parser {
                     return Err("expected a name after '.'".into());
                 };
                 expr = if self.eat("(") {
-                    // `subject.name(args)` is `name(subject, args)`, so a
-                    // method and a function are the same thing written two
-                    // ways.
-                    let mut args = vec![expr];
-                    args.extend(self.arguments()?);
-                    Expr::Call(name, args)
+                    // A method still means the function with the subject
+                    // first, but which of the two was written has to survive
+                    // parsing: the evaluator reads a quoted subject as the
+                    // name of a run, and it can only do that while it can
+                    // still tell the subject from an argument.
+                    Expr::Method(Box::new(expr), name, self.arguments()?)
                 } else {
                     Expr::Field(Box::new(expr), name)
                 };
@@ -200,6 +209,13 @@ mod tests {
             Expr::Index(s, k) => format!("({}[{}])", show(s), show(k)),
             Expr::Call(name, args) => {
                 let args: Vec<String> = args.iter().map(show).collect();
+                format!("{name}({})", args.join(" "))
+            }
+            // Written the way the call it means is written, since a method is
+            // that function with the subject first.
+            Expr::Method(subject, name, args) => {
+                let args: Vec<String> =
+                    std::iter::once(show(subject)).chain(args.iter().map(show)).collect();
                 format!("{name}({})", args.join(" "))
             }
             Expr::Unary(op, a) => format!("({op}{})", show(a)),

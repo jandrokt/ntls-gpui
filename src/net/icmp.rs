@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
 #[cfg(unix)]
+use tokio::io::Interest;
+#[cfg(unix)]
 use tokio::io::unix::AsyncFd;
 use tokio::sync::oneshot;
 
@@ -56,6 +58,11 @@ pub enum PingError {
     Cancelled,
     Closed,
     NoSocket,
+    /// The request never left the machine: the kernel refused the write, and
+    /// this is the reason it gave. It is kept because the reasons call for
+    /// quite different things from whoever is reading the table, and because
+    /// none of them is the socket having closed.
+    Unsent(&'static str),
 }
 
 impl std::fmt::Display for PingError {
@@ -65,8 +72,37 @@ impl std::fmt::Display for PingError {
             PingError::Cancelled => "stopped",
             PingError::Closed => "socket closed",
             PingError::NoSocket => "no ICMP socket for this address family",
+            PingError::Unsent(why) => why,
         })
     }
+}
+
+/// Names a write the kernel would not perform.
+///
+/// Every one of these used to be reported as "socket closed", which is a
+/// thing that had not happened and told the reader nothing: a sweep of a
+/// subnet this machine has no route to filled all two hundred and fifty-four
+/// rows with a closed socket, and the one fact that explained the whole
+/// table -- that there is no route out of here -- was thrown away at the
+/// point it was learnt. A full send queue is worse than useless there, since
+/// it is a fact about our own burst rather than about the address probed, and
+/// it reads as if the tool had broken.
+fn why_unsent(e: &io::Error) -> PingError {
+    // The one a burst of our own probes actually draws on the BSDs has no
+    // `ErrorKind` of its own, so it is read off the errno instead of being
+    // left to fall through to the vague answer below.
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::ENOBUFS) {
+        return PingError::Unsent("send queue full");
+    }
+    PingError::Unsent(match e.kind() {
+        io::ErrorKind::HostUnreachable => "no route to host",
+        io::ErrorKind::NetworkUnreachable => "network unreachable",
+        io::ErrorKind::NetworkDown => "network is down",
+        io::ErrorKind::PermissionDenied => "not allowed to send",
+        io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory => "send queue full",
+        _ => "cannot send",
+    })
 }
 
 /// Tags our payloads so replies can be matched to requests even when the
@@ -141,7 +177,17 @@ struct Waiters {
 impl Waiters {
     fn take_by_token(&mut self, token: u32) -> Option<Pending> {
         let p = self.by_token.remove(&token)?;
-        self.by_seq.remove(&p.seq);
+        // A sequence number is sixteen bits wide, so a long enough run of
+        // probes comes back round to one whose earlier owner is still waiting,
+        // and the later probe takes the entry over. Removing it on the strength
+        // of the sequence alone then cost that later probe the only thing an
+        // error report can be matched by: it could still be handed an echo
+        // reply, which carries the token, but a time-exceeded or an unreachable
+        // quotes the sequence and nothing else, so a traceroute hop that had
+        // answered turned into a star.
+        if self.by_seq.get(&p.seq) == Some(&token) {
+            self.by_seq.remove(&p.seq);
+        }
         Some(p)
     }
 
@@ -213,6 +259,34 @@ impl Conn {
                 &on as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&on) as libc::socklen_t,
             );
+        }
+
+        // Ask Linux for the ICMP errors as well. A datagram ICMP socket there
+        // is handed echo replies and nothing else: a time-exceeded or an
+        // unreachable report drawn by one of our own probes is never queued as
+        // a readable datagram. It goes on the socket's error queue, and only
+        // if the socket asked for it. Without this a traceroute printed a star
+        // for every hop on any system that allows these sockets, which is
+        // every systemd one by default, and a sweep of a subnet whose router
+        // says "host unreachable" heard nothing back at all. A raw socket is
+        // given the whole ICMP message the ordinary way, so it is left alone.
+        #[cfg(target_os = "linux")]
+        if !raw {
+            unsafe {
+                let on: libc::c_int = 1;
+                let (level, opt) = if v6 {
+                    (libc::IPPROTO_IPV6, libc::IPV6_RECVERR)
+                } else {
+                    (libc::IPPROTO_IP, libc::IP_RECVERR)
+                };
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    level,
+                    opt,
+                    &on as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&on) as libc::socklen_t,
+                );
+            }
         }
 
         Ok(Conn { socket, send: Mutex::new(0), raw, v6 })
@@ -351,7 +425,7 @@ impl Pinger {
                 Ok(Err(_)) => Err(PingError::Closed),
                 Err(_) => Err(PingError::Timeout),
             },
-            Err(_) => Err(PingError::Closed),
+            Err(e) => Err(why_unsent(&e)),
         };
 
         let mut w = self.inner.waiters.lock().unwrap();
@@ -438,13 +512,26 @@ fn checksum(b: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// What the reader waits for on its socket.
+///
+/// An error queue is not readable: putting something on it wakes a poll with
+/// an error and never with a read, so a reader that waits only for readability
+/// sleeps through every ICMP error Linux reports that way, which is all of
+/// them. Nowhere else has such a queue, and there the interest stays as narrow
+/// as it was.
+#[cfg(target_os = "linux")]
+const READER_WANTS: Interest = Interest::READABLE.add(Interest::ERROR);
+#[cfg(all(unix, not(target_os = "linux")))]
+const READER_WANTS: Interest = Interest::READABLE;
+
 /// Pumps one socket, matching replies to waiters until the pinger is dropped.
 #[cfg(unix)]
 fn spawn_reader(inner: Weak<Inner>, v6: bool, fd: AsyncFd<OwnedFd>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = [0u8; 2048];
+        let mut failures = 0usize;
         loop {
-            let Ok(mut guard) = fd.readable().await else { return };
+            let Ok(mut guard) = fd.ready(READER_WANTS).await else { return };
 
             let Some(inner) = inner.upgrade() else { return };
             if inner.closed.load(Ordering::SeqCst) {
@@ -455,10 +542,35 @@ fn spawn_reader(inner: Weak<Inner>, v6: bool, fd: AsyncFd<OwnedFd>) -> tokio::ta
             if (if v6 { inner.v6.as_ref() } else { inner.v4.as_ref() }).is_none() {
                 return;
             }
-            match recv_with_ttl(guard.get_inner().as_raw_fd(), &mut buf) {
-                Ok(Some((n, from, ttl))) => dispatch(&inner, &buf[..n], from, ttl),
-                Ok(None) => guard.clear_ready(),
-                Err(_) => return,
+            let raw_fd = guard.get_inner().as_raw_fd();
+            // The error queue goes first: emptying it is also what clears the
+            // pending error the kernel would otherwise hand to the ordinary
+            // read below.
+            let mut got = drain_error_queue(&inner, raw_fd);
+            let mut failed = false;
+            match recv_with_ttl(raw_fd, &mut buf) {
+                Ok(Some((n, from, ttl))) => {
+                    got = true;
+                    dispatch(&inner, &buf[..n], from, ttl);
+                }
+                Ok(None) => {}
+                // One failed read means one datagram lost, not a socket to
+                // abandon. A socket with an error pending reports it to the
+                // next ordinary read even when the error queue already carried
+                // the same news, so giving up here left a Linux traceroute
+                // deaf from its first hop onwards, with every later probe
+                // timing out and nothing anywhere to say why.
+                Err(_) => failed = true,
+            }
+            if got {
+                failures = 0;
+            } else if failed {
+                failures += 1;
+                if failures > MAX_READ_FAILURES {
+                    return;
+                }
+            } else {
+                guard.clear_ready();
             }
         }
     })
@@ -468,7 +580,6 @@ fn spawn_reader(inner: Weak<Inner>, v6: bool, fd: AsyncFd<OwnedFd>) -> tokio::ta
 ///
 /// High enough that no run of ordinary failures ends the listening, low enough
 /// that a socket which has genuinely gone does not spin.
-#[cfg(not(unix))]
 const MAX_READ_FAILURES: usize = 64;
 
 /// The same, where the socket cannot be registered with the runtime.
@@ -626,14 +737,121 @@ unsafe fn sockaddr_to_ip(storage: &libc::sockaddr_storage) -> Option<IpAddr> {
     }
 }
 
+/// Empties the socket's error queue, handing each report to its probe.
+///
+/// Nothing outside Linux has such a queue: an ICMP error arrives there as an
+/// ordinary datagram and is read by the loop above.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn drain_error_queue(_inner: &Inner, _fd: RawFd) -> bool {
+    false
+}
+
+/// The same, on the one system that reports ICMP errors out of band.
+///
+/// Returns whether there was anything on the queue. Every entry is taken, not
+/// just the first: several probes overlap on this socket, so several hops can
+/// answer between two wakeups, and an entry left behind would sit there until
+/// the next one arrived to wake the reader again.
+#[cfg(target_os = "linux")]
+fn drain_error_queue(inner: &Inner, fd: RawFd) -> bool {
+    let mut any = false;
+    // Only the first eight bytes are ever read: the quoted ICMP header, which
+    // is all a router has to send back and all that is needed to know whose
+    // probe this answers. The rest is room for the routers that quote more.
+    let mut quoted = [0u8; 64];
+    loop {
+        unsafe {
+            let mut iov = libc::iovec {
+                iov_base: quoted.as_mut_ptr() as *mut libc::c_void,
+                iov_len: quoted.len(),
+            };
+            let mut control = [0u8; 256];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = control.len() as _;
+
+            let n = libc::recvmsg(fd, &mut msg, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT);
+            if n < 0 {
+                return any;
+            }
+            any = true;
+            let Some(err) = parse_error_cmsg(&msg) else { continue };
+            // What the queue hands back begins at the quoted ICMP header: the
+            // kernel has already taken the quoted IP header off the front.
+            let n = (n as usize).min(quoted.len());
+            let Some(seq) = echo_seq(&quoted[..n], err.from.is_ipv6()) else { continue };
+            // No hop count. It came off a queue instead of off the wire, so
+            // the column stays blank rather than holding a guess.
+            deliver_error(inner, err.icmp_type, err.code, err.from, 0, seq);
+        }
+    }
+}
+
+/// What one error-queue entry says: which ICMP error arrived, and from whom.
+#[cfg(target_os = "linux")]
+struct QueuedError {
+    from: IpAddr,
+    icmp_type: u8,
+    code: u8,
+}
+
+/// Reads an error-queue entry's ancillary data.
+///
+/// The error itself is described there and nowhere else: a `sock_extended_err`
+/// carrying the ICMP type and code, followed by the address of the node that
+/// sent them. The datagram's own name is the address we were probing, so the
+/// router that answered has to come from here or a traceroute would attribute
+/// every hop to the target.
+#[cfg(target_os = "linux")]
+unsafe fn parse_error_cmsg(msg: &libc::msghdr) -> Option<QueuedError> {
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+        while !cmsg.is_null() {
+            let hdr = &*cmsg;
+            let is_err = (hdr.cmsg_level == libc::IPPROTO_IP
+                && hdr.cmsg_type == libc::IP_RECVERR)
+                || (hdr.cmsg_level == libc::IPPROTO_IPV6 && hdr.cmsg_type == libc::IPV6_RECVERR);
+            if is_err {
+                let data = libc::CMSG_DATA(cmsg);
+                let len = (hdr.cmsg_len as usize).saturating_sub(data as usize - cmsg as usize);
+                let ee_size = std::mem::size_of::<libc::sock_extended_err>();
+                if len >= ee_size {
+                    // Copied out byte by byte: the queue is not obliged to
+                    // align its ancillary data the way the struct wants it.
+                    let mut ee: libc::sock_extended_err = std::mem::zeroed();
+                    std::ptr::copy_nonoverlapping(data, &raw mut ee as *mut u8, ee_size);
+                    let icmp = ee.ee_origin == libc::SO_EE_ORIGIN_ICMP
+                        || ee.ee_origin == libc::SO_EE_ORIGIN_ICMP6;
+                    if icmp {
+                        let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+                        let addr = (len - ee_size).min(std::mem::size_of_val(&storage));
+                        std::ptr::copy_nonoverlapping(
+                            data.add(ee_size),
+                            &raw mut storage as *mut u8,
+                            addr,
+                        );
+                        return Some(QueuedError {
+                            from: sockaddr_to_ip(&storage)?,
+                            icmp_type: ee.ee_type,
+                            code: ee.ee_code,
+                        });
+                    }
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+        None
+    }
+}
+
 /// Resolves one received ICMP message back to whoever is waiting for it.
 fn dispatch(inner: &Inner, packet: &[u8], from: IpAddr, ttl: u8) {
     let Some(msg) = icmp_body(packet) else { return };
 
     let (icmp_type, code) = (msg[0], msg[1]);
     let echo_reply = if from.is_ipv4() { 0 } else { 129 };
-    let time_exceeded = if from.is_ipv4() { 11 } else { 3 };
-    let unreachable = if from.is_ipv4() { 3 } else { 1 };
 
     if icmp_type == echo_reply {
         let Some(token) = parse_token(&msg[8..]) else { return };
@@ -650,6 +868,18 @@ fn dispatch(inner: &Inner, packet: &[u8], from: IpAddr, ttl: u8) {
         return;
     }
 
+    // The quoted packet holds only the original IP header plus the first eight
+    // bytes of the datagram, which is the ICMP header and no payload. The
+    // token is therefore out of reach and the sequence number is what
+    // identifies the request.
+    let Some(seq) = quoted_seq(&msg[8..]) else { return };
+    deliver_error(inner, icmp_type, code, from, ttl, seq);
+}
+
+/// Hands an ICMP error report to the probe whose sequence number it quotes.
+fn deliver_error(inner: &Inner, icmp_type: u8, code: u8, from: IpAddr, ttl: u8, seq: u16) {
+    let time_exceeded = if from.is_ipv4() { 11 } else { 3 };
+    let unreachable = if from.is_ipv4() { 3 } else { 1 };
     let kind = if icmp_type == time_exceeded {
         ReplyKind::TimeExceeded
     } else if icmp_type == unreachable {
@@ -658,11 +888,6 @@ fn dispatch(inner: &Inner, packet: &[u8], from: IpAddr, ttl: u8) {
         return;
     };
 
-    // The quoted packet holds only the original IP header plus the first eight
-    // bytes of the datagram, which is the ICMP header and no payload. The
-    // token is therefore out of reach and the sequence number is what
-    // identifies the request.
-    let Some(seq) = quoted_seq(&msg[8..]) else { return };
     let Some(mut p) = inner.waiters.lock().unwrap().take_by_seq(seq) else { return };
     if let Some(tx) = p.tx.take() {
         let _ = tx.send(Ok(Reply { kind, from, rtt: p.sent.elapsed(), ttl, code }));
@@ -699,20 +924,52 @@ fn parse_token(data: &[u8]) -> Option<u32> {
 
 /// Pulls the ICMP sequence number out of the packet quoted back by an error
 /// message, skipping the original IP header.
+///
+/// Most of the quotes that arrive are nobody's business here. A raw ICMP
+/// socket, and a datagram one on macOS, is handed every ICMP message the host
+/// receives, which includes the errors drawn by every other program's traffic:
+/// a port-unreachable quoting a DNS query, a time-exceeded quoting the system
+/// traceroute's UDP probes. Two bytes at a fixed offset into one of those is a
+/// UDP checksum or the middle of a TCP sequence number, and one collision in
+/// sixty-five thousand was enough to tell a sweep that a live host was
+/// unreachable, or to end a trace at a hop it had never reached. So the quote
+/// has to prove it is an echo request before its sequence number is believed.
 fn quoted_seq(b: &[u8]) -> Option<u16> {
     if b.len() < 20 {
         return None;
     }
-    let offset = match b[0] >> 4 {
-        4 => ((b[0] & 0x0f) as usize) * 4,
-        6 => 40,
+    let (offset, v6) = match b[0] >> 4 {
+        4 => (((b[0] & 0x0f) as usize) * 4, false),
+        6 => (40, true),
         _ => return None,
     };
-    // The quoted ICMP header is type(1) code(1) checksum(2) id(2) seq(2).
-    if b.len() < offset + 8 {
+    // A header shorter than the minimum is a malformed quote, and its stated
+    // length would put the search for the ICMP header inside the IP header.
+    if offset < 20 {
         return None;
     }
-    Some(u16::from_be_bytes([b[offset + 6], b[offset + 7]]))
+    // What the quoted packet carried: byte nine of an IPv4 header, the next
+    // header of an IPv6 one. Anything else is somebody else's conversation.
+    // An IPv6 extension header counts as anything else, since it leaves the
+    // ICMP header somewhere this cannot find rather than where it looks.
+    let proto = if v6 { b[6] } else { b[9] };
+    if proto != if v6 { 58 } else { 1 } {
+        return None;
+    }
+    echo_seq(b.get(offset..)?, v6)
+}
+
+/// The sequence number of a quoted echo request.
+///
+/// Eight bytes: type(1) code(1) checksum(2) id(2) seq(2). The identifier is no
+/// help in matching, since an unprivileged datagram socket has the kernel's
+/// there and not ours, but the type says whether this was an echo request at
+/// all, and only an echo request can be one of ours.
+fn echo_seq(icmp: &[u8], v6: bool) -> Option<u16> {
+    if icmp.len() < 8 || icmp[0] != if v6 { 128 } else { 8 } {
+        return None;
+    }
+    Some(u16::from_be_bytes([icmp[6], icmp[7]]))
 }
 
 /// The human name for an ICMP destination-unreachable code.
@@ -761,16 +1018,125 @@ mod tests {
         assert_eq!(parse_token(&body[..4]), None);
     }
 
-    #[test]
-    fn an_error_report_is_matched_by_the_sequence_it_quotes() {
-        // The quoted packet is the original IP header plus the first eight
-        // bytes of the datagram: type, code, checksum, id, sequence.
+    /// An IPv4 header quoting an ICMP echo request, as an error report
+    /// carries it: twenty bytes of header with protocol 1 at byte nine, then
+    /// type, code, checksum, id, sequence.
+    fn quoted_echo(seq: u16) -> Vec<u8> {
         let mut quoted = vec![0x45, 0x00, 0x00, 0x54];
         quoted.extend_from_slice(&[0u8; 16]);
-        quoted.extend_from_slice(&[0x08, 0x00, 0x00, 0x00, 0xaa, 0xbb, 0x04, 0xd2]);
-        assert_eq!(quoted_seq(&quoted), Some(1234));
+        quoted[9] = 1;
+        quoted.extend_from_slice(&[0x08, 0x00, 0x00, 0x00, 0xaa, 0xbb]);
+        quoted.extend_from_slice(&seq.to_be_bytes());
+        quoted
+    }
+
+    #[test]
+    fn an_error_report_is_matched_by_the_sequence_it_quotes() {
+        assert_eq!(quoted_seq(&quoted_echo(1234)), Some(1234));
 
         assert_eq!(quoted_seq(&[0u8; 8]), None);
+    }
+
+    /// An error report about somebody else's packet is not one of our probes.
+    ///
+    /// The socket is handed every ICMP error the host receives, and the two
+    /// bytes where an echo request keeps its sequence number are, in a UDP
+    /// header, the checksum: whatever a passing DNS query happened to hash to
+    /// used to be matched against the probes in flight.
+    #[test]
+    fn a_report_quoting_another_protocol_matches_nothing() {
+        // A port-unreachable quoting a UDP datagram whose checksum is 1234.
+        let mut udp = quoted_echo(0);
+        udp[9] = 17;
+        udp[26] = 0x04;
+        udp[27] = 0xd2;
+        assert_eq!(quoted_seq(&udp), None, "a quoted UDP datagram is not our probe");
+
+        // And one quoting TCP, where those bytes are inside the sequence.
+        let mut tcp = quoted_echo(1234);
+        tcp[9] = 6;
+        assert_eq!(quoted_seq(&tcp), None);
+
+        // ICMP, but not an echo request: an error quoting an error.
+        let mut other = quoted_echo(1234);
+        other[20] = 11;
+        assert_eq!(quoted_seq(&other), None, "we never sent a time-exceeded");
+
+        // An IPv6 quote whose next header is a routing extension, not ICMPv6.
+        // The ICMP header is not forty bytes in, so there is nothing to read.
+        let mut v6 = vec![0x60u8; 48];
+        v6[6] = 43;
+        assert_eq!(quoted_seq(&v6), None);
+        v6[6] = 58;
+        v6[40] = 128;
+        v6[46] = 0x04;
+        v6[47] = 0xd2;
+        assert_eq!(quoted_seq(&v6), Some(1234), "a quoted ICMPv6 echo is ours");
+    }
+
+    /// The Linux error queue quotes the bare ICMP header, with no IP header in
+    /// front of it, which is the one shape the reader has to read differently.
+    #[test]
+    fn a_bare_quoted_echo_request_still_yields_its_sequence() {
+        let icmp = [0x08u8, 0x00, 0x00, 0x00, 0xaa, 0xbb, 0x04, 0xd2];
+        assert_eq!(echo_seq(&icmp, false), Some(1234));
+        // The same bytes are not an ICMPv6 echo request: the type differs.
+        assert_eq!(echo_seq(&icmp, true), None);
+        assert_eq!(echo_seq(&icmp[..7], false), None);
+    }
+
+    /// The router that sent an error is named in the ancillary data.
+    ///
+    /// Linux does not deliver ICMP errors to a datagram ICMP socket as
+    /// datagrams; they go on the error queue, where the type, the code and the
+    /// sender all arrive as ancillary data. The datagram's own name is the
+    /// address that was being probed, so a traceroute that read that would
+    /// report the target at every hop. Only Linux has this, and only Linux can
+    /// build one to read, so the queue's own message is assembled here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_error_queue_entry_names_the_router_that_sent_the_report() {
+        unsafe {
+            let ee_size = std::mem::size_of::<libc::sock_extended_err>();
+            let sin_size = std::mem::size_of::<libc::sockaddr_in>();
+            let mut control = [0u8; 256];
+            let cmsg = control.as_mut_ptr() as *mut libc::cmsghdr;
+            let len = libc::CMSG_LEN((ee_size + sin_size) as u32) as usize;
+            (*cmsg).cmsg_len = len as _;
+            (*cmsg).cmsg_level = libc::IPPROTO_IP;
+            (*cmsg).cmsg_type = libc::IP_RECVERR;
+
+            let mut ee: libc::sock_extended_err = std::mem::zeroed();
+            ee.ee_origin = libc::SO_EE_ORIGIN_ICMP;
+            ee.ee_type = 11;
+            ee.ee_code = 0;
+            let data = libc::CMSG_DATA(cmsg);
+            std::ptr::copy_nonoverlapping(&raw const ee as *const u8, data, ee_size);
+
+            let mut sin: libc::sockaddr_in = std::mem::zeroed();
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_addr.s_addr = u32::from(Ipv4Addr::new(10, 0, 0, 1)).to_be();
+            std::ptr::copy_nonoverlapping(
+                &raw const sin as *const u8,
+                data.add(ee_size),
+                sin_size,
+            );
+
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = len as _;
+
+            let err = parse_error_cmsg(&msg).expect("the report was not read");
+            assert_eq!(err.from, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+            assert_eq!(err.icmp_type, 11, "a time-exceeded, which is what a hop sends");
+            assert_eq!(err.code, 0);
+
+            // A local error -- one the kernel raised itself, with no router
+            // behind it -- has no sender to report and is not a hop.
+            ee.ee_origin = libc::SO_EE_ORIGIN_LOCAL;
+            std::ptr::copy_nonoverlapping(&raw const ee as *const u8, data, ee_size);
+            assert!(parse_error_cmsg(&msg).is_none());
+        }
     }
 
     #[test]
@@ -824,6 +1190,63 @@ mod tests {
         // 255 is a real TTL and must survive the widening intact.
         assert_eq!(hop(&255i32.to_ne_bytes()), 255);
         assert_eq!(hop(&[]), 0, "nothing to read is no TTL, not a panic");
+    }
+
+    /// A sequence number reused while its first probe still waits stays with
+    /// the probe that took it over.
+    ///
+    /// Sixteen bits is all there is, so a wide sweep gets back round to a
+    /// sequence whose earlier owner has not finished. Only the newer probe can
+    /// be matched by it from then on, and the older one finishing used to
+    /// delete the mapping anyway, leaving an error report for the newer probe
+    /// with nowhere to go.
+    #[test]
+    fn an_older_probe_finishing_leaves_a_reused_sequence_with_its_new_owner() {
+        let mut w = Waiters::default();
+        let sent = Instant::now();
+        w.by_token.insert(1, Pending { seq: 7, sent, tx: None });
+        w.by_seq.insert(7, 1);
+        // The counter has wrapped: probe 2 goes out on the same sequence while
+        // probe 1 is still waiting, and owns it from here on.
+        w.by_token.insert(2, Pending { seq: 7, sent, tx: None });
+        w.by_seq.insert(7, 2);
+
+        assert!(w.take_by_token(1).is_some(), "probe 1 was answered by its token");
+        assert_eq!(w.by_seq.get(&7), Some(&2), "probe 2 still owns the sequence");
+
+        let p = w.take_by_seq(7).expect("a time-exceeded must still reach probe 2");
+        assert_eq!(p.seq, 7);
+        assert!(w.by_token.is_empty(), "nothing left waiting");
+        assert!(w.by_seq.is_empty(), "and no mapping left behind");
+    }
+
+    /// A request the kernel refused says why, rather than blaming the socket.
+    #[test]
+    fn a_refused_send_is_reported_as_the_reason_the_kernel_gave() {
+        let no_route = why_unsent(&io::Error::from(io::ErrorKind::HostUnreachable));
+        assert_eq!(no_route.to_string(), "no route to host");
+        assert_ne!(no_route, PingError::Closed, "the socket is open; the route is not there");
+
+        assert_eq!(
+            why_unsent(&io::Error::from(io::ErrorKind::NetworkUnreachable)).to_string(),
+            "network unreachable"
+        );
+        // Our own burst filling the send queue is not a fact about the target.
+        assert_eq!(
+            why_unsent(&io::Error::from(io::ErrorKind::WouldBlock)).to_string(),
+            "send queue full"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            why_unsent(&io::Error::from_raw_os_error(libc::ENOBUFS)).to_string(),
+            "send queue full",
+            "ENOBUFS is the BSD spelling and has no ErrorKind of its own"
+        );
+
+        // Something with no better name still must not claim the socket closed.
+        let odd = why_unsent(&io::Error::from(io::ErrorKind::InvalidInput));
+        assert_eq!(odd.to_string(), "cannot send");
+        assert_ne!(odd, PingError::Closed);
     }
 
     /// The loopback answers its own pings, which exercises the socket, the

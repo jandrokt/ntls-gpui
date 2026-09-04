@@ -72,11 +72,44 @@ struct Hop {
     addrs: Vec<IpAddr>,
     rtts: Vec<Duration>,
     lost: usize,
-    /// Marks the hop that answered with an echo reply, meaning the target
-    /// itself.
+    /// Marks the hop the trace ends at: the target answered, or something on
+    /// the way said the probes are going no further.
     final_: bool,
+    /// Whether it was the target answering for itself that ended the trace,
+    /// rather than something short of it turning the probes back.
+    is_target: bool,
     /// An unreachable explanation, when there is one.
     note: String,
+}
+
+impl Hop {
+    /// Folds one answer into the hop.
+    fn record(&mut self, reply: &icmp::Reply, target: IpAddr) {
+        self.rtts.push(reply.rtt);
+        if !self.addrs.contains(&reply.from) {
+            self.addrs.push(reply.from);
+        }
+        match reply.kind {
+            icmp::ReplyKind::Echo => {
+                self.final_ = true;
+                self.is_target = true;
+            }
+            // An unreachable report ends the trace wherever it comes from,
+            // since nothing is getting past whatever sent it. But it is
+            // usually a firewall short of the target refusing to pass the
+            // probes on, not the target answering for itself, and every one
+            // of them was being counted as an arrival: a trace that a
+            // middlebox stopped six hops out finished by announcing it had
+            // reached a host that had never answered anything, with the
+            // middlebox's address in the last row.
+            icmp::ReplyKind::Unreachable => {
+                self.final_ = true;
+                self.is_target |= reply.from == target;
+                self.note = icmp::unreachable_note(reply.code).into();
+            }
+            icmp::ReplyKind::TimeExceeded => {}
+        }
+    }
 }
 
 /// How many TTLs are probed at once. The TTL is a socket setting, but it is
@@ -108,7 +141,12 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
 
     let start = Instant::now();
     let sem = Arc::new(tokio::sync::Semaphore::new(PARALLEL_HOPS));
-    let state = Arc::new(Mutex::new(State { results: Vec::new(), emitted: 1, reached: 0 }));
+    let state = Arc::new(Mutex::new(State {
+        results: Vec::new(),
+        emitted: 1,
+        reached: 0,
+        by_target: false,
+    }));
     state.lock().unwrap().results.resize_with(max_hops + 1, || None);
 
     let mut tasks = Vec::new();
@@ -139,6 +177,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                 let mut s = state.lock().unwrap();
                 if hop.final_ && (s.reached == 0 || ttl < s.reached) {
                     s.reached = ttl;
+                    s.by_target = hop.is_target;
                 }
                 s.results[ttl] = Some(hop);
                 s.drain_ready(max_hops)
@@ -164,24 +203,49 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Reaching the target early makes the hop budget irrelevant, so close the
-    // bar against what the path actually turned out to be.
-    let done = state.lock().unwrap().reached;
-    if done > 0 {
-        emit.progress(done, done);
-        emit.good(format!("reached {target} in {done} hops, {}", elapsed(start.elapsed())));
-    } else {
+    let (done, by_target) = {
+        let s = state.lock().unwrap();
+        (s.reached, s.by_target)
+    };
+    emit_summary(&emit, target, done, by_target, max_hops, start.elapsed());
+    Ok(())
+}
+
+/// Says how the trace ended and closes the progress bar.
+fn emit_summary(
+    emit: &Emitter,
+    target: IpAddr,
+    done: usize,
+    by_target: bool,
+    max_hops: usize,
+    took: Duration,
+) {
+    if done == 0 {
         emit.progress(max_hops, max_hops);
         emit.warn(format!("gave up after {max_hops} hops without reaching {target}"));
+        return;
     }
-    Ok(())
+
+    // Ending the path early makes the hop budget irrelevant, so close the bar
+    // against what the path actually turned out to be.
+    emit.progress(done, done);
+    if by_target {
+        emit.good(format!("reached {target} in {done} hops, {}", elapsed(took)));
+    } else {
+        // Something on the way refused to carry the probes any further, which
+        // is not the same as arriving. The last row names what answered and
+        // why, so all this has to say is that the path stops there.
+        emit.warn(format!("path to {target} ends at hop {done}, {}", elapsed(took)));
+    }
 }
 
 struct State {
     results: Vec<Option<Hop>>,
     emitted: usize,
-    /// The TTL at which the target answered, 0 while unknown.
+    /// The TTL the path ended at, 0 while unknown.
     reached: usize,
+    /// Whether the hop at `reached` was the target itself.
+    by_target: bool,
 }
 
 impl State {
@@ -222,18 +286,7 @@ async fn probe_hop(
             continue;
         };
 
-        hop.rtts.push(reply.rtt);
-        if !hop.addrs.contains(&reply.from) {
-            hop.addrs.push(reply.from);
-        }
-        match reply.kind {
-            icmp::ReplyKind::Echo => hop.final_ = true,
-            icmp::ReplyKind::Unreachable => {
-                hop.final_ = true;
-                hop.note = icmp::unreachable_note(reply.code).into();
-            }
-            icmp::ReplyKind::TimeExceeded => {}
-        }
+        hop.record(&reply, target);
     }
     hop
 }
@@ -276,4 +329,96 @@ fn format_rtts(hop: &Hop) -> String {
     }
     parts.extend(std::iter::repeat_n("*".to_string(), hop.lost));
     parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{Event, Level};
+
+    const TARGET: &str = "1.1.1.1";
+
+    fn target() -> IpAddr {
+        TARGET.parse().expect("an address")
+    }
+
+    fn reply(kind: icmp::ReplyKind, from: &str, code: u8) -> icmp::Reply {
+        icmp::Reply {
+            kind,
+            from: from.parse().expect("an address"),
+            rtt: Duration::from_millis(12),
+            ttl: 64,
+            code,
+        }
+    }
+
+    /// Collects the log lines a summary produces.
+    fn logged(f: impl FnOnce(&Emitter)) -> Vec<(Level, String)> {
+        let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let held = events.clone();
+        f(&Emitter::new(move |e| held.lock().expect("events").push(e)));
+        events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter_map(|e| match e {
+                Event::Log { level, text } => Some((*level, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unreachable_report_from_a_middlebox_is_not_the_target_answering() {
+        let mut hop = Hop { ttl: 6, ..Default::default() };
+        hop.record(&reply(icmp::ReplyKind::Unreachable, "10.0.0.1", 13), target());
+
+        // The trace still stops here, since nothing is getting past it.
+        assert!(hop.final_, "an unreachable report has to end the trace");
+        assert!(!hop.is_target, "a middlebox's report was credited to the target");
+        assert_eq!(hop.note, "administratively prohibited");
+    }
+
+    #[test]
+    fn an_unreachable_report_from_the_target_itself_counts_as_reaching_it() {
+        let mut hop = Hop { ttl: 9, ..Default::default() };
+        hop.record(&reply(icmp::ReplyKind::Unreachable, TARGET, 3), target());
+        assert!(hop.final_ && hop.is_target, "the target's own answer went uncredited");
+    }
+
+    #[test]
+    fn a_time_exceeded_answer_leaves_the_trace_running() {
+        let mut hop = Hop { ttl: 3, ..Default::default() };
+        hop.record(&reply(icmp::ReplyKind::TimeExceeded, "10.0.0.1", 0), target());
+        assert!(!hop.final_ && !hop.is_target);
+        assert_eq!(hop.addrs, vec!["10.0.0.1".parse::<IpAddr>().expect("an address")]);
+    }
+
+    #[test]
+    fn a_trace_stopped_short_of_the_target_does_not_claim_to_have_reached_it() {
+        let logs = logged(|emit| {
+            emit_summary(emit, target(), 6, false, 30, Duration::from_millis(400));
+        });
+        assert!(
+            logs.iter().all(|(_, text)| !text.contains("reached 1.1.1.1")),
+            "a trace a middlebox stopped announced an arrival: {logs:?}"
+        );
+        assert!(
+            logs.iter().any(|(level, text)| *level == Level::Warn && text.contains("hop 6")),
+            "nothing said where the path stopped: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn a_trace_the_target_answered_reports_reaching_it() {
+        let logs = logged(|emit| {
+            emit_summary(emit, target(), 9, true, 30, Duration::from_millis(400));
+        });
+        assert!(
+            logs.iter().any(|(level, text)| {
+                *level == Level::Good && text.contains("reached 1.1.1.1 in 9 hops")
+            }),
+            "reaching the target went unreported: {logs:?}"
+        );
+    }
 }

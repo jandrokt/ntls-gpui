@@ -231,6 +231,47 @@ mod tests {
     /// A resumed scan must skip what the interrupted one already covered, or
     /// resuming would duplicate every row it re-probed.
     #[test]
+    fn a_resumed_scan_does_not_skip_a_host_on_another_host_s_behalf() {
+        // One host answering on a high port used to mean every other host in
+        // the range had its lower ports dropped, and the run then called
+        // itself finished. A row says how far its own host got and nothing
+        // about anybody else's.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let tool = super::portscan::PortScan;
+        let mut params = Params::defaults(&crate::core::Tool::fields(&tool));
+        // Two hosts, one of which is the loopback that answers.
+        params.set("target", "127.0.0.1, 127.0.0.2");
+        params.set("ports", &format!("{}-{}", port.saturating_sub(2), port));
+        params.set("banner", "false");
+        params.set("showclosed", "true");
+        params.set("timeout", "400ms");
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let sink = collected.clone();
+        let emit = Emitter::new(move |e| sink.lock().unwrap().push(e));
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let run = crate::core::Run {
+                cancel: Cancel::new(),
+                params: params.clone(),
+                // Only the first host reported anything.
+                done: std::iter::once(format!("127.0.0.1:{port}")).collect(),
+                prior: Vec::new(),
+                keep: false,
+            };
+            crate::core::Tool::run(&tool, run, emit).await.unwrap();
+        });
+
+        let events = collected.lock().unwrap().clone();
+        let rows = events.iter().filter(|e| matches!(e, Event::Row(_))).count();
+        // The second host was never reported on, so all three of its ports
+        // are still to probe.
+        assert!(rows >= 3, "the other host should still be probed, got {rows} rows");
+    }
+
+    #[test]
     fn a_resumed_scan_skips_what_is_already_done() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();

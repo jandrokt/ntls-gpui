@@ -135,7 +135,22 @@ impl Sheet {
     /// into a file are the same thing afterwards.
     pub fn put(&mut self, flow: &Flow) -> std::io::Result<()> {
         self.source = crate::flow::write(flow);
-        std::fs::write(&self.path, &self.source)?;
+        // Write beside the workflow and rename over it. Writing in place
+        // empties the file first, so a save that ran out of disk, hit a
+        // disconnected volume or was killed part-way left the workflow with
+        // nothing or half a workflow in it; the repaint after that saw a file
+        // whose time had changed, read the wreckage back in, and the good copy
+        // in memory went with it. There is no undo for that.
+        let tmp = self.path.with_extension("flow.tmp");
+        let saved =
+            std::fs::write(&tmp, &self.source).and_then(|()| std::fs::rename(&tmp, &self.path));
+        if let Err(e) = saved {
+            // Nothing reads a leftover `.flow.tmp`, but a workspace is a
+            // directory people open in Finder, so do not leave one sitting in
+            // it.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         self.seen = modified(&self.path);
         Ok(())
     }
@@ -349,6 +364,34 @@ mod tests {
         assert_eq!(sheet.title(), "Nightly");
         assert_eq!(std::fs::read_to_string(&sheet.path).unwrap(), sheet.source);
         assert_eq!(sheet.flow(), flow);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What this is really asking is whether the save ever emptied the file it
+    /// found, because that is the file an interrupted save would leave behind.
+    /// A second link to it, made beforehand, still holds the old text if the
+    /// new text went somewhere else and was renamed over the top. Extra links
+    /// are a Unix idea, hence the gate.
+    #[cfg(unix)]
+    #[test]
+    fn saving_a_workflow_puts_a_whole_file_in_place_of_the_old_one() {
+        let dir = std::env::temp_dir().join("ntls-flow-put-whole");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let before = "# Nightly\n\nrun A\n";
+        let mut sheet = sheet(before);
+        sheet.path = dir.join("nightly.flow");
+        std::fs::write(&sheet.path, before).unwrap();
+        let witness = dir.join("nightly.before");
+        std::fs::hard_link(&sheet.path, &witness).unwrap();
+
+        let mut flow = sheet.flow();
+        flow.steps.push(crate::flow::Step::Wait { seconds: 30.0 });
+        sheet.put(&flow).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&sheet.path).unwrap(), sheet.source);
+        assert_eq!(std::fs::read_to_string(&witness).unwrap(), before);
+        assert!(!dir.join("nightly.flow.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -88,17 +88,36 @@ pub fn system_resolvers() -> Vec<String> {
     const FRESH: Duration = Duration::from_secs(20);
     static CACHE: std::sync::Mutex<Option<(Instant, Vec<String>)>> = std::sync::Mutex::new(None);
 
-    if let Ok(cache) = CACHE.lock()
-        && let Some((read, resolvers)) = cache.as_ref()
-        && read.elapsed() < FRESH
+    cached(&CACHE, FRESH, read_resolvers)
+}
+
+/// Returns what is held, working it out with `read` when that is missing or
+/// older than `fresh`.
+///
+/// One lock covers both the look and the fill. Taking it twice -- once to find
+/// nothing, once to store what was found -- left the whole of the read
+/// unguarded, so every caller that arrived while one was in flight found
+/// nothing too and started another. The workers of a subnet sweep reach this
+/// within a millisecond of each other, all sixty-four of them on a cold
+/// cache, and on Windows a read is an `ipconfig` subprocess that blocks the
+/// runtime thread it runs on: the burst this cache exists to prevent was
+/// being run every time it was cold.
+fn cached(
+    cache: &std::sync::Mutex<Option<(Instant, Vec<String>)>>,
+    fresh: Duration,
+    read: impl FnOnce() -> Vec<String>,
+) -> Vec<String> {
+    // A read that panicked poisons the lock. What is behind it is a list of
+    // addresses with no invariant to break, and refusing to serve it again
+    // would mean a subprocess per lookup for the rest of the run.
+    let mut held = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, resolvers)) = held.as_ref()
+        && at.elapsed() < fresh
     {
         return resolvers.clone();
     }
-
-    let resolvers = read_resolvers();
-    if let Ok(mut cache) = CACHE.lock() {
-        *cache = Some((Instant::now(), resolvers.clone()));
-    }
+    let resolvers = read();
+    *held = Some((Instant::now(), resolvers.clone()));
     resolvers
 }
 
@@ -153,18 +172,37 @@ fn parse_ipconfig(text: &str) -> Vec<String> {
             in_list = false;
             continue;
         }
-        let candidate = if let Some((label, value)) = trimmed.split_once(':') {
-            // A label ends in a run of dots; anything else with a colon is an
-            // address on a continuation line.
-            let labelled = label.contains('.') || label.chars().any(|c| c.is_alphabetic());
-            if labelled {
-                in_list = label.to_lowercase().contains("dns servers");
-                value.trim()
-            } else {
-                trimmed
+        // An address on a continuation line is an address, whatever letters
+        // it contains. Deciding otherwise from the presence of a letter meant
+        // any IPv6 resolver whose first group has a hex letter in it -- fe80,
+        // 2a00, fd00 -- was read as a label, which both discarded it and
+        // ended the list, taking every resolver printed after it as well.
+        let address_line = trimmed
+            .split('%')
+            .next()
+            .unwrap_or(trimmed)
+            .trim()
+            .parse::<IpAddr>()
+            .is_ok();
+
+        let candidate = match trimmed.split_once(':') {
+            Some((label, value)) if !address_line => {
+                // `ipconfig` pads a label out with a run of dots and spaces,
+                // which is what makes it a label.
+                let labelled = label.contains('.') || label.chars().any(|c| c.is_alphabetic());
+                if labelled {
+                    // The whole of this output is translated, so matching the
+                    // English phrase meant a German or French or Spanish
+                    // Windows reported no resolvers at all, and everything
+                    // that needs one silently stopped working. The acronym is
+                    // the part that survives translation.
+                    in_list = label.to_lowercase().contains("dns");
+                    value.trim()
+                } else {
+                    trimmed
+                }
             }
-        } else {
-            trimmed
+            _ => trimmed,
         };
 
         if !in_list {
@@ -237,7 +275,7 @@ pub async fn query(
 
     let start = Instant::now();
     let (reply, truncated) = exchange(addr, &query, timeout).await?;
-    let mut result = decode(&reply)?;
+    let mut result = decode(&reply, id, &name, qtype)?;
     result.server = server;
     result.elapsed = start.elapsed();
     result.truncated = truncated;
@@ -245,7 +283,11 @@ pub async fn query(
 }
 
 /// Sends the query over UDP, falling back to TCP when the answer is too large
-/// to fit in a datagram.
+/// to fit in a datagram. When that fallback cannot be made, because TCP on
+/// port 53 is refused, filtered or reset, the lookup fails: a truncated
+/// datagram is not an answer that can be reported instead. The flag in the
+/// returned pair says the reply came back over TCP, so it is only ever true
+/// alongside a complete answer.
 async fn exchange(server: SocketAddr, query: &[u8], timeout: Duration) -> Result<(Vec<u8>, bool), String> {
     let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse() } else { "[::]:0".parse() }
         .map_err(|_| "bad bind address".to_string())?;
@@ -262,9 +304,23 @@ async fn exchange(server: SocketAddr, query: &[u8], timeout: Duration) -> Result
     buf.truncate(n);
 
     // Bit 0x02 of the flags byte is TC, the truncation flag.
-    if n >= 3 && buf[2] & 0x02 != 0
-        && let Ok(reply) = exchange_tcp(server, query, timeout).await
-    {
+    if n >= 3 && buf[2] & 0x02 != 0 {
+        // A datagram with TC set is not a short answer. It is the server
+        // saying "ask again over TCP", and it carries no records at all.
+        //
+        // Both facts used to live in one condition, so "not truncated" and
+        // "truncated, but the retry failed" came out the same: that empty
+        // datagram was handed back as the whole answer. The tool then said
+        // NOERROR, drew an empty table, and reported no record of that kind,
+        // with nothing anywhere about the resolver whose TCP port was
+        // blocked. The networks where the retry fails are exactly the ones
+        // this gets opened on, so it says so instead.
+        let reply = exchange_tcp(server, query, timeout).await.map_err(|e| {
+            format!(
+                "the answer from {server} did not fit in a datagram \
+                 and could not be re-fetched over TCP: {e}"
+            )
+        })?;
         return Ok((reply, true));
     }
     Ok((buf, false))
@@ -376,18 +432,53 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn decode(reply: &[u8]) -> Result<Response, String> {
+/// Reads a reply to the query that `id`, `name` and `qtype` describe. A
+/// datagram that answers something else is refused rather than reported.
+fn decode(reply: &[u8], id: u16, name: &str, qtype: u16) -> Result<Response, String> {
     let mut c = Cursor { b: reply, pos: 0 };
     let malformed = || "malformed answer".to_string();
 
-    let _id = c.u16().ok_or_else(malformed)?;
+    // The transaction id is the only thing tying a datagram to the query it
+    // answers, and it used to be read and thrown away. The socket is
+    // connected, so the kernel drops anything not sent from the resolver's
+    // address and port, but that is no proof of much: a forgery only has to
+    // name the resolver as its source, and a resolver that answers a query
+    // after it has been given up on will send that answer to whichever
+    // ephemeral port it was asked from -- a port a sweep, asking for hundreds
+    // of names a minute, will be handed again shortly. Either way the
+    // datagram that arrived was shown as this query's answer, and in a sweep
+    // written into the table as some other host's name.
+    let answered = c.u16().ok_or_else(malformed)?;
+    if answered != id {
+        return Err(format!(
+            "the answer carries transaction id {answered} and this query's is {id}, \
+             so it is not an answer to it"
+        ));
+    }
     let flags = c.u16().ok_or_else(malformed)?;
     let counts: Vec<u16> = (0..4).map(|_| c.u16().unwrap_or(0)).collect();
 
-    for _ in 0..counts[0] {
-        c.name().ok_or_else(malformed)?;
+    for i in 0..counts[0] {
+        let asked = c.name().ok_or_else(malformed)?;
+        let asked_type = c.u16().ok_or_else(malformed)?;
         c.u16().ok_or_else(malformed)?;
-        c.u16().ok_or_else(malformed)?;
+        // A resolver echoes the question back, and one that echoes a
+        // different question has not answered this one: its records are about
+        // some other name, and putting them under the name the user typed
+        // would be a plain misreport. Only the first question is compared,
+        // because that is the only one a query of ours carries, and a reply
+        // with no question section at all -- which is how some servers refuse
+        // a query they will not parse -- still gets read, so that the rcode
+        // reaches the user instead of an error about the question.
+        if i == 0 && (!trim_root(&asked).eq_ignore_ascii_case(&trim_root(name)) || asked_type != qtype) {
+            return Err(format!(
+                "the answer is to a question about {} {}, not {} {}",
+                type_name(asked_type),
+                trim_root(&asked),
+                type_name(qtype),
+                trim_root(name)
+            ));
+        }
     }
 
     let mut records = Vec::new();
@@ -502,6 +593,36 @@ mod tests {
     }
 
     #[test]
+    fn an_ipv6_resolver_on_its_own_line_is_read_and_does_not_end_the_list() {
+        // `fe80` has letters in it, and a letter used to mean "this is a
+        // label", so the address was dropped and so was everything printed
+        // after it for that adapter.
+        let text = concat!(
+            "   DNS Servers . . . . . . . . . . . : 192.168.1.1\n",
+            "                                       fe80::1%13\n",
+            "                                       8.8.8.8\n",
+        );
+        assert_eq!(
+            super::parse_ipconfig(text),
+            vec!["192.168.1.1".to_string(), "fe80::1".to_string(), "8.8.8.8".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_translated_label_still_names_the_resolvers() {
+        // Every word of this output is translated. Matching the English
+        // phrase meant a German or French Windows reported no resolvers at
+        // all, and everything needing one quietly stopped working.
+        for line in [
+            "   DNS-Server  . . . . . . . . . . . : 192.168.1.1",
+            "   Serveurs DNS . . . . . . . . . . : 192.168.1.1",
+            "   Servidores DNS . . . . . . . . . : 192.168.1.1",
+        ] {
+            assert_eq!(super::parse_ipconfig(line), vec!["192.168.1.1".to_string()], "{line}");
+        }
+    }
+
+    #[test]
     fn the_resolvers_are_read_out_of_what_ipconfig_prints() {
         // The second server is on a line of its own with no label, which is
         // the whole difficulty of this format.
@@ -520,5 +641,162 @@ mod tests {
         // Every other line in that output holds an address too.
         let text = "   IPv4 Address. . . . . . . . . . . : 192.168.1.23(Preferred)\r\n   Subnet Mask . . . . . . . . . . . : 255.255.255.0\r\n   Default Gateway . . . . . . . . . : 192.168.1.1\r\n";
         assert!(parse_ipconfig(text).is_empty());
+    }
+
+    /// A resolver that sets the truncation flag, and a TCP port that will not
+    /// serve the retry. The truncated datagram carries no records, so this
+    /// used to be reported as a successful lookup with an empty answer and no
+    /// hint that anything had gone wrong.
+    #[test]
+    fn a_truncated_answer_that_cannot_be_refetched_fails_rather_than_reading_as_empty() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            // Answers every datagram the way a real resolver answers an
+            // oversized lookup: the question echoed back, the truncation flag
+            // set, and not one record. Nothing serves DNS on the same TCP
+            // port, so the retry fails the way blocked egress fails it.
+            let sock = UdpSocket::bind("127.0.0.1:0").await.expect("a loopback socket");
+            let server = sock.local_addr().expect("the port it was given");
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 512];
+                while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                    if n < 12 {
+                        continue;
+                    }
+                    let mut reply = vec![buf[0], buf[1], 0x83, 0x80];
+                    reply.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+                    reply.extend_from_slice(&buf[12..n]);
+                    let _ = sock.send_to(&reply, from).await;
+                }
+            });
+
+            let timeout = Duration::from_millis(500);
+            match query(&server.to_string(), "example.com", "TXT", timeout).await {
+                Ok(res) => panic!(
+                    "a truncated answer was reported as complete: {} record(s), truncated {}",
+                    res.records.len(),
+                    res.truncated
+                ),
+                Err(e) => assert!(
+                    e.contains("did not fit in a datagram"),
+                    "the reason has to name the truncation: {e}"
+                ),
+            }
+        });
+    }
+
+    /// Every worker of a subnet sweep asks for the resolvers within a
+    /// millisecond of the others. The look and the fill used to take the lock
+    /// separately, so nothing was held while a read was in flight and all of
+    /// them missed together; on Windows each of those misses is an `ipconfig`
+    /// subprocess blocking a runtime thread.
+    #[test]
+    fn callers_arriving_together_on_a_cold_cache_read_the_resolvers_once_between_them() {
+        let cache = std::sync::Mutex::new(None);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+
+        std::thread::scope(|s| {
+            for _ in 0..16 {
+                s.spawn(|| {
+                    let got = cached(&cache, Duration::from_secs(20), || {
+                        reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Long enough that the other fifteen have all arrived.
+                        std::thread::sleep(Duration::from_millis(50));
+                        vec!["192.168.1.1".to_string()]
+                    });
+                    assert_eq!(got, vec!["192.168.1.1".to_string()]);
+                });
+            }
+        });
+
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the resolvers were read once per caller waiting on a cold cache"
+        );
+    }
+
+    /// Answers every datagram with whatever `reply` makes of it, and hands
+    /// back the address to point a query at.
+    async fn fake_resolver(reply: fn(&[u8]) -> Vec<u8>) -> SocketAddr {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("a loopback socket");
+        let server = sock.local_addr().expect("the port it was given");
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                if n >= 12 {
+                    let _ = sock.send_to(&reply(&buf[..n]), from).await;
+                }
+            }
+        });
+        server
+    }
+
+    /// A well-formed response to the query in `asked`, carrying `id` and one
+    /// address: the shape a forgery has to take to be believed.
+    fn answer(asked: &[u8], id: u16) -> Vec<u8> {
+        let mut reply = Vec::with_capacity(asked.len() + 16);
+        reply.extend_from_slice(&id.to_be_bytes());
+        reply.extend_from_slice(&[0x81, 0x80]); // a response, NOERROR
+        reply.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0]); // one question, one answer
+        reply.extend_from_slice(&asked[12..]); // the question, echoed back
+        reply.extend_from_slice(&[0xc0, 0x0c]); // the name again, as a pointer
+        reply.extend_from_slice(&[0, 1, 0, 1]); // A, IN
+        reply.extend_from_slice(&60u32.to_be_bytes());
+        reply.extend_from_slice(&4u16.to_be_bytes());
+        reply.extend_from_slice(&[10, 0, 0, 1]);
+        reply
+    }
+
+    fn answer_under_another_id(asked: &[u8]) -> Vec<u8> {
+        answer(asked, u16::from_be_bytes([asked[0], asked[1]]) ^ 0xffff)
+    }
+
+    fn answer_about_another_name(asked: &[u8]) -> Vec<u8> {
+        // This one's id is the query's own, so only the question tells.
+        let id = u16::from_be_bytes([asked[0], asked[1]]);
+        let other = encode_query(id, "elsewhere.example.", 1).expect("a query for another name");
+        answer(&other, id)
+    }
+
+    /// A datagram from the resolver's address and port, answering the question
+    /// that was asked, with an address in it -- perfect but for the one field
+    /// that ties an answer to the query it answers. Reaching a connected
+    /// socket takes no more than putting the resolver's address on it.
+    #[test]
+    fn an_answer_carrying_some_other_transaction_id_is_not_taken_for_this_querys() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let server = fake_resolver(answer_under_another_id).await;
+            match query(&server.to_string(), "example.com", "A", Duration::from_millis(500)).await {
+                Ok(res) => panic!(
+                    "an unrelated datagram was reported as the answer: {} record(s)",
+                    res.records.len()
+                ),
+                Err(e) => {
+                    assert!(e.contains("transaction id"), "the reason has to name it: {e}")
+                }
+            }
+        });
+    }
+
+    /// The records in this one are about a name nobody asked about, so
+    /// showing them under the name that was typed would be a misreport.
+    #[test]
+    fn an_answer_about_another_name_is_not_reported_under_the_one_that_was_asked() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let server = fake_resolver(answer_about_another_name).await;
+            match query(&server.to_string(), "example.com", "A", Duration::from_millis(500)).await {
+                Ok(res) => panic!(
+                    "records about another name were reported: {:?}",
+                    res.records.iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+                ),
+                Err(e) => assert!(
+                    e.contains("elsewhere.example"),
+                    "the reason has to name the question that came back: {e}"
+                ),
+            }
+        });
     }
 }

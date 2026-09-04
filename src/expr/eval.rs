@@ -55,6 +55,18 @@ pub fn eval(expr: &Expr, source: &dyn Source) -> Result<Value, String> {
                 args.iter().map(|a| eval(a, source)).collect();
             call(name, &args?, source)
         }
+        // The subject of a method is a subject like any other, so
+        // `"IP scan".count()` goes through the same door as `"IP scan".rows`.
+        // Worked out as a plain argument it stayed the text of the name, and
+        // `count` then answered about that text: one, for one piece of text,
+        // where the run it named had three rows, and nothing said so.
+        Expr::Method(subject, name, args) => {
+            let mut values = vec![subject_value(subject, source)?];
+            for arg in args {
+                values.push(eval(arg, source)?);
+            }
+            call(name, &values, source)
+        }
         Expr::Unary(op, a) => {
             let a = eval(a, source)?;
             match *op {
@@ -115,7 +127,17 @@ fn index(subject: &Value, key: &Value) -> Result<Value, String> {
         Value::List(items) => {
             let at = key.number().ok_or_else(|| "a list is indexed by position".to_string())?;
             let at = if at < 0.0 { items.len() as f64 + at } else { at };
-            Ok(items.get(at.max(0.0) as usize).cloned().unwrap_or(Value::Nothing))
+            // Counting back from the end is the point of a negative position,
+            // but reaching back past the start is no position at all, and
+            // neither is the NaN that `0 / 0` comes to. Both were pulled up to
+            // zero, so `rtt[-9]` on a three-row column quietly answered with
+            // the first probe, where `rtt[99]` had rightly answered with
+            // nothing, and a report showed a figure from the wrong row with
+            // nothing anywhere to say so.
+            if at.is_nan() || at < 0.0 {
+                return Ok(Value::Nothing);
+            }
+            Ok(items.get(at as usize).cloned().unwrap_or(Value::Nothing))
         }
         Value::Table(_) => field_value(subject, &key.show()),
         Value::Nothing => Ok(Value::Nothing),
@@ -172,10 +194,15 @@ fn binary(op: &str, a: &Expr, b: &Expr, source: &dyn Source) -> Result<Value, St
         return Ok(if left.truth() { left } else { eval(b, source)? });
     }
 
+    // Whether a `+` is spelling out a sentence is settled here, while the
+    // expression is still in hand, because the answers no longer say.
+    let joining = op == "+" && (joins_text(a) || joins_text(b));
+
     let (a, b) = (eval(a, source)?, eval(b, source)?);
     Ok(match op {
         "+" => match (&a, &b) {
             // `+` on text joins it, which is how a sentence is built.
+            _ if joining => Value::Text(format!("{}{}", a.show(), b.show())),
             (Value::Text(_), _) | (_, Value::Text(_))
                 if a.number().is_none() || b.number().is_none() =>
             {
@@ -200,6 +227,29 @@ fn binary(op: &str, a: &Expr, b: &Expr, source: &dyn Source) -> Result<Value, St
         }
         _ => return Err(format!("unknown operator {op}")),
     })
+}
+
+/// Whether a `+` is spelling out a sentence rather than adding figures.
+///
+/// Quoted text anywhere in the chain settles it, because quoting is what
+/// somebody does to write prose. `Router.loss + Router.avg` names two cells
+/// and nothing else, and goes on being addition.
+///
+/// The whole chain is looked at and not just the two sides of one `+`, because
+/// `+` is left-associative and a join leaves text behind. In
+/// `Router.up + "/" + Router.rows` the outer `+` sees only "2/3" and 3, and
+/// "2/3" reads back as the figure it starts with, so judging that `+` by its
+/// answers added them and put "5" in the middle of a report with nothing
+/// anywhere to show that it had.
+fn joins_text(expr: &Expr) -> bool {
+    match expr {
+        Expr::Text(_) => true,
+        // `text(...)` is how somebody says they mean the writing and not the
+        // figure, so it joins even with no sentence quoted around it.
+        Expr::Call(name, _) => name == "text",
+        Expr::Binary(op, a, b) => *op == "+" && (joins_text(a) || joins_text(b)),
+        _ => false,
+    }
 }
 
 fn same(a: &Value, b: &Value) -> bool {
@@ -268,9 +318,23 @@ fn call(name: &str, args: &[Value], source: &dyn Source) -> Result<Value, String
         "sort" => match first {
             Some(Value::List(items)) => {
                 let mut items = items.clone();
+                // Two figures were held against each other by value while a
+                // figure and a cell that is no figure were held against each
+                // other by their writing, and those two orders disagree, so
+                // together they were no order at all: 9 comes under 20 by
+                // value, "20" comes under "3.4.5" by writing, and "3.4.5"
+                // comes under "9" by writing. A column holding those three ran
+                // in a circle, and the sort was free to leave it in whatever
+                // order the merging happened to end at, or to give up and
+                // panic in the middle of drawing a document. So a cell that is
+                // no figure — the "-" of a probe that got no reply, an address
+                // — is ordered by its writing and kept ahead of the figures,
+                // which are ordered among themselves.
                 items.sort_by(|a, b| match (a.number(), b.number()) {
-                    (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-                    _ => a.show().cmp(&b.show()),
+                    (Some(x), Some(y)) => x.total_cmp(&y),
+                    (None, None) => a.show().cmp(&b.show()),
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
                 });
                 Value::List(items)
             }
@@ -522,6 +586,53 @@ mod tests {
     }
 
     #[test]
+    fn a_join_that_has_already_happened_is_not_added_up_again() {
+        // `+` is left-associative and a join leaves text behind, so the second
+        // `+` here used to see "2/3" and 3. Text starting with a digit reads
+        // back as a figure, so it added them and rendered "5" in the middle of
+        // a report, with nothing to show anything had gone wrong.
+        assert_eq!(value(r#"Router.up + "/" + Router.rows"#).show(), "2/3");
+        assert_eq!(value(r#""" + 1 + 2"#).show(), "12");
+        // Figures with nothing quoted anywhere are still added.
+        assert_eq!(value("Router.up + Router.rows").show(), "5");
+        assert_eq!(value("1 + 2 + 3").show(), "6");
+    }
+
+    #[test]
+    fn a_method_on_a_quoted_run_name_answers_about_the_run() {
+        // A quoted name in front of a dot names the run. That was true of
+        // `"IP scan".rows` and not of `"IP scan".count()`, because parsing
+        // folded the subject in with the arguments and nothing afterwards
+        // could tell which it had been. So the method answered about the
+        // piece of text it was handed rather than about the run, and nothing
+        // anywhere said so.
+        let source = Spaced(Arc::new(Table {
+            name: "IP scan".into(),
+            tool: "ipscan".into(),
+            columns: vec!["HOST".into(), "RTT".into()],
+            rows: vec![
+                vec!["10.0.0.1".into(), "1.0 ms".into()],
+                vec!["10.0.0.2".into(), "3.0 ms".into()],
+            ],
+            statuses: vec!["up".into(), "up".into()],
+            stats: vec![("up".into(), "2".into())],
+            ..Table::default()
+        }));
+        // However it is written, it is the same question about the same run.
+        let both = |quoted: &str, long: &str| {
+            let a = run(quoted, &source).map(|v| v.show());
+            let b = run(long, &source).map(|v| v.show());
+            assert_eq!(a, b, "{quoted} and {long} have to agree");
+        };
+        both(r#""IP scan".count()"#, r#"tool("IP scan").count()"#);
+        both(r#""IP scan".col("HOST")"#, r#"tool("IP scan").col("HOST")"#);
+        both(r#""IP scan".rows"#, r#"tool("IP scan").rows"#);
+
+        // And a quoted argument is still only ever text.
+        assert_eq!(run(r#"upper("ip scan")"#, &source).unwrap().show(), "IP SCAN");
+    }
+
+    #[test]
     fn a_tool_that_is_not_there_is_nothing_rather_than_an_error() {
         // A document written ahead of the scan still renders.
         assert_eq!(value(r#"tool("Missing")"#).show(), "");
@@ -576,6 +687,28 @@ mod tests {
     }
 
     #[test]
+    fn a_column_of_figures_and_addresses_sorts_the_same_way_whatever_order_it_arrives_in() {
+        // Figures were compared by value and a figure against a cell that is
+        // no figure by its writing, and the two orders disagree: 9 is under 20
+        // by value, "20" is under "3.4.5" by writing, "3.4.5" is under "9" by
+        // writing. Those three ran in a circle, so the answer depended on
+        // which pairs the sort happened to look at, and the same column came
+        // back in a different order depending on the order it went in.
+        let cells = ["9", "3.4.5", "20", "-", "10.0.0.1"];
+        let sorted = |order: &[&str]| {
+            let list = Value::List(order.iter().map(|s| Value::Text((*s).into())).collect());
+            call("sort", &[list], &Empty).expect("it to sort").show()
+        };
+        let mut backwards = cells.to_vec();
+        backwards.reverse();
+        assert_eq!(sorted(&cells), "-, 10.0.0.1, 3.4.5, 9, 20");
+        assert_eq!(sorted(&backwards), sorted(&cells), "however the column arrives");
+        // A column with a probe that got no reply in it still reads low to
+        // high, with the missing one at the front, as it did before.
+        assert_eq!(value("Router.rtt.sort()").show(), "-, 10.0 ms, 30.0 ms");
+    }
+
+    #[test]
     fn shaping_a_list_shapes_what_is_in_it() {
         // `rtt.fixed(1)` has to mean something, and this is the only thing it
         // can mean.
@@ -595,6 +728,21 @@ mod tests {
         assert_eq!(value("Router.rtt[0]").show(), "10.0 ms");
         assert_eq!(value("Router.rtt[-1]").show(), "-");
         assert_eq!(value("Router.rtt[99]").show(), "");
+    }
+
+    #[test]
+    fn a_position_before_the_start_of_a_list_is_nothing_and_not_the_first_item() {
+        // Counting back from the end is what a negative position is for, and
+        // reaching back past the start is a mistake. It was pulled up to zero,
+        // so `rtt[-9]` read as `rtt[0]` and answered with the first probe,
+        // where `rtt[99]` rightly answered with nothing.
+        assert_eq!(value("Router.rtt[-1]").show(), "-", "the last row, as before");
+        assert_eq!(value("Router.rtt[-3]").show(), "10.0 ms", "and back to the first");
+        assert_eq!(value("Router.rtt[-4]").show(), "");
+        assert_eq!(value("Router.rtt[-99]").show(), "");
+        // `0 / 0` is a number that is no position either, and it was pulled up
+        // to zero the same way.
+        assert_eq!(value("Router.rtt[0 / 0]").show(), "");
     }
 
     #[test]

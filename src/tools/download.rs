@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crate::cells;
 use crate::core::tool::BoxFuture;
 use crate::core::{
-    Column, Emitter, Event, Expand, Field, Level, Opt, Role, Run, Status, Tool,
+    Column, Emitter, Event, Expand, Field, Level, Opt, Role, Row, Run, Status, Tool,
     Validator, bar, col,
 };
 use crate::dl::external::{self, Extractor};
@@ -187,14 +187,15 @@ async fn download(run: Run, emit: Emitter) -> anyhow::Result<()> {
     if let Some(rate) = crate::core::field::parse_rate(params.raw("limit")) {
         emit.info(format!("Rate limit: {}", names::rate(rate as f64)));
     }
+    let fetched = landed(&run.prior);
+    let pending = wanted(&links, &fetched);
     if run.resuming() {
-        emit.info(format!("Skipping {} URL(s) already fetched", run.done.len()));
+        emit.info(format!("Skipping {} URL(s) already fetched", links.len() - pending.len()));
     }
 
     let client = fetch::client()?;
     let tally = Arc::new(Tally::default());
     let queue = Arc::new(tokio::sync::Semaphore::new(at_once));
-    let pending: Vec<String> = links.into_iter().filter(|l| !run.done.contains(l)).collect();
     let total = pending.len();
 
     tally.total.store(total, Ordering::Relaxed);
@@ -205,13 +206,14 @@ async fn download(run: Run, emit: Emitter) -> anyhow::Result<()> {
     let mut running = futures::stream::FuturesUnordered::new();
     for link in pending {
         let permit = queue.clone();
-        let (client, emit, opts, quality, cancel, tally) = (
+        let (client, emit, opts, quality, cancel, tally, fetched) = (
             client.clone(),
             emit.clone(),
             opts.clone(),
             quality.clone(),
             run.cancel.clone(),
             tally.clone(),
+            &fetched,
         );
         running.push(async move {
             let _slot = permit.acquire_owned().await;
@@ -226,7 +228,7 @@ async fn download(run: Run, emit: Emitter) -> anyhow::Result<()> {
             } else {
                 opts
             };
-            one(&client, &link, prefer, &quality, &opts, &cancel, &emit, &tally).await;
+            one(&client, &link, prefer, &quality, &opts, fetched, &cancel, &emit, &tally).await;
         });
     }
 
@@ -252,6 +254,23 @@ async fn download(run: Run, emit: Emitter) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What the table an interrupted run left behind says is already on disk.
+///
+/// Only a row saying the file landed counts as fetched. That table also holds
+/// a row for every transfer that was still going when the queue was stopped
+/// and every one that failed, and counting those meant a resumed queue
+/// reported a half-written part file as already fetched and never went back
+/// for it, which is the whole of what resuming a download is for.
+fn landed(prior: &[Row]) -> std::collections::HashSet<String> {
+    prior.iter().filter(|row| row.status == Status::Up).map(|row| row.target.clone()).collect()
+}
+
+/// The links this run works through: the pasted list, less the ones whose
+/// file is already sitting in the destination.
+fn wanted(links: &[String], fetched: &std::collections::HashSet<String>) -> Vec<String> {
+    links.iter().filter(|link| !fetched.contains(link.as_str())).cloned().collect()
+}
+
 /// One pasted link, from working out what it is to the last byte of it.
 #[allow(clippy::too_many_arguments)]
 async fn one(
@@ -260,6 +279,7 @@ async fn one(
     prefer: Prefer,
     quality: &str,
     opts: &Opts,
+    fetched: &std::collections::HashSet<String>,
     cancel: &crate::core::Cancel,
     emit: &Emitter,
     tally: &Arc<Tally>,
@@ -280,12 +300,22 @@ async fn one(
 
     let plan = match resolve::resolve(client, link, prefer, cancel, emit).await {
         Ok(plan) => plan,
-        Err(e) => return fail(emit, link, &label, &e.to_string(), tally),
+        // Giving up here ends the link without starting a transfer, and a
+        // transfer is what usually counts an item off the queue, so this has
+        // to count it itself or the progress bar sits one short of the queue
+        // for the rest of the run.
+        Err(e) => {
+            fail(emit, link, &label, &e.to_string(), tally);
+            tally.finished.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
     };
 
     match plan {
+        // Nothing behind the link, so again no transfer runs to count it.
         Plan::Direct(assets) if assets.is_empty() => {
-            fail(emit, link, &label, "nothing to fetch", tally)
+            fail(emit, link, &label, "nothing to fetch", tally);
+            tally.finished.fetch_add(1, Ordering::Relaxed);
         }
         Plan::Direct(assets) => {
             let many = assets.len() > 1;
@@ -299,6 +329,14 @@ async fn one(
                 // A gallery is many files behind one link, so each gets its
                 // own row and does not share the pasted link's.
                 let key = if many { format!("{link}#{index}") } else { link.to_string() };
+                // The pasted link's own row never says a gallery is done,
+                // only the rows of the files behind it can, so a resumed
+                // queue asks the gallery again and has to recognise what it
+                // already has. Fetching a file that landed does not replace
+                // it: it lands beside it as "name (2)".
+                if fetched.contains(&key) {
+                    continue;
+                }
                 transfer(client, &key, asset, opts, cancel, emit, tally).await;
             }
         }
@@ -540,11 +578,15 @@ fn row(emit: &Emitter, line: Line<'_>) {
     );
 }
 
+/// Draws the failed row and counts the failure. Counting the item as finished
+/// is the caller's job, not this function's: `transfer` and `handled` count
+/// every item on their way out however it ended, and when this also counted
+/// one a failure was counted twice, so a queue of three links where two
+/// failed drew "5 / 3" under the progress bar.
 fn fail(emit: &Emitter, key: &str, label: &str, why: &str, tally: &Arc<Tally>) {
     emit.err(format!("{label}: {why}"));
     emit.upsert(Status::Down, key, cells![label, "—", "—", "failed", "0"]);
     tally.failed.fetch_add(1, Ordering::Relaxed);
-    tally.finished.fetch_add(1, Ordering::Relaxed);
 }
 
 fn partial(progress: &Arc<Progress>) -> f32 {
@@ -642,6 +684,80 @@ mod tests {
     fn the_host_column_reads_like_a_site_name() {
         assert_eq!(host_of("https://www.mediafire.com/file/abc"), "mediafire.com");
         assert_eq!(host_of("not a url"), "—");
+    }
+
+    /// One line of the table as the interface hands it back to a resumed run:
+    /// the key the tool drew the row under, and what it last said about it.
+    fn table_row(target: &str, status: Status) -> Row {
+        Row { status, target: target.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_transfer_that_was_stopped_part_way_is_fetched_again_when_the_queue_resumes() {
+        let links = vec![
+            "https://example.com/whole.zip".to_string(),
+            "https://example.com/half.zip".to_string(),
+            "https://example.com/gone.zip".to_string(),
+            "https://example.com/waiting.zip".to_string(),
+        ];
+        // Stopping the queue leaves a row behind for the transfer that was in
+        // flight and for the one that failed. Neither has a file to show for
+        // it, so neither is fetched.
+        let prior = vec![
+            table_row("https://example.com/whole.zip", Status::Up),
+            table_row("https://example.com/half.zip", Status::Warn),
+            table_row("https://example.com/gone.zip", Status::Down),
+        ];
+
+        assert_eq!(
+            wanted(&links, &landed(&prior)),
+            vec![
+                "https://example.com/half.zip".to_string(),
+                "https://example.com/gone.zip".to_string(),
+                "https://example.com/waiting.zip".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_gallery_link_is_not_finished_until_the_files_behind_it_are() {
+        // Nothing rewrites the pasted link's row for a gallery, since each
+        // file behind it has one of its own. Taken for done, the gallery was
+        // skipped on resume with most of it still missing.
+        let link = "https://gallery.example/set".to_string();
+        let prior = vec![
+            table_row(&link, Status::Info),
+            table_row("https://gallery.example/set#0", Status::Up),
+        ];
+        let fetched = landed(&prior);
+
+        let pending = wanted(std::slice::from_ref(&link), &fetched);
+        assert_eq!(pending, vec![link]);
+        assert!(fetched.contains("https://gallery.example/set#0"), "this one landed");
+        assert!(!fetched.contains("https://gallery.example/set#1"), "this one did not");
+    }
+
+    #[test]
+    fn a_queue_never_reports_more_items_finished_than_it_queued() {
+        let emit = Emitter::new(|_: Event| {});
+        let tally = Arc::new(Tally::default());
+        let queued = 3;
+        tally.total.store(queued, Ordering::Relaxed);
+
+        // Three links, one of which lands. Each counts itself finished as its
+        // transfer returns, whichever way it went; the failures were counted
+        // once by the transfer and again by the failed row, and the progress
+        // bar read "5 / 3".
+        tally.ok.fetch_add(1, Ordering::Relaxed);
+        tally.finished.fetch_add(1, Ordering::Relaxed);
+        for link in ["https://example.com/b.zip", "https://example.com/c.zip"] {
+            fail(&emit, link, link, "connection reset", &tally);
+            tally.finished.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let finished = tally.finished.load(Ordering::Relaxed);
+        assert_eq!(tally.failed.load(Ordering::Relaxed), 2);
+        assert_eq!(finished, queued, "the progress bar reads {finished} / {queued}");
     }
 
     /// A real transfer, end to end: resolve a link, split it, write it, and

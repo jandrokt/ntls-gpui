@@ -65,8 +65,13 @@ impl Prefix {
         if self.bits >= 31 {
             return None;
         }
-        let host = 32 - self.bits;
-        Some(Ipv4Addr::from(u32::from(net) | ((1u32 << host) - 1)))
+        // A /0 gets this far whenever the OS declines to report an
+        // interface's netmask: `if-addrs` hands back 0.0.0.0 for the mask and
+        // the bit count comes out zero. Raising a one by 32 places to build
+        // the host part was then a shift off the end of a u32, which panics
+        // while the interfaces screen is drawing in a debug build and quietly
+        // calls the broadcast 0.0.0.0 in a release one.
+        Some(Ipv4Addr::from(u32::from(net) | (u32::MAX >> self.bits)))
     }
 
     /// Every host address in the prefix.
@@ -367,6 +372,21 @@ mod tests {
             Some(v4("192.168.7.255"))
         );
         assert_eq!(parse_prefix("10.0.0.0/31").unwrap().broadcast(), None);
+    }
+
+    #[test]
+    fn a_prefix_with_no_mask_bits_broadcasts_to_all_ones() {
+        // An interface whose netmask the OS withholds arrives as a /0, and
+        // asking that prefix for its broadcast address used to shift a one
+        // past the top of the word rather than answer.
+        assert_eq!(
+            parse_prefix("0.0.0.0/0").unwrap().broadcast().map(IpAddr::V4),
+            Some(v4("255.255.255.255"))
+        );
+        assert_eq!(
+            Prefix::new(v4("10.4.5.6"), 0).broadcast().map(IpAddr::V4),
+            Some(v4("255.255.255.255"))
+        );
     }
 
     #[test]

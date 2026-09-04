@@ -224,13 +224,23 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                             if keep {
                                 // One row per address for the silent ones, so
                                 // a nightly sweep does not grow a row a night
-                                // for everything that is not there.
-                                emit.upsert_as(
-                                    seen.silent_key(&addr.to_string()),
-                                    Status::Down,
-                                    addr.to_string(),
-                                    cells,
-                                );
+                                // for everything that is not there. And none
+                                // at all for an address that already has a row
+                                // about something that answered on it: the
+                                // ageing pass below marks and dates that row,
+                                // and a second row saying only that the
+                                // address timed out doubled every host that
+                                // comes and goes, then sat in the table
+                                // insisting the address was silent for as long
+                                // as it went on answering.
+                                if seen.silence_worth_a_row(&addr.to_string()) {
+                                    emit.upsert_as(
+                                        seen.silent_key(&addr.to_string()),
+                                        Status::Down,
+                                        addr.to_string(),
+                                        cells,
+                                    );
+                                }
                             } else {
                                 emit.row(Status::Down, addr.to_string(), cells);
                             }
@@ -244,7 +254,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                             String::new()
                         };
                         let status = if r.suspect { Status::Warn } else { Status::Up };
-                        let cells = cells![
+                        let mut cells = cells![
                             addr,
                             ms(r.rtt),
                             r.ttl_text(),
@@ -265,6 +275,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                                     hardware(&r.mac)
                                 )),
                             }
+                            seen.carry(&addr.to_string(), &key, &mut cells);
                             emit.upsert_as(key, status, addr.to_string(), cells);
                         } else {
                             emit.row(status, addr.to_string(), cells);
@@ -323,16 +334,24 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Which column carries the hardware address, and which carries the date.
+/// Which column carries what a kept run has to read back out of the rows
+/// earlier runs wrote: the name, the hardware address and its vendor, none of
+/// which a later probe is certain to learn again, and the date.
 ///
-/// Both are read back out of rows written by earlier runs, including runs of
+/// They are read back out of rows written by earlier runs, including runs of
 /// earlier versions whose rows are one column short, so the positions are
 /// named, not counted out at each use.
+const NAME_COL: usize = 3;
 const MAC_COL: usize = 4;
+const VENDOR_COL: usize = 5;
 const SEEN_COL: usize = 6;
 
 /// What the date column says about a row this scan has just confirmed.
 const SEEN_NOW: &str = "this scan";
+
+/// What it says about a row there is nothing to date: one written by a
+/// version of ntls that had no such column.
+const UNDATED: &str = "earlier";
 
 /// The rows a kept run should put a scan into the past: the ones it asked
 /// about and did not hear from.
@@ -360,29 +379,54 @@ fn stale<'a>(
 /// what lets a table survive being closed and reopened and still know how old
 /// each line in it is.
 fn age(cells: &mut Vec<String>) {
+    // Read before the row is padded out. A row too short to have a date
+    // column at all and a row whose date column is empty are two different
+    // things, and padding first made them the same one.
+    let dated = older(cells.get(SEEN_COL).map(String::as_str));
     if cells.len() <= SEEN_COL {
         cells.resize(SEEN_COL + 1, String::new());
     }
-    cells[SEEN_COL] = older(&cells[SEEN_COL]);
+    cells[SEEN_COL] = dated;
 }
 
-fn older(current: &str) -> String {
+fn older(current: Option<&str>) -> String {
+    // A row with no date column comes from a version that had none, and
+    // nothing in it says when it was written.
+    let Some(current) = current else { return UNDATED.into() };
     let current = current.trim();
-    let scans = if current == SEEN_NOW {
+    let scans = if current.is_empty() {
+        // A scan that keeps nothing dates nothing: it is all one moment, so
+        // every row of it would say the same thing. The blank still means the
+        // scan just before this one, and reading it as "no idea" is what the
+        // first kept run did to every host that had gone quiet: it wrote
+        // "earlier" over the lot of them, where it then stayed for good. That
+        // run is the one a user makes first, its table having come from a scan
+        // that was not keeping anything.
         0
-    } else if let Some(n) = current.strip_suffix(" scans ago").and_then(|n| n.parse::<u32>().ok()) {
+    } else if let Some(n) = scans_ago(current) {
         n
-    } else if current == "1 scan ago" {
-        1
     } else {
-        // A row from before any of this existed cannot be dated, and guessing
-        // a number for it would be inventing one.
-        return "earlier".into();
+        // Anything else no version of this wrote, and guessing a number for it
+        // would be inventing one.
+        return UNDATED.into();
     };
     match scans + 1 {
         1 => "1 scan ago".into(),
         n => format!("{n} scans ago"),
     }
+}
+
+/// How many scans ago a date column says its row was last seen, where it says
+/// anything countable at all.
+fn scans_ago(seen: &str) -> Option<u32> {
+    let seen = seen.trim();
+    if seen == SEEN_NOW {
+        return Some(0);
+    }
+    if seen == "1 scan ago" {
+        return Some(1);
+    }
+    seen.strip_suffix(" scans ago").and_then(|n| n.parse::<u32>().ok())
 }
 
 /// What was in the table when this run started, for a run that is adding to
@@ -405,6 +449,9 @@ struct Device {
     /// than adding a second one beside it, including for the rows of runs
     /// made before this switch existed, which name themselves by their target.
     row: String,
+    /// The cells of that row, so what an earlier run learned about the device
+    /// can be written again by a run whose lookups came back with nothing.
+    cells: Vec<String>,
 }
 
 /// What an address was, the last time anything answered on it.
@@ -434,7 +481,11 @@ impl Seen {
             let mac = identity(row.cells.get(MAC_COL).map(String::as_str).unwrap_or_default());
             let entry = devices.entry(row.target.clone()).or_default();
             if !entry.iter().any(|d| d.mac == mac) {
-                entry.push(Device { mac, row: row.identity().to_string() });
+                entry.push(Device {
+                    mac,
+                    row: row.identity().to_string(),
+                    cells: row.cells.clone(),
+                });
             }
         }
         Seen { devices, silent }
@@ -453,9 +504,17 @@ impl Seen {
                 return same.row.clone();
             }
             // Where either side has no hardware address there is nothing to
-            // tell the two apart with, so they are treated as one device.
+            // tell the two apart with, so they are treated as one device: the
+            // one the table saw last. Taking the first row instead took the
+            // oldest, so a sweep that learned no MAC over an address that had
+            // changed hands wrote the answer into the row of the device that
+            // had been displaced, said that device was found by this scan, and
+            // left the one actually living there to be dated a scan further
+            // into the past.
             if now.is_empty() || before.iter().all(|d| d.mac.is_empty()) {
-                return before[0].row.clone();
+                if let Some(latest) = last_seen(before) {
+                    return latest.row.clone();
+                }
             }
         } else if let Some(row) = self.silent.get(addr) {
             return row.clone();
@@ -463,9 +522,58 @@ impl Seen {
         format!("up:{addr}|{now}")
     }
 
+    /// Writes back into a fresh answer whatever the row it is about already
+    /// said and this probe did not find out.
+    ///
+    /// A host answering says only that it is there. Its name comes from a
+    /// reverse lookup that times out, is switched off, or was never asked
+    /// for; its hardware from an ARP request that goes unanswered, is
+    /// switched off, or cannot reach an address off this link. So a second
+    /// scan of the same network routinely answers with those three columns
+    /// empty, and the row it rewrote lost the name, the MAC and the vendor
+    /// the run before had established. The MAC was the worse loss: it is the
+    /// only record of what answered on that address, and with it blanked
+    /// nothing could ever again notice the address changing hands.
+    ///
+    /// Only the row of this same device lends anything, which is what keeps
+    /// a device that has just taken an address over from inheriting the name
+    /// of the one it displaced.
+    fn carry(&self, addr: &str, key: &str, cells: &mut Vec<String>) {
+        let Some(before) = self.devices.get(addr).and_then(|ds| ds.iter().find(|d| d.row == key))
+        else {
+            return;
+        };
+        for col in [NAME_COL, MAC_COL, VENDOR_COL] {
+            if cells.get(col).is_some_and(|c| !c.trim().is_empty()) {
+                continue;
+            }
+            let Some(learned) = before.cells.get(col).filter(|c| !c.trim().is_empty()) else {
+                continue;
+            };
+            if cells.len() <= col {
+                cells.resize(col + 1, String::new());
+            }
+            cells[col] = learned.clone();
+        }
+    }
+
     /// What the row saying this address did not answer should call itself.
     fn silent_key(&self, addr: &str) -> String {
         self.silent.get(addr).cloned().unwrap_or_else(|| format!("down:{addr}"))
+    }
+
+    /// Whether a row about this address staying silent is worth having in a
+    /// kept table.
+    ///
+    /// An address nothing has ever answered on needs one, or there is no line
+    /// for it at all. An address that already has a row about a device does
+    /// not: that row is the one the ageing pass marks and dates, and a row
+    /// beside it saying only that the address timed out is the same news with
+    /// the device's name, hardware and history left out. A row of that kind
+    /// already in the table is still worth rewriting, since one left saying
+    /// what an earlier run found is worse than one kept current.
+    fn silence_worth_a_row(&self, addr: &str) -> bool {
+        self.silent.contains_key(addr) || !self.devices.contains_key(addr)
     }
 
     fn is_empty(&self) -> bool {
@@ -504,6 +612,19 @@ impl Seen {
                 .join(", "),
         )
     }
+}
+
+/// Which of the devices recorded on one address the table saw most recently.
+///
+/// When an answer arrives with no hardware address in it, the dates the rows
+/// carry are the only evidence there is about which of them it came from, and
+/// the likeliest is the one that was there last. A row nothing ever dated is
+/// taken as the older of the two: the dated one was dated by a run that was
+/// keeping results, which is later than whatever left the other blank.
+fn last_seen(devices: &[Device]) -> Option<&Device> {
+    devices
+        .iter()
+        .min_by_key(|d| d.cells.get(SEEN_COL).and_then(|s| scans_ago(s)).unwrap_or(u32::MAX))
 }
 
 /// What makes two answers from one address the same device: its hardware
@@ -643,6 +764,20 @@ mod tests {
     }
 
     #[test]
+    fn a_row_left_undated_by_a_scan_that_kept_nothing_is_dated_from_that_scan() {
+        // Seven cells with the date blank, which is every row on screen when
+        // the switch is turned on: a scan that keeps nothing dates nothing,
+        // because it is all one moment. The blank still means the scan just
+        // before this one, and treating it as undatable marked every host that
+        // had gone quiet by the first kept run "earlier" and kept it there.
+        let mut cells = crate::cells!["10.0.0.1", "1 ms", "64", "host", "aa:bb", "Acme", ""];
+        age(&mut cells);
+        assert_eq!(cells[SEEN_COL], "1 scan ago");
+        age(&mut cells);
+        assert_eq!(cells[SEEN_COL], "2 scans ago");
+    }
+
+    #[test]
     fn a_row_written_before_there_was_a_date_column_gets_one() {
         // Six cells, from a version of ntls that had six columns. Ageing it
         // must not put the date in the vendor column, and must not claim a
@@ -655,5 +790,127 @@ mod tests {
         // And stays there, since there is nothing to count from.
         age(&mut cells);
         assert_eq!(cells[SEEN_COL], "earlier");
+    }
+
+    /// The row a host already has is the only place what was learned about it
+    /// is written down, so a scan that answers with less than the one before
+    /// must not overwrite it with the difference.
+    #[test]
+    fn a_probe_that_learned_no_hardware_or_name_keeps_the_ones_an_earlier_run_did() {
+        let mut before = row("10.0.0.1", "aa:bb:cc:dd:ee:ff", Status::Up, None);
+        before.cells[NAME_COL] = "printer.lan".into();
+        before.cells[VENDOR_COL] = "Acme".into();
+        let seen = Seen::of(&[before]);
+
+        // A second scan over ICMP with the hardware lookup off and the
+        // reverse lookup timed out: it knows the host is up and nothing else.
+        let key = seen.key_for("10.0.0.1", "");
+        let mut cells = crate::cells!["10.0.0.1", "1 ms", "64", "", "", "", SEEN_NOW];
+        seen.carry("10.0.0.1", &key, &mut cells);
+        assert_eq!(cells[NAME_COL], "printer.lan");
+        assert_eq!(cells[MAC_COL], "aa:bb:cc:dd:ee:ff");
+        assert_eq!(cells[VENDOR_COL], "Acme");
+        // And still says this scan is the one that found it.
+        assert_eq!(cells[SEEN_COL], SEEN_NOW);
+    }
+
+    #[test]
+    fn the_hardware_a_scan_failed_to_learn_again_is_still_there_to_compare_against() {
+        // The MAC in the row is the whole of the change-detection baseline.
+        // Blanking it did not merely empty a column: every later scan of that
+        // address then had nothing to tell a swapped device from the one that
+        // had been there, and said Same forever.
+        let seen = Seen::of(&[row("10.0.0.1", "aa:bb:cc:dd:ee:ff", Status::Up, None)]);
+        let key = seen.key_for("10.0.0.1", "");
+        let mut cells = crate::cells!["10.0.0.1", "1 ms", "64", "", "", "", SEEN_NOW];
+        seen.carry("10.0.0.1", &key, &mut cells);
+
+        let after = Seen::of(&[Row {
+            cells,
+            status: Status::Up,
+            target: "10.0.0.1".into(),
+            note: None,
+            key: Some(key),
+        }]);
+        assert!(matches!(after.compare("10.0.0.1", "11:22:33:44:55:66"), Was::Different(_)));
+    }
+
+    #[test]
+    fn the_device_that_has_taken_an_address_over_inherits_nothing_from_the_one_before_it() {
+        let mut before = row("10.0.0.1", "aa:bb:cc:dd:ee:ff", Status::Up, None);
+        before.cells[NAME_COL] = "printer.lan".into();
+        before.cells[VENDOR_COL] = "Acme".into();
+        let seen = Seen::of(&[before]);
+
+        let key = seen.key_for("10.0.0.1", "11:22:33:44:55:66");
+        let mut cells =
+            crate::cells!["10.0.0.1", "1 ms", "64", "", "11:22:33:44:55:66", "", SEEN_NOW];
+        seen.carry("10.0.0.1", &key, &mut cells);
+        assert_eq!(cells[NAME_COL], "", "the name belonged to the device that was there");
+        assert_eq!(cells[MAC_COL], "11:22:33:44:55:66");
+        assert_eq!(cells[VENDOR_COL], "");
+    }
+
+    #[test]
+    fn an_answer_that_names_no_device_goes_to_the_one_the_table_saw_last() {
+        // An address that has changed hands has a row per device. A later
+        // sweep with the hardware lookup off, or blind, or over ICMP to an
+        // address off this link, learns no MAC and cannot say which of them
+        // answered. Going to the first row went to the device that had been
+        // displaced: the table then said the old device was back, dated the
+        // one actually living there a scan further into the past, and handed
+        // the answer the displaced device's hardware to be compared against
+        // next time.
+        let mut displaced = row("10.0.0.1", "aa:bb:cc:dd:ee:ff", Status::Up, None);
+        displaced.cells[SEEN_COL] = "3 scans ago".into();
+        let current = row(
+            "10.0.0.1",
+            "11:22:33:44:55:66",
+            Status::Up,
+            Some("up:10.0.0.1|11:22:33:44:55:66"),
+        );
+        let seen = Seen::of(&[displaced, current]);
+
+        let key = seen.key_for("10.0.0.1", "");
+        assert_eq!(key, "up:10.0.0.1|11:22:33:44:55:66");
+        let mut cells = crate::cells!["10.0.0.1", "1 ms", "64", "", "", "", SEEN_NOW];
+        seen.carry("10.0.0.1", &key, &mut cells);
+        assert_eq!(cells[MAC_COL], "11:22:33:44:55:66");
+    }
+
+    #[test]
+    fn a_host_that_has_gone_quiet_is_marked_in_the_row_it_has_and_not_given_a_second_one() {
+        // The row about the device is what the ageing pass marks and dates. A
+        // row beside it saying only that the address timed out doubled every
+        // host that comes and goes, and stayed in the table calling the
+        // address silent for as long as it went on answering.
+        let seen = Seen::of(&[row("10.0.0.1", "aa:bb:cc:dd:ee:ff", Status::Up, None)]);
+        assert!(!seen.silence_worth_a_row("10.0.0.1"));
+        // An address nothing has ever answered on has no other row to be
+        // marked in, so it still gets one.
+        assert!(seen.silence_worth_a_row("10.0.0.2"));
+        // And one already in the table is kept current rather than left
+        // saying what an earlier run found.
+        let both = Seen::of(&[
+            row("10.0.0.1", "aa:bb:cc:dd:ee:ff", Status::Up, None),
+            row("10.0.0.1", "", Status::Down, Some("down:10.0.0.1")),
+        ]);
+        assert!(both.silence_worth_a_row("10.0.0.1"));
+    }
+
+    #[test]
+    fn a_row_recording_silence_lends_nothing_to_the_answer_that_replaces_it() {
+        // Why a host did not answer is written in the vendor column of its
+        // row, so a host that has just answered must take nothing out of the
+        // row it is replacing, or it would be labelled "timeout".
+        let mut silent = row("10.0.0.9", "", Status::Down, None);
+        silent.cells[VENDOR_COL] = "timeout".into();
+        let seen = Seen::of(&[silent]);
+
+        let key = seen.key_for("10.0.0.9", "aa:bb:cc:dd:ee:ff");
+        let mut cells =
+            crate::cells!["10.0.0.9", "1 ms", "64", "", "aa:bb:cc:dd:ee:ff", "", SEEN_NOW];
+        seen.carry("10.0.0.9", &key, &mut cells);
+        assert_eq!(cells[VENDOR_COL], "");
     }
 }

@@ -642,27 +642,40 @@ impl App {
                                         .job(id)
                                         .map(|j| (j.tag, j.favorite, j.state.is_running(), j.open))
                                         .unwrap_or_default();
-                                    crate::ui::menu::for_job(
+                                    crate::ui::menu::for_job(crate::ui::menu::JobMenu {
                                         id,
                                         tag,
                                         running,
                                         favourite,
                                         open,
-                                        !app.comparable(id).is_empty(),
-                                        app.workspace()
+                                        comparable: !app.comparable(id).is_empty(),
+                                        comparing: app
+                                            .workspace()
                                             .job(id)
                                             .is_some_and(|j| j.compare_with.is_some()),
-                                    )
+                                        can_move: app.can_move(Item::Tool(id)),
+                                    })
                                 }
                                 Some(Item::Doc(id)) => {
                                     let (tag, favourite) = app.mark_of(Item::Doc(id));
-                                    crate::ui::menu::for_doc(id, tag, favourite)
+                                    crate::ui::menu::for_doc(
+                                        id,
+                                        tag,
+                                        favourite,
+                                        app.can_move(Item::Doc(id)),
+                                    )
                                 }
                                 Some(Item::Flow(id)) => {
                                     let (tag, favourite) = app.mark_of(Item::Flow(id));
                                     let running =
                                         app.workspace().flow(id).is_some_and(|f| f.running());
-                                    crate::ui::menu::for_flow(id, running, tag, favourite)
+                                    crate::ui::menu::for_flow(
+                                        id,
+                                        running,
+                                        tag,
+                                        favourite,
+                                        app.can_move(Item::Flow(id)),
+                                    )
                                 }
                                 None => vec![crate::ui::menu::Item::choice(
                                     "Reveal in file manager",
@@ -1720,7 +1733,7 @@ fn tree_row(
     let digest = job.digest();
     let samples: Option<Vec<f64>> = job.spark(36).map(<[f64]>::to_vec);
     let has_secondary = !digest.is_empty() || samples.is_some();
-    let theme_drag = theme.clone();
+    let theme_drag = *theme;
     let job_name = job.name().to_string();
     let tool_icon = job.tool.icon();
     let (tint, edge) = (theme.accent_soft, theme.accent);
@@ -1743,7 +1756,7 @@ fn tree_row(
             cx.new(|_| DragPreview {
                 icon: tool_icon,
                 name: job_name.clone(),
-                theme: theme_drag.clone(),
+                theme: theme_drag,
             })
         })
         .drag_over::<DragItem>(move |style, _, _, _| takes_a_drop(style, tint, edge))
@@ -1757,15 +1770,19 @@ fn tree_row(
                 app.select_job(id, cx);
                 app.open_menu(
                     e.position,
-                    crate::ui::menu::for_job(
+                    crate::ui::menu::for_job(crate::ui::menu::JobMenu {
                         id,
-                        tag_value,
+                        tag: tag_value,
                         running,
                         favourite,
                         open,
-                        !app.comparable(id).is_empty(),
-                        app.workspace().job(id).is_some_and(|j| j.compare_with.is_some()),
-                    ),
+                        comparable: !app.comparable(id).is_empty(),
+                        comparing: app
+                            .workspace()
+                            .job(id)
+                            .is_some_and(|j| j.compare_with.is_some()),
+                        can_move: app.can_move(Item::Tool(id)),
+                    }),
                     cx,
                 );
                 cx.stop_propagation();
@@ -1877,7 +1894,7 @@ fn doc_row(
 ) -> AnyElement {
     let has_summary = !summary.is_empty();
     let (tint, edge) = (theme.accent_soft, theme.accent);
-    let (theme_drag, doc_name) = (theme.clone(), title.to_string());
+    let (theme_drag, doc_name) = (*theme, title.to_string());
 
     div()
         .id(SharedString::from(format!("doc-{id}")))
@@ -1897,7 +1914,7 @@ fn doc_row(
             cx.new(|_| DragPreview {
                 icon: "note",
                 name: doc_name.clone(),
-                theme: theme_drag.clone(),
+                theme: theme_drag,
             })
         })
         .drag_over::<DragItem>(move |style, _, _, _| takes_a_drop(style, tint, edge))
@@ -1909,7 +1926,7 @@ fn doc_row(
             MouseButton::Right,
             cx.listener(move |app, e: &gpui::MouseDownEvent, _, cx| {
                 let (tag, favourite) = app.mark_of(Item::Doc(id));
-                app.open_menu(e.position, crate::ui::menu::for_doc(id, tag, favourite), cx);
+                app.open_menu(e.position, crate::ui::menu::for_doc(id, tag, favourite, app.can_move(Item::Doc(id))), cx);
                 cx.stop_propagation();
             }),
         )
@@ -1983,7 +2000,7 @@ fn flow_row(
     cx: &mut Context<App>,
 ) -> AnyElement {
     let (tint, edge) = (theme.accent_soft, theme.accent);
-    let (theme_drag, flow_name) = (theme.clone(), title.to_string());
+    let (theme_drag, flow_name) = (*theme, title.to_string());
 
     div()
         .id(SharedString::from(format!("flow-{id}")))
@@ -2003,7 +2020,7 @@ fn flow_row(
             cx.new(|_| DragPreview {
                 icon: "play",
                 name: flow_name.clone(),
-                theme: theme_drag.clone(),
+                theme: theme_drag,
             })
         })
         .drag_over::<DragItem>(move |style, _, _, _| takes_a_drop(style, tint, edge))
@@ -2017,7 +2034,13 @@ fn flow_row(
                 let (tag, favourite) = app.mark_of(Item::Flow(id));
                 app.open_menu(
                     e.position,
-                    crate::ui::menu::for_flow(id, running, tag, favourite),
+                    crate::ui::menu::for_flow(
+                        id,
+                        running,
+                        tag,
+                        favourite,
+                        app.can_move(Item::Flow(id)),
+                    ),
                     cx,
                 );
                 cx.stop_propagation();
@@ -2125,7 +2148,7 @@ fn doc_tab(
             cx.listener(move |app, e: &gpui::MouseDownEvent, _, cx| {
                 app.select_doc(id, cx);
                 let (tag, favourite) = app.mark_of(Item::Doc(id));
-                app.open_menu(e.position, crate::ui::menu::for_doc(id, tag, favourite), cx);
+                app.open_menu(e.position, crate::ui::menu::for_doc(id, tag, favourite, app.can_move(Item::Doc(id))), cx);
                 cx.stop_propagation();
             }),
         )
@@ -2214,15 +2237,19 @@ fn tab(job: &Job, active: bool, theme: &Theme, cx: &mut Context<App>) -> AnyElem
                 app.select_job(id, cx);
                 app.open_menu(
                     e.position,
-                    crate::ui::menu::for_job(
-                                id,
-                                tag_value,
-                                running,
-                                favourite,
-                                open,
-                                !app.comparable(id).is_empty(),
-                                app.workspace().job(id).is_some_and(|j| j.compare_with.is_some()),
-                            ),
+                    crate::ui::menu::for_job(crate::ui::menu::JobMenu {
+                        id,
+                        tag: tag_value,
+                        running,
+                        favourite,
+                        open,
+                        comparable: !app.comparable(id).is_empty(),
+                        comparing: app
+                            .workspace()
+                            .job(id)
+                            .is_some_and(|j| j.compare_with.is_some()),
+                        can_move: app.can_move(Item::Tool(id)),
+                    }),
                     cx,
                 );
                 cx.stop_propagation();
