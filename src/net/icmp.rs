@@ -653,6 +653,39 @@ fn is_hop_cmsg(level: libc::c_int, kind: libc::c_int) -> bool {
         || (level == libc::IPPROTO_IPV6 && kind == libc::IPV6_HOPLIMIT)
 }
 
+/// A buffer for ancillary data, aligned the way the kernel's own headers are.
+///
+/// `recvmsg` writes `cmsghdr` structures into this, and the pointers the
+/// `CMSG_*` macros hand back out of it are then read as those structures. A
+/// plain `[u8; N]` is aligned to a single byte, so every one of those reads is
+/// misaligned, which is undefined behaviour rather than merely untidy: a debug
+/// build checks for it and ends the process, and a release build is entitled
+/// to do whatever it likes. It went unnoticed because the check only fires
+/// when the buffer happens to land on an address that is not a multiple of
+/// eight, so it passed far more often than it failed.
+///
+/// Eight covers both shapes: `cmsg_len` is a `size_t` on Linux and a
+/// `socklen_t` on the BSDs, so the header wants eight-byte alignment on one
+/// and four on the other.
+#[cfg(unix)]
+#[repr(align(8))]
+struct Control([u8; 256]);
+
+#[cfg(unix)]
+impl Control {
+    fn new() -> Control {
+        Control([0u8; 256])
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// Reads a hop count out of ancillary data.
 ///
 /// Its width is not the same everywhere either: macOS sends the IPv4 TTL as a
@@ -686,7 +719,7 @@ fn recv_with_ttl(fd: RawFd, buf: &mut [u8]) -> io::Result<Option<(usize, IpAddr,
     unsafe {
         let mut addr: libc::sockaddr_storage = std::mem::zeroed();
         let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
-        let mut control = [0u8; 256];
+        let mut control = Control::new();
         let mut msg: libc::msghdr = std::mem::zeroed();
         msg.msg_name = &mut addr as *mut _ as *mut libc::c_void;
         msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -765,7 +798,7 @@ fn drain_error_queue(inner: &Inner, fd: RawFd) -> bool {
                 iov_base: quoted.as_mut_ptr() as *mut libc::c_void,
                 iov_len: quoted.len(),
             };
-            let mut control = [0u8; 256];
+            let mut control = Control::new();
             let mut msg: libc::msghdr = std::mem::zeroed();
             msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
@@ -1099,7 +1132,7 @@ mod tests {
         unsafe {
             let ee_size = std::mem::size_of::<libc::sock_extended_err>();
             let sin_size = std::mem::size_of::<libc::sockaddr_in>();
-            let mut control = [0u8; 256];
+            let mut control = Control::new();
             let cmsg = control.as_mut_ptr() as *mut libc::cmsghdr;
             let len = libc::CMSG_LEN((ee_size + sin_size) as u32) as usize;
             (*cmsg).cmsg_len = len as _;
@@ -1166,11 +1199,22 @@ mod tests {
         assert!(is_hop_cmsg(libc::IPPROTO_IPV6, libc::IPV6_HOPLIMIT));
         assert!(!is_hop_cmsg(libc::IPPROTO_IP, libc::IP_TOS));
 
+        // The buffer a cmsg is read out of has to be aligned for one, or
+        // every read of it is undefined behaviour. A debug build only catches
+        // that when the buffer happens to land on an odd address, so it is
+        // asserted here rather than left to chance.
+        let mut aligned = Control::new();
+        assert_eq!(
+            aligned.as_mut_ptr().align_offset(std::mem::align_of::<libc::cmsghdr>()),
+            0,
+            "a control buffer must be aligned for the headers written into it"
+        );
+
         // A cmsg built the way the kernel builds one, so the reading is
         // tested against the real layout and not against an assumption.
         fn hop(payload: &[u8]) -> u8 {
             unsafe {
-                let mut buf = [0u8; 64];
+                let mut buf = Control::new();
                 let cmsg = buf.as_mut_ptr() as *mut libc::cmsghdr;
                 let len = libc::CMSG_LEN(payload.len() as u32) as usize;
                 (*cmsg).cmsg_len = len as _;
