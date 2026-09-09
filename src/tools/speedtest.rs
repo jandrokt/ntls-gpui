@@ -75,7 +75,7 @@ impl Tool for SpeedTest {
             ),
             Field::text("duration", "Duration", "How long to run each direction; longer is steadier")
                 .default("8s")
-                .validate(Validator::Duration),
+                .validate(Validator::Duration).advanced(),
             Field::text(
                 "streams",
                 "Streams",

@@ -68,7 +68,7 @@ impl Tool for PortScan {
                 "How long to wait per port; raise it for hosts across the internet",
             )
             .default("700ms")
-            .validate(Validator::Duration),
+            .validate(Validator::Duration).advanced(),
             iface_field(),
             Field::text(
                 "concurrency",
@@ -76,7 +76,7 @@ impl Tool for PortScan {
                 "Ports probed at the same time. The main speed knob; lower it if your network drops probes",
             )
             .default("1024")
-            .validate(Validator::IntRange(1, 8192)),
+            .validate(Validator::IntRange(1, 8192)).advanced(),
             Field::boolean(
                 "banner",
                 "Grab banners",

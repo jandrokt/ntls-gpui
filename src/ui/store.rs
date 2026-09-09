@@ -90,6 +90,11 @@ pub struct JobRecord {
     pub log: Vec<SavedLog>,
     #[serde(default)]
     pub charts: Vec<SavedSeries>,
+    /// The last whole answer the tool received, for the tools that get one.
+    /// Kept so that reopening a workspace tomorrow still has the response in
+    /// it, and so a document about it still renders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<crate::core::Answer>,
 }
 
 /// What a run had come to when it was last written.
@@ -889,6 +894,7 @@ mod tests {
             rows: vec![Row { cells: vec!["1".into()], status: Status::Up, target: "1.1.1.1".into(), note: None, key: None }],
             log: vec![SavedLog { level: Level::Good, text: "done".into(), at: Duration::ZERO }],
             charts: vec![SavedSeries { name: "rtt".into(), unit: " ms".into(), values: vec![1.0] }],
+            answer: None,
         };
         let json = serde_json::to_vec(&record).unwrap();
         let back: JobRecord = serde_json::from_slice(&json).unwrap();

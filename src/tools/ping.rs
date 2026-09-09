@@ -41,11 +41,11 @@ impl Tool for Ping {
                 .validate(Validator::Duration),
             Field::text("timeout", "Timeout", "Time to wait for each reply")
                 .default("2s")
-                .validate(Validator::Duration),
+                .validate(Validator::Duration).advanced(),
             Field::text("size", "Payload", "Payload bytes per echo request")
                 .default("56")
                 .validate(Validator::IntRange(0, 65000))
-                .visible_if(VisibleIf::Equals("method", METHOD_ICMP)),
+                .visible_if(VisibleIf::Equals("method", METHOD_ICMP)).advanced(),
         ]
     }
 

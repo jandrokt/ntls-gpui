@@ -11,4 +11,4 @@ pub mod parse;
 pub mod value;
 
 pub use eval::{Source, run};
-pub use value::Table;
+pub use value::{Table, Value};

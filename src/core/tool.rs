@@ -175,6 +175,20 @@ pub trait Tool: Send + Sync + 'static {
     /// respect `cancel` and return promptly once cancelled.
     fn run<'a>(&'a self, run: Run, emit: Emitter) -> BoxFuture<'a, anyhow::Result<()>>;
 
+    /// A whole request pasted into the target field, spread across the form.
+    ///
+    /// Some tools have a text form the rest of the world already writes them
+    /// in. An HTTP request is nearly always handed round as a `curl` line,
+    /// and retyping one field at a time out of it is the tedium the form was
+    /// supposed to remove. A tool that recognises what was pasted says which
+    /// of its fields it fills; anything not named is left alone.
+    ///
+    /// Returns `None` when the text is nothing it knows, which is the common
+    /// case and must stay cheap: this is asked on every edit of the field.
+    fn absorb(&self, _pasted: &str) -> Option<Vec<(&'static str, String)>> {
+        None
+    }
+
     /// The key of the field carrying the target, if there is one.
     fn target_key(&self) -> Option<&'static str> {
         self.fields().into_iter().find(|f| f.role == Role::Target).map(|f| f.key)

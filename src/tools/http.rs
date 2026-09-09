@@ -55,19 +55,68 @@ impl Tool for Http {
         "globe"
     }
 
+    /// A `curl` line pasted into the URL box becomes the whole request.
+    ///
+    /// Which is how an HTTP request is handed round: in an issue, in a
+    /// service's own documentation, off a browser's "copy as cURL". Reading
+    /// it here saves retyping five fields out of one line.
+    fn absorb(&self, pasted: &str) -> Option<Vec<(&'static str, String)>> {
+        let asked = crate::tools::curl::parse(pasted)?;
+        let mut out = vec![("target", asked.url)];
+        if let Some(method) = asked.method {
+            // Only the methods the form offers; anything else is left as it
+            // was rather than putting a word in the box that is not a choice.
+            if METHODS.contains(&method.as_str()) {
+                out.push(("method", method));
+            }
+        }
+        if !asked.headers.is_empty() {
+            out.push(("headers", asked.headers.join("\n")));
+        }
+        if let Some(body) = asked.body {
+            out.push(("body", body));
+        }
+        if let Some(kind) = asked.body_kind {
+            out.push(("bodytype", kind.to_string()));
+        }
+        if let Some((kind, value)) = asked.auth {
+            out.push(("authkind", kind.to_string()));
+            out.push(("auth", value));
+        }
+        // Only when it says so: a switch curl was not given should not turn
+        // one off that the form already has on.
+        if asked.insecure {
+            out.push(("insecure", "true".into()));
+        }
+        if asked.follow {
+            out.push(("follow", "true".into()));
+        }
+        if asked.http1 {
+            out.push(("http1", "true".into()));
+        }
+        Some(out)
+    }
+
     fn fields(&self) -> Vec<Field> {
         vec![
-            Field::text("target", "URL", "What to ask, in full")
+            Field::text(
+                "target",
+                "URL",
+                "What to ask, in full. Paste a curl line here and the rest of the form fills itself",
+            )
                 .placeholder("https://example.com/health")
                 .role(Role::Target)
                 .validate(Validator::Required),
+            // Seven choices, so a row of its own: in the grid's column each
+            // one gets thirty pixels and reads as a stub.
             Field::select(
                 "method",
                 "Method",
                 "Which request to send",
                 "GET",
                 METHODS.iter().map(|m| Opt::new(m, m, method_desc(m))).collect(),
-            ),
+            )
+            .wide(),
             Field::text(
                 "query",
                 "Query",
@@ -100,15 +149,28 @@ impl Tool for Http {
                 "What the body is, and the content type it is sent with",
                 "text",
                 vec![
-                    Opt::new("text", "text", "sent as it is written"),
+                    Opt::new("text", "text", "sent as written, with no content type added"),
                     Opt::new("json", "JSON", "application/json"),
+                    Opt::new("xml", "XML", "application/xml"),
                     Opt::new("form", "form", "application/x-www-form-urlencoded"),
                 ],
             )
-            .visible_if(VisibleIf::NotEquals("method", "GET")),
-            Field::text("body", "Body", "Sent as the request body")
+            .visible_if(VisibleIf::NoneOf("method", &["GET", "HEAD"])),
+            // A payload is several lines of JSON or XML far more often than
+            // it is one line of anything, so it gets an editor and not a box:
+            // room to type in, line breaks that stay, and colouring that
+            // follows whatever the body type above it is set to.
+            Field::code("body", "Body", "Sent as the request body", "bodytype")
                 .placeholder("{\"ok\": true}")
-                .visible_if(VisibleIf::NotEquals("method", "GET")),
+                .visible_if(VisibleIf::NoneOf("method", &["GET", "HEAD"])),
+            Field::text(
+                "attach",
+                "Attachments",
+                "Files to send with it, one per line: a path, or name=path to choose what the part is called. Sending any makes the request multipart/form-data",
+            )
+            .placeholder("/tmp/report.pdf")
+            .wide()
+            .visible_if(VisibleIf::NoneOf("method", &["GET", "HEAD"])),
             Field::text(
                 "expect",
                 "Expect",
@@ -131,34 +193,34 @@ impl Tool for Http {
                 .visible_if(VisibleIf::NotEquals("count", "1")),
             Field::text("timeout", "Timeout", "How long to wait for an answer")
                 .default("10s")
-                .validate(Validator::Duration),
+                .validate(Validator::Duration).advanced(),
             Field::text("proxy", "Proxy", "Ask through this instead; empty uses the system's")
-                .placeholder("http://proxy.example.com:8080"),
+                .placeholder("http://proxy.example.com:8080").advanced(),
             Field::boolean("follow", "Follow redirects", "Ask again wherever it points", true),
             Field::boolean(
                 "insecure",
                 "Accept any certificate",
                 "Do not check the certificate, for an appliance with a self-signed one",
                 false,
-            ),
+            ).advanced(),
             Field::boolean(
                 "http1",
                 "HTTP/1.1 only",
                 "Do not offer HTTP/2, for a server that answers one badly",
                 false,
-            ),
+            ).advanced(),
             Field::boolean(
                 "showheaders",
                 "Log the headers",
                 "Write the response headers into the output panel",
                 true,
-            ),
+            ).advanced(),
             Field::boolean(
                 "showbody",
                 "Log the body",
                 "Write the start of the response body into the output panel",
                 false,
-            ),
+            ).advanced(),
         ]
     }
 
@@ -409,6 +471,9 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
     let follow = p.bool("follow");
     let want = p.str("expect");
     let capturing = p.str("capture");
+    // Read once, and re-read from disk on every request: a file that changes
+    // between two of them is meant to.
+    let attachments = parse_attachments(&p.str("attach"));
     let (headers, unreadable) = parse_headers(&p.str("headers"));
     for bad in &unreadable {
         emit.warn(format!("{bad:?} is not a header: they read Name: value"));
@@ -459,9 +524,22 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
 
         let mut request = client.request(verb.clone(), &url);
         let body = p.str("body");
-        let sends_body =
-            !body.is_empty() && verb != reqwest::Method::GET && verb != reqwest::Method::HEAD;
-        if sends_body {
+        let carries = verb != reqwest::Method::GET && verb != reqwest::Method::HEAD;
+
+        if carries && !attachments.is_empty() {
+            // Files make it a form upload, and the form sets its own content
+            // type with the boundary in it, so nothing else may.
+            match multipart_form(&body, &p.str("bodytype"), &attachments) {
+                Ok(form) => request = request.multipart(form),
+                Err(e) => {
+                    emit.err(format!("{method} {url}: {e}"));
+                    // The files are the request. Sending it without them
+                    // would be asking a different question, and doing so
+                    // sixty times over would be worse.
+                    break;
+                }
+            }
+        } else if carries && !body.is_empty() {
             if let Some(kind) = body_type(&p.str("bodytype"))
                 && !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
             {
@@ -503,6 +581,10 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                 emit.err(format!("{method} {url}: {}", why(&e)));
             }
             Ok(mut response) => {
+                // `send` comes back when the headers do, so this is
+                // everything up to the first byte: name resolution, the
+                // connection, the handshake and the far end's own thinking.
+                let waited = began.elapsed();
                 let code = response.status();
                 let landed = response.url().to_string();
                 let kind = header(&response, reqwest::header::CONTENT_TYPE);
@@ -592,6 +674,32 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                 if show_body {
                     preview(&body, &emit);
                 }
+
+                // The whole answer is kept, separately from the row, so that
+                // it can be read in the response pane and so that a document
+                // or a workflow can reach any part of it rather than only the
+                // one value this run was told to capture.
+                emit.emit(Event::Answered(crate::core::Answer {
+                    status: code.as_u16(),
+                    reason: code.canonical_reason().unwrap_or_default().to_string(),
+                    content_type: short(&kind),
+                    headers: headers_back
+                        .iter()
+                        .map(|(name, value)| {
+                            (name.to_string(), value.to_str().unwrap_or_default().to_string())
+                        })
+                        .collect(),
+                    // Lossily on purpose: an answer that is not text is
+                    // shown as the bytes that could be read as text, which
+                    // is more use than showing nothing at all.
+                    body: String::from_utf8_lossy(&body.kept).into_owned(),
+                    truncated: !body.whole(),
+                    waited: waited.as_secs_f64() * 1000.,
+                    read: took.saturating_sub(waited).as_secs_f64() * 1000.,
+                    method: method.to_string(),
+                    url: url.clone(),
+                    landed: if landed == url { String::new() } else { landed.clone() },
+                }));
             }
         }
 
@@ -617,11 +725,125 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How much of an upload is held in memory at once.
+///
+/// Every attachment is read whole before the request is sent, because a part
+/// has to know its own length. Something larger than this is not an
+/// attachment on a diagnostic request, it is a transfer, and the download
+/// tool is the one that moves files.
+const MOST_ATTACHED: u64 = 64 * 1024 * 1024;
+
+/// One attachment: what the part is called, and the file it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    pub name: String,
+    pub path: std::path::PathBuf,
+}
+
+/// The files to send with a request.
+///
+/// One per line, or separated by semicolons, because a list of paths is as
+/// often pasted as typed. A bare path takes its part name from the file, and
+/// `name=path` says what to call it instead, which is what an API asking for
+/// a field called `avatar` needs.
+///
+/// A Windows path has a colon in it and a name may not, so the split is on
+/// the first `=` and nothing else.
+pub fn parse_attachments(spec: &str) -> Vec<Attachment> {
+    spec.split(['\n', ';'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| match line.split_once('=') {
+            Some((name, path)) if !name.trim().is_empty() && !path.trim().is_empty() => {
+                Attachment { name: name.trim().to_string(), path: path.trim().into() }
+            }
+            _ => Attachment { name: part_name(line), path: std::path::PathBuf::from(line) },
+        })
+        .collect()
+}
+
+/// What to call the part holding a file, when nobody said.
+///
+/// The file's own name without its extension. Both separators are cut on,
+/// not just this machine's: a Windows path typed on Windows is what the
+/// person is sending, and `std::path` on a Unix machine does not know that
+/// `\` divides one, so the whole path became the name of the part.
+fn part_name(path: &str) -> String {
+    let last = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let stem = last.rsplit_once('.').map_or(last, |(head, _)| head);
+    let stem = stem.trim();
+    if stem.is_empty() { "file".to_string() } else { stem.to_string() }
+}
+
+/// The multipart body for a request that carries files.
+///
+/// The attachments become one part each. What else goes in depends on the
+/// body type: a form body is already a list of names and values, so its pairs
+/// become text parts beside the files, which is what an API expects of a form
+/// upload. A JSON or XML body has no such shape, so the whole of it goes in as
+/// one part called `body`, carrying its own content type.
+fn multipart_form(
+    body: &str,
+    kind: &str,
+    attachments: &[Attachment],
+) -> Result<reqwest::multipart::Form, String> {
+    let mut form = reqwest::multipart::Form::new();
+
+    if !body.is_empty() {
+        if kind == "form" {
+            for pair in body.split('&').filter(|p| !p.is_empty()) {
+                let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                form = form.text(name.to_string(), value.to_string());
+            }
+        } else {
+            let mut part = reqwest::multipart::Part::text(body.to_string());
+            if let Some(content) = body_type(kind) {
+                part = part.mime_str(content).map_err(|e| e.to_string())?;
+            }
+            form = form.part("body", part);
+        }
+    }
+
+    let mut total = 0u64;
+    for attachment in attachments {
+        let shown = attachment.path.display();
+        let size = std::fs::metadata(&attachment.path)
+            .map_err(|e| format!("cannot read {shown}: {e}"))?
+            .len();
+        total += size;
+        if total > MOST_ATTACHED {
+            return Err(format!(
+                "the attachments come to more than {}, which is a transfer and not a request",
+                crate::dl::names::bytes(MOST_ATTACHED)
+            ));
+        }
+        let bytes = std::fs::read(&attachment.path)
+            .map_err(|e| format!("cannot read {shown}: {e}"))?;
+        let filename = attachment
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| attachment.name.clone());
+        let guessed = mime_guess::from_path(&attachment.path).first_or_octet_stream();
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename)
+            .mime_str(guessed.essence_str())
+            .map_err(|e| e.to_string())?;
+        form = form.part(attachment.name.clone(), part);
+    }
+    Ok(form)
+}
+
 /// What a body is sent as, unless a header already says.
 fn body_type(kind: &str) -> Option<&'static str> {
     match kind {
         "json" => Some("application/json"),
+        "xml" => Some("application/xml"),
         "form" => Some("application/x-www-form-urlencoded"),
+        // `text` deliberately sends no content type at all, so that a header
+        // of your own is the only thing that decides. Adding one here would
+        // quietly overrule the answer for anybody relying on that.
         _ => None,
     }
 }
@@ -754,6 +976,58 @@ fn why(e: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_curl_line_pasted_in_becomes_the_whole_request() {
+        let filled = Http
+            .absorb(
+                "curl -X POST 'https://api.example.com/v1/things' \
+                 -H 'Accept: application/json' \
+                 -H 'Authorization: Bearer tok' \
+                 -k -L --data-raw '{\"a\": 1}'",
+            )
+            .expect("a curl line");
+        let of = |key: &str| {
+            filled.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str())
+        };
+
+        assert_eq!(of("target"), Some("https://api.example.com/v1/things"));
+        assert_eq!(of("method"), Some("POST"));
+        assert_eq!(of("headers"), Some("Accept: application/json"));
+        assert_eq!(of("body"), Some("{\"a\": 1}"));
+        assert_eq!(of("bodytype"), Some("json"));
+        // The bearer token became the credential rather than staying a
+        // header nobody would think to look in.
+        assert_eq!(of("authkind"), Some("bearer"));
+        assert_eq!(of("auth"), Some("tok"));
+        assert_eq!(of("insecure"), Some("true"));
+        assert_eq!(of("follow"), Some("true"));
+
+        // Every key it names has to be a field this tool actually has, or
+        // the paste would quietly fill nothing.
+        let keys: Vec<&str> = Http.fields().iter().map(|f| f.key).collect();
+        for (key, _) in &filled {
+            assert!(keys.contains(key), "{key} is not a field of the http tool");
+        }
+    }
+
+    #[test]
+    fn a_switch_the_line_does_not_give_is_left_as_it_was() {
+        // Curl without `-k` says nothing about certificates; it must not
+        // turn off a switch the form already has on.
+        let filled = Http.absorb("curl https://example.com").expect("a curl line");
+        assert!(!filled.iter().any(|(k, _)| *k == "insecure"), "{filled:?}");
+        assert!(!filled.iter().any(|(k, _)| *k == "follow"), "{filled:?}");
+        // And a method the form does not offer is not written into the box.
+        let filled = Http.absorb("curl -X PROPFIND https://example.com").expect("a curl line");
+        assert!(!filled.iter().any(|(k, _)| *k == "method"), "{filled:?}");
+    }
+
+    #[test]
+    fn anything_that_is_not_a_curl_line_is_not_absorbed() {
+        assert!(Http.absorb("https://example.com").is_none());
+        assert!(Http.absorb("").is_none());
+    }
 
     #[test]
     fn headers_are_read_however_they_are_separated() {
@@ -919,6 +1193,63 @@ mod tests {
     fn a_content_type_is_shown_without_its_parameters() {
         assert_eq!(short("text/html; charset=utf-8"), "text/html");
         assert_eq!(short("application/json"), "application/json");
+    }
+
+    #[test]
+    fn attachments_are_read_one_per_line_and_named_after_their_file() {
+        use std::path::PathBuf;
+        let found = parse_attachments("/tmp/report.pdf\n avatar=/tmp/me.png ;/tmp/a.txt\n\n");
+        assert_eq!(
+            found,
+            vec![
+                Attachment { name: "report".into(), path: PathBuf::from("/tmp/report.pdf") },
+                Attachment { name: "avatar".into(), path: PathBuf::from("/tmp/me.png") },
+                Attachment { name: "a".into(), path: PathBuf::from("/tmp/a.txt") },
+            ]
+        );
+        assert!(parse_attachments("   \n \n").is_empty());
+    }
+
+    #[test]
+    fn a_windows_path_is_not_split_on_its_drive_letter() {
+        use std::path::PathBuf;
+        // The split is on `=` and nothing else, so a colon in a path is a
+        // colon in a path.
+        let found = parse_attachments(r"C:\reports\q3.pdf");
+        assert_eq!(
+            found,
+            vec![Attachment { name: "q3".into(), path: PathBuf::from(r"C:\reports\q3.pdf") }]
+        );
+        // And a name given explicitly still wins.
+        let named = parse_attachments(r"doc=C:\reports\q3.pdf");
+        assert_eq!(named[0].name, "doc");
+    }
+
+    #[test]
+    fn an_attachment_that_is_not_there_is_reported_and_not_sent_empty() {
+        let missing =
+            vec![Attachment { name: "a".into(), path: "/nowhere/at/all.bin".into() }];
+        let failed = multipart_form("", "json", &missing).expect_err("it to refuse");
+        assert!(failed.contains("cannot read"), "{failed}");
+    }
+
+    #[test]
+    fn a_form_body_beside_files_becomes_the_fields_of_the_upload() {
+        // A form body is already a list of names and values, so its pairs
+        // belong beside the files rather than inside a part of their own.
+        let dir = std::env::temp_dir().join("ntls-attach-test");
+        std::fs::create_dir_all(&dir).expect("the directory");
+        let file = dir.join("note.txt");
+        std::fs::write(&file, b"hello").expect("a file");
+
+        let attached = vec![Attachment { name: "note".into(), path: file }];
+        assert!(multipart_form("a=1&b=2", "form", &attached).is_ok());
+        // And a JSON body, which has no such shape, goes in whole.
+        assert!(multipart_form(r#"{"a":1}"#, "json", &attached).is_ok());
+        // With nothing to send beside them, the files are the whole of it.
+        assert!(multipart_form("", "json", &attached).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

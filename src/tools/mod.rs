@@ -5,6 +5,7 @@
 //! result table, the log, the chart and the run lifecycle all follow from the
 //! trait, so there is nothing to wire up in the interface.
 
+pub mod curl;
 pub mod dns;
 pub mod download;
 pub mod http;
@@ -131,14 +132,36 @@ mod tests {
                         f.key,
                         f.default
                     ),
+                    // A body says which other field decides what language
+                    // it is written in, and that field has to exist and has
+                    // to be a set of choices, since the colouring is keyed
+                    // off its value.
+                    FieldKind::Code => {
+                        let from = f.syntax_from.unwrap_or_else(|| {
+                            panic!("{id}.{}: a body field names no syntax field", f.key)
+                        });
+                        let named = fields.iter().find(|other| other.key == from);
+                        let named = named.unwrap_or_else(|| {
+                            panic!("{id}.{}: syntax_from names unknown field {from}", f.key)
+                        });
+                        assert_eq!(
+                            named.kind,
+                            FieldKind::Select,
+                            "{id}.{}: syntax_from names {from}, which is not a set of choices",
+                            f.key
+                        );
+                    }
                     FieldKind::Text => {}
                 }
 
                 // A hidden field is one the tool can also show, so the
                 // condition must name a field that exists.
                 if let Some(cond) = &f.visible_if {
-                    let (crate::core::VisibleIf::Equals(key, _)
-                    | crate::core::VisibleIf::NotEquals(key, _)) = cond;
+                    let key = match cond {
+                        crate::core::VisibleIf::Equals(key, _)
+                        | crate::core::VisibleIf::NotEquals(key, _)
+                        | crate::core::VisibleIf::NoneOf(key, _) => key,
+                    };
                     assert!(
                         fields.iter().any(|other| other.key == *key),
                         "{id}.{}: visible_if names unknown field {key}",

@@ -35,11 +35,16 @@ impl App {
         // A menu that would hang off the bottom opens upwards from the
         // pointer instead, as menus everywhere do.
         let viewport = window.viewport_size();
-        let height = menu.height();
         let left = f32::from(menu.at.x).min(f32::from(viewport.width - WIDTH) - MARGIN).max(MARGIN);
+        // What a menu may take of the window, whichever way it opens. Once a
+        // menu can list what a run answered it is no longer four or five
+        // lines: a JSON body of any size fills it, and a menu taller than the
+        // window used to run off the bottom with no way of reaching the rest.
+        let most = (f32::from(viewport.height) - 2. * MARGIN).max(120.);
+        let height = f32::from(menu.height()).min(most);
         let below = f32::from(menu.at.y);
-        let top = if below + f32::from(height) + MARGIN > f32::from(viewport.height) {
-            (below - f32::from(height)).max(MARGIN)
+        let top = if below + height + MARGIN > f32::from(viewport.height) {
+            (below - height).max(MARGIN)
         } else {
             below
         };
@@ -76,6 +81,7 @@ impl App {
                     .absolute()
                     .left(px(left))
                     .w(WIDTH)
+                    .max_h(px(most))
                     .flex()
                     .flex_col()
                     .py(px(4.))
@@ -84,7 +90,17 @@ impl App {
                     .border_1()
                     .border_color(theme.border)
                     .shadow_lg()
-                    .children(rows)
+                    // A long menu scrolls rather than being cut off by the
+                    // edge of the window.
+                    .child(
+                        div()
+                            .id("menu-rows")
+                            .flex()
+                            .flex_col()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .children(rows),
+                    )
                     // A menu grows out of the point it was opened at, which
                     // the only movement that says where it came from.
                     .with_animation(

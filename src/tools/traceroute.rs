@@ -42,7 +42,7 @@ impl Tool for Traceroute {
             .validate(Validator::IntRange(1, 10)),
             Field::text("timeout", "Timeout", "How long to wait for each probe")
                 .default("2s")
-                .validate(Validator::Duration),
+                .validate(Validator::Duration).advanced(),
             Field::boolean(
                 "resolve",
                 "Resolve names",

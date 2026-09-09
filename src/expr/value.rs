@@ -10,6 +10,13 @@ pub enum Value {
     List(Vec<Value>),
     /// One tool's results.
     Table(Arc<Table>),
+    /// A structure read out of an answer: fields by name, in the order the
+    /// answer gave them.
+    ///
+    /// What a service replies with is nested, and a run that can only publish
+    /// the single value it was told to capture leaves a document unable to
+    /// ask a second question of the same answer.
+    Object(Arc<Vec<(String, Value)>>),
     /// A missing thing. Reading a field of it is not an error, so a document
     /// written against a tool that has not run yet still renders.
     Nothing,
@@ -23,6 +30,7 @@ impl Value {
             Value::Bool(_) => "true or false",
             Value::List(_) => "a list",
             Value::Table(_) => "a set of results",
+            Value::Object(_) => "an answer with fields in it",
             Value::Nothing => "nothing",
         }
     }
@@ -47,6 +55,7 @@ impl Value {
             Value::Text(s) => !s.is_empty(),
             Value::List(l) => !l.is_empty(),
             Value::Table(t) => !t.rows.is_empty(),
+            Value::Object(fields) => !fields.is_empty(),
             Value::Nothing => false,
         }
     }
@@ -69,9 +78,115 @@ impl Value {
                 items.iter().map(Value::show).collect::<Vec<_>>().join(", ")
             }
             Value::Table(t) => format!("{} ({} rows)", t.name, t.rows.len()),
+            // Written back out as JSON, so a whole object dropped into a
+            // document reads as the answer it came from rather than as a
+            // description of one.
+            Value::Object(_) => self.to_json(),
             Value::Nothing => String::new(),
         }
     }
+}
+
+impl Value {
+    /// Reads a JSON document into something an expression can walk.
+    ///
+    /// `None` when the text is not JSON, which is the honest answer for an
+    /// answer that was HTML or a stack trace: a document asking for a field
+    /// of it then gets nothing rather than a parse error in the middle of a
+    /// paragraph.
+    pub fn from_json(text: &str) -> Option<Value> {
+        serde_json::from_str::<serde_json::Value>(text).ok().map(from_serde)
+    }
+
+    /// One field of an object, by name.
+    ///
+    /// The name is tried exactly first, because JSON says two fields may
+    /// differ only in case, and only then without regard to case, because the
+    /// rest of this language reads `Ping.rtt` and `Ping.RTT` alike and a
+    /// person writing a document should not have to remember which a service
+    /// chose.
+    pub fn field(&self, name: &str) -> Option<Value> {
+        let Value::Object(fields) = self else { return None };
+        fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .or_else(|| fields.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)))
+            .map(|(_, value)| value.clone())
+    }
+
+    /// The names an object has, so a document can list what it was sent.
+    pub fn keys(&self) -> Vec<String> {
+        match self {
+            Value::Object(fields) => fields.iter().map(|(k, _)| k.clone()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Written back out as JSON.
+    ///
+    /// Not `serde_json`'s own writer: this has to render a `Table` and a
+    /// `Nothing` too, neither of which came from JSON in the first place.
+    pub fn to_json(&self) -> String {
+        match self {
+            Value::Number(n) => {
+                if n.is_finite() { format_number(*n) } else { "null".into() }
+            }
+            Value::Bool(b) => b.to_string(),
+            Value::Text(s) => quote_json(s),
+            Value::Nothing => "null".into(),
+            Value::List(items) => {
+                let inner: Vec<String> = items.iter().map(Value::to_json).collect();
+                format!("[{}]", inner.join(","))
+            }
+            Value::Object(fields) => {
+                let inner: Vec<String> = fields
+                    .iter()
+                    .map(|(k, v)| format!("{}:{}", quote_json(k), v.to_json()))
+                    .collect();
+                format!("{{{}}}", inner.join(","))
+            }
+            Value::Table(t) => quote_json(&format!("{} ({} rows)", t.name, t.rows.len())),
+        }
+    }
+}
+
+/// A `serde_json` document as one of ours.
+///
+/// JSON's null becomes `Nothing`, which is the same thing this language
+/// already means by it: reading a field of it is not an error, so a document
+/// written against a service that sometimes omits a value still renders.
+fn from_serde(value: serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Nothing,
+        serde_json::Value::Bool(b) => Value::Bool(b),
+        serde_json::Value::Number(n) => n.as_f64().map_or(Value::Nothing, Value::Number),
+        serde_json::Value::String(s) => Value::Text(s),
+        serde_json::Value::Array(items) => {
+            Value::List(items.into_iter().map(from_serde).collect())
+        }
+        serde_json::Value::Object(map) => {
+            Value::Object(Arc::new(map.into_iter().map(|(k, v)| (k, from_serde(v))).collect()))
+        }
+    }
+}
+
+/// One JSON string, quoted and escaped.
+fn quote_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Trims the noise off a computed number: whole numbers stay whole, and the
@@ -125,6 +240,11 @@ pub struct Table {
     pub stats: Vec<(String, String)>,
     /// How long the run took, in seconds.
     pub elapsed: Option<f64>,
+    /// Structured values the tool published beside its table, by name.
+    ///
+    /// The HTTP tool puts the answer it received here, parsed, so a document
+    /// or a workflow can reach any part of it.
+    pub extras: Vec<(String, Value)>,
 }
 
 impl Table {

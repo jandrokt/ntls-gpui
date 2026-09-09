@@ -32,8 +32,13 @@ impl App {
         let suggestion = self.suggestion(cx);
         let command = {
             let p = palette.read(cx);
+            // Only once the first word actually names a tool. Without that,
+            // `> work` offered to "Run with work", having taken the `>` for
+            // a tool and the rest for its target.
+            let names_a_tool =
+                crate::ui::palette::tool_of(p.query(), &self.registry).is_some();
             let c = p.command();
-            c.has_arguments().then(|| {
+            (names_a_tool && c.has_arguments()).then(|| {
                 let mut parts = Vec::new();
                 if !c.target().is_empty() {
                     parts.push(c.target());
@@ -43,14 +48,38 @@ impl App {
             })
         };
 
+        // What was typed, for picking the matched characters out of each
+        // label. Recomputed against the label actually shown rather than
+        // carried along, because the label is what the reader is looking at.
+        let needle = {
+            let typed = palette.read(cx).query().trim().to_lowercase();
+            typed.strip_prefix('>').map_or(typed.clone(), |rest| rest.trim().to_string())
+        };
+
+        // The row each answer was drawn on. Only the grouped list puts
+        // anything between them, so for the others it is one to one.
+        let mut placed: Vec<usize> = Vec::new();
+
         let (heading, rows): (Option<String>, Vec<AnyElement>) = match &suggestion {
-            Suggest::Search(hits) => (
-                None,
-                hits.iter()
-                    .enumerate()
-                    .map(|(i, hit)| hit_row(i, hit, i == cursor, theme, cx))
-                    .collect(),
-            ),
+            // Grouped under headings, best group first. A flat list mixing
+            // commands, tools, runs, rows of results and documents is a
+            // list nobody can scan.
+            Suggest::Search(hits) => {
+                let mut rows = Vec::new();
+                let mut at = 0usize;
+                for (kind, held) in crate::ui::search::grouped(hits.clone()) {
+                    rows.push(group_heading(kind, theme));
+                    for hit in held {
+                        // Where in the drawn list this answer ended up, which
+                        // is not its place among the answers once headings
+                        // are drawn between them.
+                        placed.push(rows.len());
+                        rows.push(hit_row(at, &hit, at == cursor, &needle, theme, cx));
+                        at += 1;
+                    }
+                }
+                (None, rows)
+            }
             Suggest::Params { tool, items } => (
                 Some(format!("{} settings", tool.title())),
                 items
@@ -69,9 +98,26 @@ impl App {
             ),
         };
         let empty_line = match &suggestion {
-            Suggest::Search(_) => "Nothing found",
+            // A dead end is the place to say what else the box takes: the
+            // one thing nobody discovers on their own.
+            Suggest::Search(_) => {
+                "Nothing found. A tool's name runs it \u{2014} ping 1.1.1.1 \u{2014} and > lists what ntls can do."
+            }
             Suggest::Params { .. } => "No setting by that name",
             Suggest::Values { .. } => "Type any value",
+        };
+        // What the keys do, which is how the second and third things this box
+        // can do get found at all.
+        let footing: Vec<(&'static str, &'static str)> = match &suggestion {
+            Suggest::Search(_) if needle.is_empty() => {
+                vec![("\u{21c5}", "move"), ("\u{23ce}", "open"), (">", "commands")]
+            }
+            Suggest::Search(_) => {
+                vec![("\u{21c5}", "move"), ("\u{23ce}", "open"), ("\u{21e5}", "complete")]
+            }
+            Suggest::Params { .. } | Suggest::Values { .. } => {
+                vec![("\u{21e5}", "fill in"), ("\u{23ce}", "run it")]
+            }
         };
 
         // A search offers up to forty rows and the card shows about nine of
@@ -79,10 +125,17 @@ impl App {
         // before it runs out of list: the highlight goes below the fold and
         // Enter then runs a row nobody can see. Move the list to the row the
         // keyboard is on.
-        let count = rows.len();
+        if placed.is_empty() {
+            placed = (0..rows.len()).collect();
+        }
+        let count = placed.len();
         let scroll = LIST.with(|list| {
-            if let Some(row) = scroll_row(list.shown.get(), cursor, count) {
-                list.scroll.scroll_to_item(row);
+            if let Some(at) = scroll_row(list.shown.get(), cursor, count) {
+                // The heading above it, when there is one, so a group's
+                // first answer is not scrolled to with its own name off the
+                // top of the view.
+                let row = placed[at];
+                list.scroll.scroll_to_item(row.saturating_sub(usize::from(row > 0 && at == 0)));
             }
             if count > 0 {
                 list.shown.set(Some(cursor.min(count - 1)));
@@ -203,6 +256,40 @@ impl App {
                                 rows
                             }),
                     )
+                    // A line of keys along the bottom. The box is three
+                    // things at once — a search, a command line and a list of
+                    // what the application can do — and only the first is
+                    // obvious from looking at it.
+                    .child(super::rule(theme))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(space::ROOMY))
+                            .flex_shrink_0()
+                            .px(px(12.))
+                            .h(px(28.))
+                            .children(footing.into_iter().map(|(key, what)| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(space::TIGHT))
+                                    .child(keycap(key, theme))
+                                    .child(
+                                        div()
+                                            .text_meta()
+                                            .text_color(theme.faint)
+                                            .child(what),
+                                    )
+                            }))
+                            .child(div().flex_1())
+                            .children((count > 0).then(|| {
+                                div().text_meta().text_color(theme.faint).child(format!(
+                                    "{count} answer{}",
+                                    if count == 1 { "" } else { "s" }
+                                ))
+                            })),
+                    )
                     // The card drops into place under the pointer's own
                     // gesture: a panel that is simply there on the next frame
                     // reads as the window having jumped and not as
@@ -252,6 +339,65 @@ fn scroll_row(shown: Option<usize>, cursor: usize, rows: usize) -> Option<usize>
     (shown? != row).then_some(row)
 }
 
+/// The heading over one kind of answer.
+fn group_heading(kind: &'static str, theme: &Theme) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .h(px(22.))
+        .px(px(9.))
+        .pt(px(4.))
+        .text_caps()
+        .text_color(theme.faint)
+        .child(kind)
+        .into_any_element()
+}
+
+/// A label with the characters that answered the query picked out.
+///
+/// With a list this mixed, a row matched three words in is otherwise
+/// indistinguishable from one matched at the start, and a fuzzy match looks
+/// like no match at all.
+fn lit(
+    label: &str,
+    needle: &str,
+    mono: bool,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    let found = (!needle.is_empty())
+        .then(|| crate::ui::search::hit_of(&label.to_lowercase(), needle))
+        .flatten();
+    let highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = found
+        .map(|m| m.at)
+        .unwrap_or_default()
+        .into_iter()
+        // One range per character: the matched positions may be scattered.
+        .filter_map(|at| {
+            let end = label[at..].chars().next()?.len_utf8() + at;
+            Some((
+                at..end,
+                gpui::HighlightStyle {
+                    color: Some(theme.accent),
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                },
+            ))
+        })
+        .collect();
+
+    div()
+        .flex_1()
+        .min_w_0()
+        .when(mono, |d| d.mono())
+        .text_small()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme.text)
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .child(gpui::StyledText::new(label.to_string()).with_highlights(highlights))
+        .into_any_element()
+}
+
 /// A row in the search results: what it is, what it is called, and where it
 /// lives. One shape for tools, workspaces, open tools, result rows and
 /// interfaces, because the list mixes them.
@@ -259,6 +405,7 @@ fn hit_row(
     index: usize,
     hit: &Hit,
     on_cursor: bool,
+    needle: &str,
     theme: &Theme,
     cx: &mut Context<App>,
 ) -> AnyElement {
@@ -267,31 +414,18 @@ fn hit_row(
         _ => theme.accent,
     };
     let hit = hit.clone();
-    let (kind, label, context) = (hit.kind(), hit.label(), hit.context());
+    let (label, context) = (hit.label(), hit.context());
     let mono = matches!(hit, Hit::Row { .. } | Hit::Iface { .. });
+    // A command already says what it does; the rest of the row says where it
+    // is, and the keys that also do it go on the right in a keycap.
+    let keys = match &hit {
+        Hit::Command(c) => c.keys,
+        _ => None,
+    };
 
     row_shell(format!("pal-hit-{index}"), on_cursor, theme)
         .child(icon(hit.icon(), px(15.), colour))
-        .child(
-            div()
-                .w(px(52.))
-                .flex_shrink_0()
-                .text_meta()
-                .text_color(theme.faint)
-                .whitespace_nowrap()
-                .child(kind),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .when(mono, |d| d.mono())
-                .text_small()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.text)
-                .truncate()
-                .child(label),
-        )
+        .child(lit(&label, needle, mono, theme))
         .child(
             div()
                 .max_w(px(190.))
@@ -301,7 +435,8 @@ fn hit_row(
                 .truncate()
                 .child(context),
         )
-        .when(on_cursor, |d| d.child(keycap("⏎", theme)))
+        .children(keys.map(|keys| keycap(keys, theme)))
+        .when(on_cursor && keys.is_none(), |d| d.child(keycap("⏎", theme)))
         .on_click(cx.listener(move |app, _, window, cx| {
             app.palette.update(cx, |p, _| p.cursor = index);
             app.confirm_palette(window, cx);

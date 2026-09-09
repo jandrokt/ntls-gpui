@@ -34,6 +34,9 @@ reqwest = { version = "0.13", default-features = false, features = [
   "json",
   "stream",
   "http2",
+  # Attachments on a request. It brings `mime_guess` with it, which is what
+  # decides the content type of each part from the file's own name.
+  "multipart",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -41,6 +44,9 @@ futures = "0.3"
 scraper = "0.27"
 url = "2"
 percent-encoding = "2"
+# What an attachment's content type is guessed from. reqwest's multipart
+# support already builds it; naming it here is what lets this ask directly.
+mime_guess = "2"
 youtube_dl = { version = "0.10", features = ["tokio"] }
 base64 = "0.22"
 

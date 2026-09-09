@@ -56,7 +56,7 @@ impl Tool for Dns {
             .expand(Expand::Resolver),
             Field::text("timeout", "Timeout", "How long to wait for the server to answer")
                 .default("4s")
-                .validate(Validator::Duration),
+                .validate(Validator::Duration).advanced(),
             Field::boolean(
                 "extra",
                 "Show all sections",

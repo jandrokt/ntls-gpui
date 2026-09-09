@@ -23,6 +23,7 @@ use crate::ui::app::App;
 use crate::ui::flows::Outcome;
 use crate::ui::icons::icon;
 use crate::ui::menu::{Act, Item};
+use crate::ui::syntax;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{Kind, Type, button, pill, space};
 
@@ -40,9 +41,12 @@ const INDENT: f32 = 22.;
 fn hue(step: &Step, theme: &Theme) -> (Hsla, Hsla) {
     match step {
         Step::Run { .. } => (theme.accent, theme.accent_soft),
-        Step::If { .. } => (theme.warn, theme.warn_soft),
-        Step::Repeat { .. } => (theme.up, theme.up_soft),
-        Step::Wait { .. } => (theme.dim, theme.track),
+        // A `while` decides on every pass, so it is drawn as a decision and
+        // not only as a loop.
+        Step::If { .. } | Step::While { .. } => (theme.warn, theme.warn_soft),
+        Step::Repeat { .. } | Step::ForEach { .. } => (theme.up, theme.up_soft),
+        // A wait and a note both change nothing.
+        Step::Wait { .. } | Step::Log { .. } => (theme.dim, theme.track),
         // A set step and a run both produce something, and the word beside
         // the icon is what tells them apart.
         Step::Set { .. } => (theme.accent, theme.accent_soft),
@@ -56,13 +60,35 @@ fn hue(step: &Step, theme: &Theme) -> (Hsla, Hsla) {
 /// can be read as the value it is.
 fn parts(step: &Step) -> (&'static str, String) {
     match step {
-        Step::Run { name, .. } => {
-            ("Run", if name.trim().is_empty() { "\u{2014}".into() } else { name.clone() })
+        Step::Run { name, with, .. } => {
+            let name =
+                if name.trim().is_empty() { "\u{2014}".to_string() } else { name.clone() };
+            // What it sets goes on the card, because a step that runs the
+            // same tool three times with three targets is otherwise three
+            // identical lines.
+            let said = if with.is_empty() {
+                name
+            } else {
+                let pairs: Vec<String> =
+                    with.iter().map(|(field, value)| format!("{field} = {value}")).collect();
+                format!("{name} with {}", pairs.join(", "))
+            };
+            ("Run", said)
         }
         Step::If { .. } => ("If", String::new()),
+        Step::While { .. } => ("While", String::new()),
         Step::Repeat { times, .. } => {
             ("Repeat", format!("{times} time{}", if *times == 1 { "" } else { "s" }))
         }
+        Step::ForEach { name, over, .. } => (
+            "For each",
+            match (name.trim().is_empty(), over.trim().is_empty()) {
+                (true, true) => "\u{2014}".into(),
+                (false, true) => name.clone(),
+                (true, false) => format!("of {over}"),
+                (false, false) => format!("{name} in {over}"),
+            },
+        ),
         Step::Wait { seconds } => ("Wait", seconds_text(*seconds)),
         Step::Set { name, value } => (
             "Set",
@@ -71,6 +97,10 @@ fn parts(step: &Step) -> (&'static str, String) {
                 (false, true) => name.clone(),
                 (false, false) => format!("{name} = {value}"),
             },
+        ),
+        Step::Log { value } => (
+            "Print",
+            if value.trim().is_empty() { "\u{2014}".into() } else { value.clone() },
         ),
         Step::Stop { .. } => ("Stop", String::new()),
     }
@@ -122,7 +152,9 @@ fn lay_out(
                 lay_out(otherwise, &within, depth + 1, id, out);
                 out.push(Line::Slot { spot, block: 1, depth: depth + 1 });
             }
-            Step::Repeat { body, .. } => {
+            Step::Repeat { body, .. }
+            | Step::ForEach { body, .. }
+            | Step::While { body, .. } => {
                 let mut within = inside.to_vec();
                 within.push((index, 0));
                 lay_out(body, &within, depth + 1, id, out);
@@ -168,6 +200,7 @@ impl App {
 
         let Some(sheet) = self.workspace().flow(id) else { return div().into_any_element() };
         let (title, path, running) = (sheet.title(), sheet.path.clone(), sheet.running());
+        let (printed, log_open) = (sheet.printed.clone(), sheet.log_open);
         let scroll = sheet.scroll.clone();
         let parsed = sheet.flow();
         let cursor = sheet.cursor.clone();
@@ -340,6 +373,24 @@ impl App {
                             app.toggle_editing(item, window, cx)
                         })),
                     )
+                    // What the run said, which is where a `print` goes and
+                    // the only place every pass of one survives.
+                    .when(!printed.is_empty(), |d| {
+                        d.child(
+                            button(
+                                "flow-log",
+                                "Log",
+                                Kind::Toggle(log_open),
+                                theme,
+                            )
+                            .on_click(cx.listener(move |app, _, _, cx| {
+                                if let Some(sheet) = app.workspace_mut().flow_mut(id) {
+                                    sheet.log_open = !sheet.log_open;
+                                    cx.notify();
+                                }
+                            })),
+                        )
+                    })
                     .child(if running {
                         button("flow-stop", "Stop", Kind::Danger, theme)
                             .on_click(cx.listener(move |app, _, _, cx| app.stop_flow(id, cx)))
@@ -404,6 +455,9 @@ impl App {
                     .children(rows)
                     .children(problems),
             )
+            .when(log_open && !printed.is_empty(), |d| {
+                d.child(run_log(id, &printed, theme, cx))
+            })
             .into_any_element()
     }
 }
@@ -425,11 +479,13 @@ fn shut_step(
     let (menu_spot, click_spot) = (spot.clone(), spot.clone());
     let step_for_menu = step.clone();
     let running = outcome == Some(Outcome::Running);
-    let repeated = matches!(step, Step::Repeat { .. });
     let (colour, soft) = hue(step, theme);
     let (word, detail) = parts(step);
     let condition = condition_of(step).to_string();
-    let branch = matches!(step, Step::If { .. });
+    // A branch and a loop are both labelled with their own word already, so
+    // neither needs an "if" in front of the condition to read as a sentence.
+    // "While if false" is not English.
+    let branch = matches!(step, Step::If { .. } | Step::While { .. });
 
     div()
         .id(SharedString::from(format!("step-{flow}-{step_id}")))
@@ -453,15 +509,7 @@ fn shut_step(
                 .child(word),
         )
         .when(!detail.is_empty(), |d| {
-            d.child(
-                div()
-                    .min_w_0()
-                    .mono()
-                    .text_small()
-                    .text_color(theme.text)
-                    .truncate()
-                    .child(detail),
-            )
+            d.child(coloured(&detail, syntax::Language::Flow, theme, false))
         })
         .when(!condition.is_empty(), |d| {
             d.child(
@@ -475,33 +523,35 @@ fn shut_step(
                     .when(!branch, |d| {
                         d.child(div().text_meta().text_color(theme.faint).child("if"))
                     })
-                    .child(
-                        div()
-                            .min_w_0()
-                            .mono()
-                            .text_small()
-                            .text_color(theme.dim)
-                            .truncate()
-                            .child(condition),
-                    ),
+                    // A condition is an expression and nothing else, so it
+                    // is read as one.
+                    .child(coloured(&condition, syntax::Language::Expr, theme, true)),
             )
         })
         .children(outcome.as_ref().map(|o| {
             pill(o.label(), theme.status(o.status()), theme.status_soft(o.status()))
         }))
-        .children((repeated && passes > 1).then(|| {
+        // Whatever put it round again. This used to be shown only on a
+        // `repeat` itself, so a step inside one — which is the step you
+        // actually want the count of — never said how many times it had
+        // happened, and a walk over a list looked like a single pass whose
+        // trail happened to name the last item.
+        .children((passes > 1).then(|| {
             div().text_meta().text_color(theme.faint).child(format!("{passes} passes"))
         }))
-        .child(div().flex_1())
+        // What came of it, next to what it was, and not flung out to the
+        // right-hand edge of the window. `PublicIP = 79.116.21.76` a foot
+        // away from the step that set it reads as belonging to nothing.
         .children(outcome.as_ref().map(|o| o.detail()).filter(|d| !d.is_empty()).map(|detail| {
             div()
-                .max_w(px(300.))
-                .flex_shrink_0()
+                .min_w_0()
+                .max_w(px(420.))
                 .text_small()
                 .text_color(theme.faint)
                 .truncate()
                 .child(detail)
         }))
+        .child(div().flex_1())
         .on_click(cx.listener(move |app, _, _, cx| {
             if readable {
                 app.select_step(flow, Some(click_spot.clone()), cx);
@@ -681,7 +731,24 @@ fn open_step(
                         ),
                 }));
         }
-        Step::If { .. } | Step::Stop { .. } => {}
+        // A walk over a list: the name each item is put under, and the list
+        // itself. The list is typed rather than built, because what is worth
+        // walking is a column or an array out of an answer, and the controls
+        // that build a single value have nothing to say about either.
+        Step::ForEach { over, .. } => {
+            top = top
+                .child(div().text_meta().text_color(theme.faint).child("each"))
+                .child(boxed(value_name.clone(), px(110.), theme))
+                .child(div().text_meta().text_color(theme.faint).child("in"))
+                .child(boxed(value_input.clone(), px(240.), theme))
+                .when(over.trim().is_empty(), |d| {
+                    d.child(pill("a list, a column, or an answer", theme.dim, theme.track))
+                });
+        }
+        Step::Log { .. } => {
+            top = top.child(boxed(value_input.clone(), px(320.), theme));
+        }
+        Step::If { .. } | Step::While { .. } | Step::Stop { .. } => {}
     }
 
     let (up, down) = (spot.clone(), spot.clone());
@@ -733,6 +800,199 @@ fn open_step(
 /// pretended about: the language is bigger than the controls, and a workflow
 /// that used the rest of it is still a workflow.
 #[allow(clippy::too_many_arguments)]
+/// Everything a run said, oldest first.
+///
+/// The trail keeps one mark per step and so keeps only the last pass of a
+/// step inside a walk; this keeps every line, which is the point of a
+/// `print` inside a loop. Stamped with how far into the run each line was,
+/// not with the time of day: a run log is read against itself, and what
+/// matters is what happened between one line and the next.
+fn run_log(
+    flow: usize,
+    printed: &[crate::ui::flows::Printed],
+    theme: &Theme,
+    cx: &mut Context<App>,
+) -> AnyElement {
+    let started = printed.first().map(|line| line.at);
+    let lines: Vec<AnyElement> = printed
+        .iter()
+        .map(|line| {
+            div()
+                .flex()
+                .items_baseline()
+                .gap(px(space::ROOMY))
+                .px(px(space::ROOMY))
+                .py(px(1.))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(62.))
+                        .mono()
+                        .text_meta()
+                        .text_color(theme.faint)
+                        .child(stamp(started, line.at)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .mono()
+                        .text_small()
+                        .text_color(if line.bad { theme.down } else { theme.text })
+                        .child(line.text.clone()),
+                )
+                .into_any_element()
+        })
+        .collect();
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .max_h(px(200.))
+        .border_t_1()
+        .border_color(theme.border)
+        .bg(theme.raised)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(space::SNUG))
+                .flex_shrink_0()
+                .px(px(space::ROOMY))
+                .py(px(space::SNUG))
+                .child(div().text_caps().text_color(theme.faint).child("Log"))
+                .child(
+                    div()
+                        .text_meta()
+                        .text_color(theme.faint)
+                        .child(format!("{} line{}", printed.len(), plural(printed.len()))),
+                )
+                .child(div().flex_1())
+                .child(
+                    button("flow-log-shut", "Hide", Kind::Ghost, theme).on_click(cx.listener(
+                        move |app, _, _, cx| {
+                            if let Some(sheet) = app.workspace_mut().flow_mut(flow) {
+                                sheet.log_open = false;
+                                cx.notify();
+                            }
+                        },
+                    )),
+                ),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("flow-log-{flow}")))
+                .flex()
+                .flex_col()
+                .min_h_0()
+                .pb(px(space::SNUG))
+                .overflow_y_scroll()
+                .children(lines),
+        )
+        .into_any_element()
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// How far into the run a line was written.
+fn stamp(started: Option<std::time::SystemTime>, at: std::time::SystemTime) -> String {
+    let Some(started) = started else { return "+0.0s".into() };
+    let since = at.duration_since(started).unwrap_or_default().as_secs_f64();
+    if since >= 60. {
+        return format!("+{}m{:02.0}s", (since / 60.) as u64, since % 60.);
+    }
+    format!("+{since:.1}s")
+}
+
+/// A step's own words, coloured the way the same words are coloured in the
+/// file behind it.
+///
+/// The cards used to render every expression as one flat colour while the
+/// *Text* view of the very same workflow coloured it properly, so the two
+/// halves of one editor disagreed about what a string or a keyword looked
+/// like. Laid out as one run of text with ranges rather than as a row of
+/// spans, so it truncates as a sentence does.
+fn coloured(text: &str, language: syntax::Language, theme: &Theme, dim: bool) -> AnyElement {
+    let colours = crate::ui::editor::Colours::of(theme);
+    let base = if dim { theme.dim } else { theme.text };
+    let highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> =
+        syntax::highlight_flat(language, text)
+            .into_iter()
+            .filter(|s| !s.range.is_empty())
+            .map(|s| {
+                let colour = match s.kind {
+                    // Ordinary text keeps the card's own colour, so a dimmed
+                    // condition stays dimmed.
+                    syntax::Kind::Text => base,
+                    kind => colours.of_kind(kind),
+                };
+                (
+                    s.range,
+                    gpui::HighlightStyle {
+                        color: Some(colour),
+                        font_weight: Some(crate::ui::editor::Colours::weight_of(s.kind)),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+
+    div()
+        .min_w_0()
+        .mono()
+        .text_small()
+        .text_color(base)
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .child(gpui::StyledText::new(text.to_string()).with_highlights(highlights))
+        .into_any_element()
+}
+
+/// The paths of a run's answer, as menu entries: the path, and what is there.
+///
+/// Flattened, because a menu that made you walk down one level at a time
+/// would be a worse way to reach `json.queue.depth` than typing it. Bounded
+/// in both directions: an answer can be a whole document, and every leaf of a
+/// large one would be a menu nobody could read.
+fn answer_paths(table: &crate::expr::Table) -> Vec<(String, String)> {
+    use crate::expr::Value;
+
+    /// How far down the menu goes.
+    const DEEPEST: usize = 4;
+    /// How many entries it may come to.
+    const MOST: usize = 60;
+
+    fn walk(prefix: &str, value: &Value, depth: usize, out: &mut Vec<(String, String)>) {
+        let Value::Object(fields) = value else { return };
+        for (key, inner) in fields.iter() {
+            if out.len() >= MOST {
+                return;
+            }
+            // A name a dot cannot spell is not offered: picking it would
+            // write a condition that does not parse.
+            if !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+            match inner {
+                Value::Object(_) if depth + 1 < DEEPEST => walk(&path, inner, depth + 1, out),
+                _ => out.push((path, crate::ui::complete::preview(inner))),
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (name, value) in &table.extras {
+        match value {
+            Value::Object(_) => walk(name, value, 1, &mut out),
+            other => out.push((name.clone(), crate::ui::complete::preview(other))),
+        }
+    }
+    out
+}
+
 fn condition_row(
     flow: usize,
     spot: &Spot,
@@ -744,7 +1004,6 @@ fn condition_row(
     cx: &mut Context<App>,
 ) -> AnyElement {
     let condition = condition_of(step);
-    let branch = matches!(step, Step::If { .. });
     let row = div()
         .flex()
         .items_center()
@@ -756,7 +1015,11 @@ fn condition_row(
                 .text_meta()
                 .text_color(theme.faint)
                 .whitespace_nowrap()
-                .child(if branch { "if" } else { "only if" }),
+                .child(match step {
+                    Step::If { .. } => "if",
+                    Step::While { .. } => "while",
+                    _ => "only if",
+                }),
         );
 
     // Nothing chosen yet: one word to start, not four empty controls
@@ -865,6 +1128,17 @@ fn condition_row(
                 fields.push(Item::plain(
                     format!("{key} \u{b7} {value}"),
                     Act::ChangeStep(flow, spot.clone(), Change::SetField(key.clone())),
+                ));
+            }
+        }
+        let answered = answer_paths(table);
+        if !answered.is_empty() {
+            fields.push(Item::Separator);
+            fields.push(Item::Heading("What it answered".into()));
+            for (path, shown) in answered {
+                fields.push(Item::plain(
+                    format!("{path} \u{b7} {shown}"),
+                    Act::ChangeStep(flow, spot.clone(), Change::SetField(path)),
                 ));
             }
         }
@@ -1133,6 +1407,17 @@ fn value_controls(
             ));
         }
     }
+    let answered = answer_paths(table);
+    if !answered.is_empty() {
+        fields.push(Item::Separator);
+        fields.push(Item::Heading("What it answered".into()));
+        for (path, shown) in answered {
+            fields.push(Item::plain(
+                format!("{path} \u{b7} {shown}"),
+                Act::ChangeStep(flow, spot.clone(), Change::SetValueField(path)),
+            ));
+        }
+    }
 
     out.push(chooser(
         "step-value-field",
@@ -1255,6 +1540,19 @@ fn nearer(seconds: f64, direction: i32) -> u32 {
 mod tests {
     use super::*;
     use crate::flow::parse;
+
+    #[test]
+    fn a_log_line_says_how_far_into_the_run_it_was() {
+        use std::time::{Duration, SystemTime};
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        assert_eq!(stamp(Some(start), start), "+0.0s");
+        assert_eq!(stamp(Some(start), start + Duration::from_millis(640)), "+0.6s");
+        assert_eq!(stamp(Some(start), start + Duration::from_secs(75)), "+1m15s");
+        // A clock that went backwards between two lines is not a reason to
+        // refuse to draw the log.
+        assert_eq!(stamp(Some(start), start - Duration::from_secs(5)), "+0.0s");
+        assert_eq!(stamp(None, start), "+0.0s");
+    }
 
     #[test]
     fn the_rows_are_numbered_the_way_a_running_workflow_numbers_its_steps() {

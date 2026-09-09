@@ -121,7 +121,7 @@ impl Tool for Download {
                     Opt::new("date", "By date", "One folder per day, named YYYY-MM-DD"),
                 ],
             ),
-            Field::boolean("overwrite", "Overwrite", "Replace an existing file of the same name", false),
+            Field::boolean("overwrite", "Overwrite", "Replace an existing file of the same name", false).advanced(),
             Field::boolean(
                 "keep_partial",
                 "Keep part files",

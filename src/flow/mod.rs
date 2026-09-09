@@ -34,16 +34,38 @@ use std::fmt::Write as _;
 #[derive(Clone, PartialEq, Debug)]
 pub enum Step {
     /// Start a run in this workspace and wait for it to finish.
-    Run { name: String, condition: Option<String> },
+    ///
+    /// `with` sets some of the tool's own fields first, each to whatever its
+    /// expression comes to when the step is reached. A workflow that can only
+    /// run tools exactly as they were left is a list of buttons; being able
+    /// to point one at something worked out a moment ago is what makes it a
+    /// program. The fields are put back afterwards, so the tool is not
+    /// quietly rewritten by having been used.
+    Run { name: String, condition: Option<String>, with: Vec<(String, String)> },
     /// Take one branch or the other.
     If { condition: String, then: Vec<Step>, otherwise: Vec<Step> },
     /// Do the same thing a fixed number of times.
     Repeat { times: usize, body: Vec<Step> },
+    /// Do the same thing once for each item of a list, with the item under a
+    /// name the body can read.
+    ///
+    /// The list is whatever the expression comes to: a column of a run
+    /// (`Sweep.host`), an array out of an answer (`Health.json.hosts`), or a
+    /// single value, which counts as a list of one.
+    ForEach { name: String, over: String, body: Vec<Step> },
+    /// Keep going while a condition holds.
+    ///
+    /// What `repeat` cannot say: waiting for something to come up, or
+    /// draining a queue, where the number of passes is not known when the
+    /// workflow is written.
+    While { condition: String, body: Vec<Step> },
     /// Pause.
     Wait { seconds: f64 },
     /// Work something out and keep it under a name, for every document,
     /// condition and later step in the workspace to read.
     Set { name: String, value: String },
+    /// Work something out and write it into the trail, changing nothing.
+    Log { value: String },
     /// End the workflow.
     Stop { condition: Option<String> },
 }
@@ -54,9 +76,11 @@ impl Step {
         match self {
             Step::Run { .. } => "play",
             Step::If { .. } => "compare",
-            Step::Repeat { .. } => "refresh",
+            Step::Repeat { .. } | Step::While { .. } => "refresh",
+            Step::ForEach { .. } => "list",
             Step::Wait { .. } => "gear",
             Step::Set { .. } => "note",
+            Step::Log { .. } => "info",
             Step::Stop { .. } => "stop",
         }
     }
@@ -65,7 +89,9 @@ impl Step {
     pub fn blocks(&self) -> Vec<&Vec<Step>> {
         match self {
             Step::If { then, otherwise, .. } => vec![then, otherwise],
-            Step::Repeat { body, .. } => vec![body],
+            Step::Repeat { body, .. }
+            | Step::ForEach { body, .. }
+            | Step::While { body, .. } => vec![body],
             _ => Vec::new(),
         }
     }
@@ -277,6 +303,47 @@ fn step(
         return Some(Step::If { condition, then, otherwise });
     }
 
+    // `for each host in Sweep.host {`. The `each` is optional, so both the
+    // way it reads aloud and the way it is usually typed are accepted.
+    if let Some(rest) = keyword(text, "for") {
+        let rest = keyword(rest, "each").unwrap_or(rest);
+        let head = rest.trim_end_matches('{').trim();
+        if opens_a_block(head) {
+            return None;
+        }
+        let Some((name, over)) = split_in(head) else {
+            problems.push((line + 1, "for each needs a name, an in and a list".into()));
+            *lost = true;
+            return None;
+        };
+        if name.is_empty() {
+            problems.push((line + 1, "for each needs a name to put each one under".into()));
+        }
+        if over.is_empty() {
+            problems.push((line + 1, "for each needs a list to go through".into()));
+        }
+        let body = block(lines, at, problems, lost, depth + 1);
+        if *at < lines.len() {
+            *at += 1;
+        }
+        return Some(Step::ForEach { name, over, body });
+    }
+
+    if let Some(rest) = keyword(text, "while") {
+        let condition = rest.trim_end_matches('{').trim().to_string();
+        if opens_a_block(&condition) {
+            return None;
+        }
+        if condition.is_empty() {
+            problems.push((line + 1, "while needs a condition".into()));
+        }
+        let body = block(lines, at, problems, lost, depth + 1);
+        if *at < lines.len() {
+            *at += 1;
+        }
+        return Some(Step::While { condition, body });
+    }
+
     if let Some(rest) = keyword(text, "repeat") {
         let count = rest.trim_end_matches('{').trim();
         let times = count.parse().unwrap_or_else(|_| {
@@ -309,6 +376,12 @@ fn step(
         return Some(Step::Set { name, value });
     }
 
+    // `print` is what the step is called; `log` is what it was called first
+    // and files written then still read.
+    if let Some(rest) = keyword(text, "print").or_else(|| keyword(text, "log")) {
+        return Some(Step::Log { value: rest.trim().to_string() });
+    }
+
     if let Some(rest) = keyword(text, "wait") {
         let seconds = parse_seconds(rest.trim()).unwrap_or_else(|| {
             problems.push((line + 1, format!("{:?} is not a length of time", rest.trim())));
@@ -327,10 +400,127 @@ fn step(
         if rest.is_empty() {
             return None;
         }
-        let name = unquote(rest);
-        return Some(Step::Run { name, condition });
+        let (name, with) = split_with(rest);
+        let name = unquote(&name);
+        let with = match with {
+            None => Vec::new(),
+            Some(text) => {
+                let (settings, bad) = parse_with(&text);
+                if let Some(bad) = bad {
+                    // In the file and not in the tree: saying so is what
+                    // stops the next edit writing over it.
+                    problems.push((line + 1, format!("cannot read {bad:?} after with")));
+                    *lost = true;
+                    return None;
+                }
+                settings
+            }
+        };
+        return Some(Step::Run { name, condition, with });
     }
     None
+}
+
+/// Splits `host in Sweep.host` at the `in` between them.
+///
+/// The name may not have a space in it, so the first `in` that stands as its
+/// own word is the one, and a list called `initial` or a run called `in use`
+/// is not mistaken for it.
+fn split_in(text: &str) -> Option<(String, String)> {
+    let mut after_space = true;
+    for (at, ch) in text.char_indices() {
+        let word_here = after_space
+            && text[at..].starts_with("in")
+            && text[at + 2..].chars().next().is_none_or(char::is_whitespace);
+        if word_here {
+            return Some((text[..at].trim().to_string(), text[at + 2..].trim().to_string()));
+        }
+        after_space = ch.is_whitespace();
+    }
+    None
+}
+
+/// Splits `"Port scan" with target = host` at the `with`.
+///
+/// Quotes are respected, so a run called "Deal with it" is not cut in half.
+fn split_with(text: &str) -> (String, Option<String>) {
+    let mut quote: Option<char> = None;
+    let mut after_space = false;
+    for (at, ch) in text.char_indices() {
+        match quote {
+            Some(open) if ch == open => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if after_space
+                && text[at..].starts_with("with")
+                && text[at + 4..].chars().next().is_none_or(char::is_whitespace) =>
+            {
+                let settings = text[at + 4..].trim();
+                return (
+                    text[..at].trim().to_string(),
+                    (!settings.is_empty()).then(|| settings.to_string()),
+                );
+            }
+            None => {}
+        }
+        after_space = ch.is_whitespace();
+    }
+    (text.trim().to_string(), None)
+}
+
+/// `target = host, timeout = 5s` into the pairs it names.
+///
+/// Split on the commas that are not inside quotes or brackets, so a value may
+/// itself be an expression with a comma in it. Returns whatever it could read
+/// and the first part it could not.
+fn parse_with(text: &str) -> (Vec<(String, String)>, Option<String>) {
+    let mut out = Vec::new();
+    for part in split_commas(text) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((field, value)) = part.split_once('=') else {
+            return (out, Some(part.to_string()));
+        };
+        let field = field.trim();
+        let value = value.trim();
+        if field.is_empty()
+            || value.is_empty()
+            || !field.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            return (out, Some(part.to_string()));
+        }
+        out.push((field.to_string(), value.to_string()));
+    }
+    (out, None)
+}
+
+/// The commas that separate one setting from the next: the ones outside
+/// quotes, brackets and braces.
+fn split_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (at, ch) in text.char_indices() {
+        match quote {
+            Some(open) if ch == open => quote = None,
+            Some(_) => {}
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth <= 0 => {
+                    parts.push(&text[start..at]);
+                    start = at + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    parts.push(&text[start..]);
+    parts
 }
 
 /// A repeat has to stop: an unbounded one would be a way to hang the
@@ -491,8 +681,16 @@ fn write_block(out: &mut String, steps: &[Step], depth: usize) {
     let pad = "  ".repeat(depth);
     for step in steps {
         match step {
-            Step::Run { name, condition } => {
-                let _ = writeln!(out, "{pad}run {}{}", quoted(name), suffix(condition));
+            Step::Run { name, condition, with } => {
+                let settings = if with.is_empty() {
+                    String::new()
+                } else {
+                    let pairs: Vec<String> =
+                        with.iter().map(|(field, value)| format!("{field} = {value}")).collect();
+                    format!(" with {}", pairs.join(", "))
+                };
+                let _ =
+                    writeln!(out, "{pad}run {}{settings}{}", quoted(name), suffix(condition));
             }
             Step::Stop { condition } => {
                 let _ = writeln!(out, "{pad}stop{}", suffix(condition));
@@ -502,6 +700,9 @@ fn write_block(out: &mut String, steps: &[Step], depth: usize) {
             }
             Step::Set { name, value } => {
                 let _ = writeln!(out, "{pad}set {name} = {value}");
+            }
+            Step::Log { value } => {
+                let _ = writeln!(out, "{pad}print {value}");
             }
             Step::If { condition, then, otherwise } => {
                 let _ = writeln!(out, "{pad}if {condition} {{");
@@ -516,6 +717,16 @@ fn write_block(out: &mut String, steps: &[Step], depth: usize) {
             }
             Step::Repeat { times, body } => {
                 let _ = writeln!(out, "{pad}repeat {times} {{");
+                write_block(out, body, depth + 1);
+                let _ = writeln!(out, "{pad}}}");
+            }
+            Step::ForEach { name, over, body } => {
+                let _ = writeln!(out, "{pad}for each {name} in {over} {{");
+                write_block(out, body, depth + 1);
+                let _ = writeln!(out, "{pad}}}");
+            }
+            Step::While { condition, body } => {
+                let _ = writeln!(out, "{pad}while {condition} {{");
                 write_block(out, body, depth + 1);
                 let _ = writeln!(out, "{pad}}}");
             }
@@ -557,6 +768,35 @@ pub fn holds(condition: &str, source: &dyn crate::expr::Source) -> Result<bool, 
     crate::expr::run(condition, source).map(|value| value.truth())
 }
 
+/// What a `for each` walks over: an expression, as a list of items.
+///
+/// A list is itself; a column of a run is already a list; anything else is a
+/// list of one, so `for each x in Sweep.up` is a pass over the one figure
+/// rather than nothing at all. Nothing is no passes.
+pub fn items(expression: &str, source: &dyn crate::expr::Source) -> Result<Vec<String>, String> {
+    let value = crate::expr::run(expression, source)?;
+    Ok(match value {
+        crate::expr::Value::Nothing => Vec::new(),
+        crate::expr::Value::List(items) => {
+            items.iter().map(crate::expr::Value::show).collect()
+        }
+        crate::expr::Value::Table(table) => {
+            // A whole run walks its targets, which is the column anybody
+            // naming a run in a `for each` meant.
+            table.rows.iter().filter_map(|row| row.first().cloned()).collect()
+        }
+        one => vec![one.show()],
+    })
+}
+
+/// How many items one `for each` may walk.
+///
+/// A sweep of a /16 answers with tens of thousands of hosts, and a step that
+/// runs a tool for each of them is not a workflow anybody meant to write. The
+/// walk is cut here and the trail says so, rather than the window going away
+/// for an hour.
+pub const MOST_ITEMS: usize = 1_000;
+
 /// What a new workflow holds.
 pub fn starter(name: &str) -> Flow {
     Flow {
@@ -573,6 +813,115 @@ pub fn starter(name: &str) -> Flow {
 mod tests {
 
     #[test]
+    fn a_print_is_written_as_print_and_a_log_still_reads() {
+        // The step is called Print, so that is what the file says. Files
+        // written when it was called `log` still read, and are written back
+        // under the name it has now.
+        let flow = parse("log \"one\"\nprint \"two\"\n");
+        assert!(flow.problems.is_empty(), "{:?}", flow.problems);
+        assert_eq!(
+            flow.steps,
+            vec![
+                Step::Log { value: "\"one\"".into() },
+                Step::Log { value: "\"two\"".into() },
+            ]
+        );
+        assert_eq!(write(&flow), "print \"one\"\nprint \"two\"\n");
+    }
+
+    #[test]
+    fn a_walk_a_loop_a_note_and_a_run_with_fields_all_read_and_write_again() {
+        let source = concat!(
+            "for each host in Sweep.host {\n",
+            "  run \"Port scan\" with target = host, ports = \"1-1024\"\n",
+            "  print \"scanned \" + host\n",
+            "}\n",
+            "while Queue.json.depth > 0 {\n",
+            "  run Drain\n",
+            "}\n",
+        );
+        let flow = parse(source);
+        assert!(flow.problems.is_empty(), "{:?}", flow.problems);
+        assert!(!flow.lossy);
+
+        let Step::ForEach { name, over, body } = &flow.steps[0] else {
+            panic!("expected a walk, got {:?}", flow.steps[0])
+        };
+        assert_eq!(name, "host");
+        assert_eq!(over, "Sweep.host");
+        let Step::Run { name, with, .. } = &body[0] else { panic!("expected a run") };
+        assert_eq!(name, "Port scan");
+        assert_eq!(
+            with,
+            &[
+                ("target".to_string(), "host".to_string()),
+                ("ports".to_string(), "\"1-1024\"".to_string()),
+            ]
+        );
+        assert_eq!(body[1], Step::Log { value: "\"scanned \" + host".into() });
+
+        let Step::While { condition, .. } = &flow.steps[1] else { panic!("expected a while") };
+        assert_eq!(condition, "Queue.json.depth > 0");
+
+        // Written back exactly, so an edit elsewhere does not rewrite it.
+        assert_eq!(write(&flow), source);
+    }
+
+    #[test]
+    fn the_words_in_and_with_are_only_keywords_where_they_stand_alone() {
+        // A run called "Deal with it" is not cut in half at its `with`, and a
+        // list called `initial` is not read as an `in`.
+        let flow = parse("run \"Deal with it\"\n");
+        assert_eq!(
+            flow.steps,
+            vec![Step::Run {
+                name: "Deal with it".into(),
+                condition: None,
+                with: Vec::new()
+            }]
+        );
+
+        let flow = parse("for each x in initial {\n}\n");
+        let Step::ForEach { name, over, .. } = &flow.steps[0] else { panic!("a walk") };
+        assert_eq!((name.as_str(), over.as_str()), ("x", "initial"));
+    }
+
+    #[test]
+    fn a_setting_the_reader_cannot_make_sense_of_is_reported_and_left_alone() {
+        // In the file and not in the tree. Saying so is what stops the next
+        // edit writing the tree back over the line.
+        let flow = parse("run \"A\" with target\n");
+        assert!(flow.lossy, "{:?}", flow.problems);
+        assert!(!flow.problems.is_empty());
+        assert!(flow.steps.is_empty());
+    }
+
+    #[test]
+    fn a_value_with_a_comma_inside_it_is_still_one_setting() {
+        let flow = parse("run A with target = join(Sweep.host, \",\"), count = 2\n");
+        let Step::Run { with, .. } = &flow.steps[0] else { panic!("a run") };
+        assert_eq!(
+            with,
+            &[
+                ("target".to_string(), "join(Sweep.host, \",\")".to_string()),
+                ("count".to_string(), "2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_walk_and_a_loop_may_carry_a_condition_the_way_a_branch_does() {
+        // `if` after a `run` guards it; a `while` has its condition in front
+        // of the brace like an `if`, which is where anybody would write it.
+        let flow = parse("while Sweep.up > 0 {\n  run A if Sweep.ok\n}\n");
+        assert!(flow.problems.is_empty(), "{:?}", flow.problems);
+        let Step::While { condition, body } = &flow.steps[0] else { panic!("a while") };
+        assert_eq!(condition, "Sweep.up > 0");
+        let Step::Run { condition, .. } = &body[0] else { panic!("a run") };
+        assert_eq!(condition.as_deref(), Some("Sweep.ok"));
+    }
+
+    #[test]
     fn a_line_with_an_accent_in_it_is_read_and_not_fatal() {
         // The condition split used to step through the line a byte at a time,
         // so the first multi-byte character put the index inside a character
@@ -587,7 +936,7 @@ mod tests {
     use super::*;
 
     fn run(name: &str) -> Step {
-        Step::Run { name: name.into(), condition: None }
+        Step::Run { name: name.into(), condition: None, with: Vec::new() }
     }
 
     /// How deep the blocks inside blocks go.
@@ -606,7 +955,7 @@ mod tests {
         assert_eq!(flow.steps[0], run("Sweep"));
         assert_eq!(
             flow.steps[1],
-            Step::Run { name: "Port scan".into(), condition: Some("Sweep.up > 0".into()) }
+            Step::Run { name: "Port scan".into(), condition: Some("Sweep.up > 0".into()), with: Vec::new() }
         );
         assert!(flow.problems.is_empty(), "{:?}", flow.problems);
     }
@@ -844,7 +1193,7 @@ mod tests {
         let flow = parse("run A if not Sweep.ok\n");
         assert_eq!(
             flow.steps,
-            vec![Step::Run { name: "A".into(), condition: Some("not Sweep.ok".into()) }]
+            vec![Step::Run { name: "A".into(), condition: Some("not Sweep.ok".into()), with: Vec::new() }]
         );
         let written = write(&flow);
         assert!(written.contains("not Sweep.ok"), "written as:\n{written}");

@@ -25,7 +25,7 @@ pub struct Palette {
 impl Palette {
     pub fn new(cx: &mut Context<Self>) -> Palette {
         let input = cx.new(|cx| {
-            let mut input = TextInput::new(cx, "", "Search, or run a command");
+            let mut input = TextInput::new(cx, "", "Search, run a tool, or > for what ntls can do");
             input.mono = false;
             input
         });
@@ -325,7 +325,7 @@ mod tests {
     /// The search results a query would produce with nothing open, which is
     /// all these tests need: they are about the command line, not the search.
     fn hits(query: &str, registry: &Registry) -> Vec<crate::ui::search::Hit> {
-        crate::ui::search::search(query, registry, &[], 0, &[])
+        crate::ui::search::search(query, registry, &[], 0, &[], &[], &[])
     }
 
     fn suggest(query: &str, registry: &Registry) -> Suggest {

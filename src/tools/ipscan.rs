@@ -44,17 +44,17 @@ impl Tool for IpScan {
             iface_field(),
             Field::text("timeout", "Timeout", "How long to wait for each host to answer")
                 .default("1s")
-                .validate(Validator::Duration),
+                .validate(Validator::Duration).advanced(),
             Field::text(
                 "retries",
                 "Retries",
                 "Extra attempts before calling a host down; raise this on lossy networks",
             )
             .default("1")
-            .validate(Validator::IntRange(0, 10)),
+            .validate(Validator::IntRange(0, 10)).advanced(),
             Field::text("concurrency", "Concurrency", "Hosts probed at the same time")
                 .default("64")
-                .validate(Validator::IntRange(1, 4096)),
+                .validate(Validator::IntRange(1, 4096)).advanced(),
             Field::boolean(
                 "resolve",
                 "Resolve names",
@@ -72,7 +72,7 @@ impl Tool for IpScan {
                 "List silent hosts",
                 "Also add a row for every host that did not answer",
                 false,
-            ),
+            ).advanced(),
             Field::boolean(
                 "keep",
                 "Keep earlier results",

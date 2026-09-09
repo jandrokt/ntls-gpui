@@ -50,6 +50,7 @@ actions!(
         ShowWorkspaces,
         ShowTools,
         ToggleChart,
+        ToggleResponse,
         ToggleTheme,
         MoveUp,
         MoveDown,
@@ -103,6 +104,7 @@ pub fn bind_keys(cx: &mut GpuiApp) {
         KeyBinding::new(&crate::sys::shortcut("cmd-shift-o"), ShowWorkspaces, Some("Ntls")),
         KeyBinding::new(&crate::sys::shortcut("cmd-shift-e"), ShowTools, Some("Ntls")),
         KeyBinding::new(&crate::sys::shortcut("cmd-g"), ToggleChart, Some("Ntls")),
+        KeyBinding::new(&crate::sys::shortcut("cmd-shift-r"), ToggleResponse, Some("Ntls")),
         KeyBinding::new(&crate::sys::shortcut("cmd-d"), ToggleTheme, Some("Ntls")),
         // These four mean different things depending on what is open, so they
         // resolve to one action each and the handler decides.
@@ -263,6 +265,11 @@ pub struct App {
     /// What the application has to say for itself: runs that finished while
     /// you were elsewhere, and anything that went wrong.
     pub notices: super::notify::Notices,
+    /// What the command bar was last used for, newest first.
+    ///
+    /// Not written to disk: it is about the last few minutes, and a list
+    /// restored from last week would be worse than none.
+    pub recent: Vec<String>,
     /// The page in front of the workspace, if any. Unlike a view, a page takes
     /// the whole window, side bar and tabs included: what it is about does not
     /// live inside the workspace.
@@ -407,6 +414,18 @@ impl Page {
             Page::Settings => "gear",
         }
     }
+
+    /// A line about it, for the row that offers it.
+    pub fn about(self) -> &'static str {
+        match self {
+            Page::Variables => "what this workspace has written down",
+            Page::Interfaces => "the addresses and interfaces of this machine",
+            Page::Settings => "how ntls itself behaves",
+        }
+    }
+
+    /// Every page, for the one box that is supposed to reach everything.
+    pub const ALL: [Page; 3] = [Page::Variables, Page::Interfaces, Page::Settings];
 }
 
 /// Somewhere the rail goes. Views and pages are different things behind the
@@ -604,6 +623,47 @@ fn build_inputs(
         .collect()
 }
 
+/// One body editor per body field, and nothing for the rest.
+///
+/// The path is empty because a request body is not a file. `Editor::save`
+/// refuses an empty path, so the save key does nothing in one rather than
+/// writing a body into the working directory.
+fn build_bodies(
+    fields: &[crate::core::Field],
+    params: &Params,
+    cx: &mut Context<App>,
+) -> Vec<Option<Entity<super::editor::Editor>>> {
+    fields
+        .iter()
+        .map(|f| {
+            (f.kind == FieldKind::Code).then(|| {
+                let text = params.raw(f.key).to_string();
+                let language = body_language(f, params);
+                cx.new(|cx| {
+                    super::editor::Editor::new(cx, &text, std::path::PathBuf::new(), language)
+                })
+            })
+        })
+        .collect()
+}
+
+/// Which language a body field is written in, out of the field it takes its
+/// answer from.
+pub fn body_language(
+    field: &crate::core::Field,
+    params: &Params,
+) -> crate::ui::syntax::Language {
+    use crate::ui::syntax::Language;
+    let Some(key) = field.syntax_from else { return Language::Text };
+    match params.str(key).as_str() {
+        "json" => Language::Json,
+        "xml" => Language::Xml,
+        // A form body is `a=1&b=2`, which has no shape worth colouring, and
+        // plain text has none by definition.
+        _ => Language::Text,
+    }
+}
+
 fn new_filter_input(cx: &mut Context<App>) -> Entity<TextInput> {
     cx.new(|cx| {
         let mut input = TextInput::new(cx, "", "Filter results");
@@ -712,6 +772,7 @@ impl App {
             clearing: None,
             settings: saved,
             notices: super::notify::Notices::default(),
+            recent: Vec::new(),
             page: None,
             segment_from: std::collections::HashMap::new(),
             drop_hover: false,
@@ -782,7 +843,9 @@ impl App {
 
         let id = self.next_job_id;
         self.next_job_id += 1;
-        let mut job = Job::new(id, stem.to_string(), tool, params, inputs, filter_input);
+        let bodies = build_bodies(&fields, &params, cx);
+        let mut job =
+            Job::new(id, stem.to_string(), tool, params, inputs, bodies, filter_input);
         job.restore(record);
         Some(job)
     }
@@ -1150,10 +1213,12 @@ impl App {
         let inputs = build_inputs(&fields, &params, cx);
         let filter_input = new_filter_input(cx);
 
+        let bodies = build_bodies(&fields, &params, cx);
         let id = self.next_job_id;
         self.next_job_id += 1;
         let stem = self.workspace_mut().next_stem(tool.id());
-        self.workspace_mut().add(Job::new(id, stem, tool, params, inputs, filter_input));
+        self.workspace_mut()
+            .add(Job::new(id, stem, tool, params, inputs, bodies, filter_input));
 
         self.save_current();
         self.save_workspace(self.active);
@@ -1947,12 +2012,55 @@ impl App {
     /// Reads the form back out of its editors, so validation and the run see
     /// exactly what is on screen.
     pub fn collect_params(&mut self, cx: &mut GpuiApp) {
+        self.absorb_paste(cx);
         let Some(job) = self.selected_job_mut() else { return };
         let fields = job.tool.fields();
         for (i, field) in fields.iter().enumerate() {
             if let Some(Some(input)) = job.inputs.get(i) {
                 let value = input.read(cx).value().to_string();
                 job.params.set(field.key, &value);
+            }
+            // A body is read back the same way, so what is on screen is what
+            // gets sent without anybody having to press anything first.
+            if let Some(Some(body)) = job.bodies.get(i) {
+                let value = body.read(cx).text().to_string();
+                job.params.set(field.key, &value);
+            }
+        }
+    }
+
+    /// Spreads a whole request pasted into the target field across the form.
+    ///
+    /// Paste a `curl` line into the URL box and the form becomes that
+    /// request. Self-limiting: filling the fields rewrites the box with just
+    /// the URL, so what was recognised once is not recognised again, and
+    /// anything the tool does not know is left exactly as it was typed.
+    fn absorb_paste(&mut self, cx: &mut GpuiApp) {
+        let Some(job) = self.selected_job() else { return };
+        let Some(key) = job.tool.target_key() else { return };
+        let fields = job.tool.fields();
+        let Some(at) = fields.iter().position(|f| f.key == key) else { return };
+        let Some(Some(input)) = job.inputs.get(at) else { return };
+
+        let typed = input.read(cx).value().to_string();
+        // Cheap enough to ask on every edit: nearly every keystroke fails on
+        // the first word.
+        if !typed.trim_start().to_lowercase().starts_with("curl") {
+            return;
+        }
+        let Some(filling) = job.tool.absorb(&typed) else { return };
+
+        let id = job.id;
+        for (key, value) in filling {
+            let Some(at) = fields.iter().position(|f| f.key == key) else { continue };
+            let Some(job) = self.job_anywhere_mut(id) else { return };
+            job.params.set(key, &value);
+            let (input, body) = (job.inputs.get(at).cloned(), job.bodies.get(at).cloned());
+            if let Some(Some(input)) = input {
+                input.update(cx, |input, cx| input.set_value(&value, cx));
+            }
+            if let Some(Some(body)) = body {
+                body.update(cx, |body, cx| body.set_text(&value, cx));
             }
         }
     }
@@ -2272,7 +2380,65 @@ impl App {
 
     /// Everything matching what is in the palette.
     pub fn hits(&self, query: &str) -> Vec<super::search::Hit> {
-        super::search::search(query, &self.registry, &self.workspaces, self.active, &self.ifaces)
+        super::search::search(
+            query,
+            &self.registry,
+            &self.workspaces,
+            self.active,
+            &self.ifaces,
+            &super::command::all(&self.now()),
+            &self.recent,
+        )
+    }
+
+    /// What is true of the window right now, which decides which commands
+    /// are worth offering.
+    pub fn now(&self) -> super::command::Now {
+        let job = self.selected_job();
+        super::command::Now {
+            job: job.map(|j| j.id),
+            job_name: job.map(super::job::Job::name).unwrap_or_default(),
+            job_running: job.is_some_and(|j| j.state.is_running()),
+            job_has_answer: job.is_some_and(|j| j.answer.is_some()),
+            job_has_chart: job.is_some_and(|j| !j.charts.is_empty()),
+            showing: self.workspace().showing(),
+            doc_name: match self.workspace().showing() {
+                Some(super::workspace::Item::Doc(id)) => self
+                    .workspace()
+                    .doc(id)
+                    .map(|d| d.title(&super::notes::Data::of(self.workspace())))
+                    .unwrap_or_default(),
+                Some(super::workspace::Item::Flow(id)) => {
+                    self.workspace().flow(id).map(|f| f.title()).unwrap_or_default()
+                }
+                _ => String::new(),
+            },
+            flow_running: match self.workspace().showing() {
+                Some(super::workspace::Item::Flow(id)) => {
+                    self.workspace().flow(id).is_some_and(|f| f.running())
+                }
+                _ => false,
+            },
+            workspace: self.active,
+            workspaces: self.workspaces.len(),
+            workspace_name: self.workspace().name(),
+            sidebar_open: self.sidebar_open,
+            panel_open: self.panel_open,
+            notices: self.notices.unread(),
+        }
+    }
+
+    /// Remembers what the palette was used for, so it opens on what gets
+    /// used rather than on the tool list in registry order.
+    pub fn remember_choice(&mut self, hit: &super::search::Hit) {
+        /// How many are worth keeping. Long enough to cover a session's
+        /// habits, short enough that the empty list is still a short list.
+        const MOST: usize = 8;
+
+        let key = hit.key();
+        self.recent.retain(|held| *held != key);
+        self.recent.insert(0, key);
+        self.recent.truncate(MOST);
     }
 
     /// What the palette is offering for what is typed in it.
@@ -2313,11 +2479,20 @@ impl App {
         self.close_palette(window, cx);
 
         let Some(hit) = chosen else { return };
+        self.remember_choice(&hit);
+        // A recent answer is the answer it wraps, so it is taken by exactly
+        // the same path and not by a shorter one that skips the arguments.
+        let hit = match hit {
+            super::search::Hit::Recent(inner) => *inner,
+            hit => hit,
+        };
         let tool = match hit {
             super::search::Hit::Tool(tool) => tool,
             elsewhere => return self.reveal(elsewhere, window, cx),
         };
 
+        // A new tool is something to look at, and a page is in front of it.
+        self.page = None;
         let id = self.add_tool(tool, target, None, window, cx);
         if named.is_empty() && !run_it {
             return;
@@ -2348,6 +2523,14 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         use super::search::Hit;
+        // Every answer but a page is somewhere inside the workspace, and a
+        // page covers the whole window. Going to a run while Settings or
+        // This machine was open used to change the selection behind the page
+        // and leave the page up, so choosing from the search looked like it
+        // had done nothing at all.
+        if !matches!(hit, Hit::Page { .. } | Hit::Command(_)) {
+            self.page = None;
+        }
         match hit {
             Hit::Tool(tool) => {
                 self.add_tool(tool, None, None, window, cx);
@@ -2399,6 +2582,13 @@ impl App {
                 self.page = Some(Page::Interfaces);
                 let _ = name;
             }
+            Hit::Page { page, .. } => self.page = Some(page),
+            // A command is the one hit that does something rather than going
+            // somewhere.
+            Hit::Command(command) => self.choose(command.act, window, cx),
+            // Unwrapped before it gets here by whoever chose it, so that a
+            // recent answer takes the same path as the answer it wraps.
+            Hit::Recent(inner) => self.reveal(*inner, window, cx),
         }
         cx.notify();
     }
@@ -2458,7 +2648,8 @@ impl App {
                 let next = (at as isize + delta).rem_euclid(n) as usize;
                 job.params.set(field.key, &field.options[next].value);
             }
-            FieldKind::Text => {}
+            // Neither is a thing with a next value to step to.
+            FieldKind::Text | FieldKind::Code => {}
         }
         job.field_error = None;
         cx.notify();
@@ -2918,6 +3109,97 @@ impl App {
 
     /// Opens a menu at a point. Opening one closes whatever was open, since
     /// there is only ever one.
+    /// Carries out one of the commands that act on whatever is in front of
+    /// you, by dispatching the action its key is bound to.
+    fn do_global(
+        &mut self,
+        what: crate::ui::command::Global,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::command::Global;
+
+        let action: Box<dyn gpui::Action> = match what {
+            Global::Save => Box::new(Save),
+            Global::AddTool => Box::new(AddTool),
+            Global::ShowForm => Box::new(Settings),
+            Global::Properties => Box::new(ToggleProperties),
+            Global::FocusFilter => Box::new(FocusFilter),
+            Global::ToggleChart => Box::new(ToggleChart),
+            Global::ToggleResponse => Box::new(ToggleResponse),
+            Global::ShowWorkspaces => Box::new(ShowWorkspaces),
+            Global::ShowTools => Box::new(ShowTools),
+            Global::ShowNotices => Box::new(ShowNotices),
+            Global::NextWorkspace => Box::new(NextWorkspace),
+            Global::PrevWorkspace => Box::new(PrevWorkspace),
+            Global::Preferences => Box::new(Preferences),
+            Global::Quit => Box::new(Quit),
+            // These two have no key of their own.
+            Global::ShowVariables => {
+                self.page = Some(Page::Variables);
+                cx.notify();
+                return;
+            }
+            Global::ShowInterfaces => {
+                self.page = Some(Page::Interfaces);
+                cx.notify();
+                return;
+            }
+        };
+        window.dispatch_action(action, cx);
+    }
+
+    /// The editor for whatever is on screen, if its source is open.
+    pub fn showing_editor(&self) -> Option<gpui::Entity<crate::ui::editor::Editor>> {
+        let item = self.workspace().showing()?;
+        self.editor_for(item).cloned()
+    }
+
+    /// Shows or hides a document's preview while its source is open.
+    fn preview_of(&mut self, doc: usize) -> Option<&mut f32> {
+        self.workspace_mut().docs.iter_mut().find(|d| d.id == doc).map(|d| &mut d.preview)
+    }
+
+    pub fn toggle_doc_preview(&mut self, doc: usize, cx: &mut Context<Self>) {
+        let Some(preview) = self.preview_of(doc) else { return };
+        *preview = if *preview > 0. { 0. } else { crate::ui::notes::PREVIEW };
+        cx.notify();
+    }
+
+    /// Moves the edge between a document's source and its preview.
+    ///
+    /// Worked out from where the edge is now rather than from where the pane
+    /// begins, so nothing has to remember the pane's own position: the
+    /// distance the pointer is from the edge is the distance the edge should
+    /// move, and `source` says how many pixels a whole fraction is worth.
+    ///
+    /// Dragged past the point where the preview can still show a line of
+    /// prose it shuts instead of becoming a sliver, and the button puts it
+    /// back.
+    pub fn drag_doc_split(
+        &mut self,
+        doc: usize,
+        x: f32,
+        edge: gpui::Bounds<gpui::Pixels>,
+        source: f32,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::notes::{PREVIEW_LEAST, PREVIEW_MOST};
+
+        let Some(&split) = self.preview_of(doc).map(|p| &*p) else { return };
+        let taken = (1. - split).max(0.05);
+        let whole = source / taken;
+        if !whole.is_finite() || whole <= 1. {
+            return;
+        }
+        let centre = f32::from(edge.left()) + f32::from(edge.size.width) / 2.;
+        let moved = (x - centre) / whole;
+        let preview = split - moved;
+        let Some(held) = self.preview_of(doc) else { return };
+        *held = if preview < PREVIEW_LEAST { 0. } else { preview.min(PREVIEW_MOST) };
+        cx.notify();
+    }
+
     pub fn open_menu(
         &mut self,
         at: gpui::Point<gpui::Pixels>,
@@ -3032,6 +3314,35 @@ impl App {
             Act::NewDoc => self.new_document(window, cx),
             Act::NewFlow => self.new_workflow(window, cx),
 
+            // The source of whichever document or workflow is on screen.
+            // Menu entries and toolbar buttons do the same thing, and both
+            // hand focus back so typing carries on where it left off.
+            Act::Format(what) => {
+                if let Some(editor) = self.showing_editor() {
+                    editor.update(cx, |editor, cx| {
+                        editor.markup(what, cx);
+                        window.focus(&editor.focus_handle);
+                    });
+                }
+            }
+            Act::CutSelection
+            | Act::CopySelection
+            | Act::PasteSelection
+            | Act::SelectAllText => {
+                if let Some(editor) = self.showing_editor() {
+                    window.focus(&editor.read(cx).focus_handle);
+                    editor.update(cx, |editor, cx| {
+                        use crate::ui::editor::{Copy, Cut, Paste, SelectAll};
+                        match act {
+                            Act::CutSelection => editor.cut(&Cut, window, cx),
+                            Act::CopySelection => editor.copy(&Copy, window, cx),
+                            Act::PasteSelection => editor.paste(&Paste, window, cx),
+                            _ => editor.select_all(&SelectAll, window, cx),
+                        }
+                    });
+                }
+            }
+
             Act::OpenDoc(id) => self.select_doc(id, cx),
             Act::EditDoc(id) => self.edit_doc(id, cx),
             Act::CloseDocTab(id) => self.close_doc_tab(id, cx),
@@ -3069,6 +3380,11 @@ impl App {
             Act::TogglePanel => self.toggle_panel(cx),
             Act::ToggleTheme => self.toggle_theme(cx),
             Act::OpenPalette => self.open_palette(window, cx),
+
+            // The key and the menu item already do these, so the palette
+            // sends the very same action rather than carrying a second copy
+            // of each that could drift from it.
+            Act::Global(what) => self.do_global(what, window, cx),
         }
         cx.notify();
     }
@@ -3661,16 +3977,19 @@ impl App {
             Some((flow, spot, step))
         });
 
-        // The name of a `set` step is the one thing with a box of its own.
+        // A `set` and a `for each` both name something, and that name is the
+        // one thing with a box of its own.
         match &selected {
-            Some((flow, spot, Step::Set { name, .. })) => {
+            Some((flow, spot, Step::Set { name, .. } | Step::ForEach { name, .. })) => {
                 self.sync_step_name(*flow, spot.clone(), name.clone(), cx)
             }
             _ => self.step_name_for = None,
         }
 
         let here = selected.and_then(|(flow, spot, step)| match &step {
-            Step::Set { value, .. } => Some((flow, spot, value.clone())),
+            Step::Set { value, .. }
+            | Step::ForEach { over: value, .. }
+            | Step::Log { value } => Some((flow, spot, value.clone())),
             step if takes_a_condition(step) => {
                 let guide = Guide::read_partial(condition_of(step)).unwrap_or_default();
                 Some((flow, spot, guide.value))
@@ -3682,11 +4001,13 @@ impl App {
             self.step_value_for = None;
             return;
         };
-        let is_set = self
-            .workspace()
-            .flow(flow)
-            .and_then(|f| f.selected())
-            .is_some_and(|(_, step)| matches!(step, Step::Set { .. }));
+        // Whether the box holds the step's own value or the right-hand side
+        // of a condition being built, which are written back differently.
+        let is_set = self.workspace().flow(flow).and_then(|f| f.selected()).is_some_and(
+            |(_, step)| {
+                matches!(step, Step::Set { .. } | Step::ForEach { .. } | Step::Log { .. })
+            },
+        );
 
         // A different step means the box is about something else, so it is
         // filled in from that step, not read as a change to it.
@@ -3748,6 +4069,11 @@ impl App {
         let steps = crate::flow::parse(&sheet.source).steps;
         sheet.trail.clear();
         sheet.busy = None;
+        // Whatever the last run was inside, said, or was part-way through is
+        // nothing to do with this one.
+        sheet.printed.clear();
+        sheet.bindings.clear();
+        sheet.say(None, "started".into(), false);
         sheet.machine = Some(crate::flow::compile::Machine::new(&steps));
         self.select_flow(id, cx);
         self.advance_flow(id, window, cx);
@@ -3791,6 +4117,59 @@ impl App {
         self.active = showing;
     }
 
+    /// Puts a step's `with` settings into the tool before it runs.
+    ///
+    /// Both the field and what is on screen for it: a run reads its fields
+    /// back off the form on the way out, so setting only the field would
+    /// have the form put the old value straight back. The tool keeps what it
+    /// was last run with, which is what makes its results and its form agree
+    /// afterwards.
+    fn apply_overrides(
+        &mut self,
+        job: usize,
+        with: &[(String, String)],
+        data: &dyn crate::expr::Source,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        // Worked out first, so a mistake in the third one does not leave the
+        // tool half-set.
+        let mut settings = Vec::with_capacity(with.len());
+        for (field, expression) in with {
+            let value = crate::expr::run(expression, data)
+                .map(|v| v.show())
+                .map_err(|why| format!("{field}: {why}"))?;
+            settings.push((field.clone(), value));
+        }
+
+        let Some(job) = self.workspace_mut().jobs.iter_mut().find(|j| j.id == job) else {
+            return Err("the tool is no longer here".into());
+        };
+        let fields = job.tool.fields();
+        let mut edits = Vec::new();
+        for (name, value) in settings {
+            let Some(at) = fields.iter().position(|f| f.key.eq_ignore_ascii_case(&name)) else {
+                let known: Vec<&str> = fields.iter().map(|f| f.key).collect();
+                return Err(format!(
+                    "{} has no field called {name}; it has {}",
+                    job.tool.id(),
+                    known.join(", ")
+                ));
+            };
+            job.params.set(fields[at].key, &value);
+            edits.push((at, value));
+        }
+        // The boxes on the form, so what it shows is what just ran.
+        for (at, value) in edits {
+            if let Some(Some(input)) = job.inputs.get(at) {
+                input.update(cx, |input, cx| input.set_value(&value, cx));
+            }
+            if let Some(Some(body)) = job.bodies.get(at) {
+                body.update(cx, |body, cx| body.set_text(&value, cx));
+            }
+        }
+        Ok(())
+    }
+
     /// Works through a workflow until it has to wait for something.
     ///
     /// Every condition is decided when it is reached, not when the workflow
@@ -3801,13 +4180,20 @@ impl App {
         use super::flows::{Busy, Mark, Outcome};
 
         loop {
-            let data = super::notes::Snapshot::of(self.workspace());
-            let mut truth = |condition: &str| crate::flow::holds(condition, &data);
+            // What the walks it is inside are on, which every condition,
+            // value and setting below them can name.
+            let bindings = self
+                .workspace()
+                .flow(id)
+                .map(|sheet| sheet.bindings.clone())
+                .unwrap_or_default();
+            let data = super::notes::Snapshot::inside(self.workspace(), &bindings);
+            let mut asking = Asking(&data);
 
             let Some(sheet) = self.workspace_mut().flow_mut(id) else { return };
             let Some(machine) = sheet.machine.as_mut() else { return };
 
-            match machine.next(&mut truth) {
+            match machine.next(&mut asking) {
                 Event::Skipped { step, why } => {
                     sheet.trail.push(Mark { step, outcome: Outcome::Skipped(why) });
                 }
@@ -3852,6 +4238,43 @@ impl App {
                     }
                     cx.notify();
                 }
+                // Each pass of a `for each` puts the item under its name
+                // before the body runs, so a condition, a `set` or a tool's
+                // own field can read it the same way it reads anything else.
+                Event::Each { step, name, value, at, of } => {
+                    let shown = crate::ui::complete::preview(&crate::expr::Value::Text(
+                        value.clone(),
+                    ));
+                    sheet.trail.push(Mark {
+                        step,
+                        outcome: Outcome::Set(format!("{name} = {shown} ({at} of {of})")),
+                    });
+                    // The item came out of a list that may hold objects, and
+                    // it reached here as the text that object writes as. Read
+                    // back, so the body of the walk can ask it for a field
+                    // rather than only for the whole of it. Anything that is
+                    // not JSON is the text it is: a host is a host.
+                    let item = crate::expr::Value::from_json(&value)
+                        .unwrap_or(crate::expr::Value::Text(value));
+                    // Innermost last, and one entry per name: going round
+                    // again replaces the item rather than stacking another.
+                    match sheet.bindings.iter_mut().find(|(key, _)| *key == name) {
+                        Some((_, held)) => *held = item,
+                        None => sheet.bindings.push((name, item)),
+                    }
+                    cx.notify();
+                }
+                // A note in the trail and nothing else: what a workflow says
+                // about itself while it runs.
+                Event::Logged { step, value } => {
+                    let (said, bad) = match crate::expr::run(&value, &data) {
+                        Ok(value) => (value.show(), false),
+                        Err(why) => (why.to_string(), true),
+                    };
+                    sheet.trail.push(Mark { step, outcome: Outcome::Said(said.clone()) });
+                    sheet.say(Some(step), said, bad);
+                    cx.notify();
+                }
                 Event::Wait { step, seconds } => {
                     let at = std::time::Instant::now()
                         + std::time::Duration::from_secs_f64(seconds.clamp(0., 3600.));
@@ -3863,6 +4286,7 @@ impl App {
                 }
                 Event::Stopped { step } => {
                     sheet.trail.push(Mark { step, outcome: Outcome::Done });
+                    sheet.say(None, "stopped".into(), false);
                     sheet.machine = None;
                     sheet.busy = None;
                     cx.notify();
@@ -3872,6 +4296,7 @@ impl App {
                 // workflow which was never going to come back, so it is shown
                 // as having failed at the step it was on, and not as done.
                 Event::Failed { step, why } => {
+                    sheet.say(Some(step), format!("gave up: {why}"), true);
                     sheet.trail.push(Mark { step, outcome: Outcome::Failed(why) });
                     sheet.machine = None;
                     sheet.busy = None;
@@ -3879,18 +4304,18 @@ impl App {
                     return;
                 }
                 Event::Finished => {
+                    sheet.say(None, "finished".into(), false);
                     sheet.machine = None;
                     sheet.busy = None;
                     cx.notify();
                     return;
                 }
-                Event::Run { step, name } => {
+                Event::Run { step, name, with } => {
                     let Some(job) = self.workspace().job_named(&name).map(|j| j.id) else {
                         let Some(sheet) = self.workspace_mut().flow_mut(id) else { return };
-                        sheet.trail.push(Mark {
-                            step,
-                            outcome: Outcome::Failed(format!("nothing here is called {name}")),
-                        });
+                        let why = format!("nothing here is called {name}");
+                        sheet.say(Some(step), why.clone(), true);
+                        sheet.trail.push(Mark { step, outcome: Outcome::Failed(why) });
                         // A step naming a tool that is not here is a mistake in
                         // the workflow, not a result: stop, do not carry on
                         // as if it had happened.
@@ -3906,6 +4331,22 @@ impl App {
                         sheet.busy = Some(Busy::Run { step, job });
                     }
                     self.select_job(job, cx);
+                    // Whatever the step said to set, worked out now and put
+                    // into the tool before it goes. A field that does not
+                    // exist, or a value that cannot be worked out, stops the
+                    // workflow: running the tool as it happened to be left
+                    // would be doing something other than what was asked.
+                    if !with.is_empty()
+                        && let Err(why) = self.apply_overrides(job, &with, &data, cx)
+                    {
+                        let Some(sheet) = self.workspace_mut().flow_mut(id) else { return };
+                        sheet.say(Some(step), why.clone(), true);
+                        sheet.trail.push(Mark { step, outcome: Outcome::Failed(why) });
+                        sheet.machine = None;
+                        sheet.busy = None;
+                        cx.notify();
+                        return;
+                    }
                     self.run_selected(window, cx);
                     self.workspace_mut().select_flow(id);
                     cx.notify();
@@ -4888,6 +5329,25 @@ fn spawn_tick(cx: &mut Context<App>) -> gpui::Task<()> {
     })
 }
 
+/// What a running workflow's machine asks, answered from a snapshot of the
+/// workspace.
+///
+/// The machine knows nothing about expressions on purpose, so this is the one
+/// place the two meet.
+struct Asking<'a>(&'a super::notes::Snapshot);
+
+impl crate::flow::compile::Ask for Asking<'_> {
+    fn truth(&mut self, condition: &str) -> Result<bool, String> {
+        crate::flow::holds(condition, self.0)
+    }
+
+    fn list(&mut self, expression: &str) -> Result<Vec<String>, String> {
+        let mut items = crate::flow::items(expression, self.0)?;
+        items.truncate(crate::flow::MOST_ITEMS);
+        Ok(items)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4909,6 +5369,7 @@ mod tests {
             folder: None,
             seen: None,
             scroll: gpui::ScrollHandle::new(),
+            preview: crate::ui::notes::PREVIEW,
         }
     }
 
@@ -4923,6 +5384,9 @@ mod tests {
             seen: None,
             trail: Vec::new(),
             machine: None,
+            printed: Vec::new(),
+            log_open: false,
+            bindings: Vec::new(),
             busy: None,
             scroll: gpui::ScrollHandle::new(),
             cursor: None,

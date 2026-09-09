@@ -355,8 +355,8 @@ fn variable_row(
                         div()
                             .id("var-formula")
                             .flex()
-                            .flex_1()
                             .min_w_0()
+                            .max_w(px(420.))
                             .items_baseline()
                             .gap(px(4.))
                             .mono()
@@ -372,8 +372,8 @@ fn variable_row(
                     } else {
                         div()
                             .id("var-under")
-                            .flex_1()
                             .min_w_0()
+                            .max_w(px(420.))
                             .text_meta()
                             .text_color(theme.faint)
                             .truncate()
@@ -394,7 +394,12 @@ fn variable_row(
                                 .truncate()
                                 .child(under_right),
                         )
-                    }),
+                    })
+                    // Whatever is left over goes after both of them, so who
+                    // set it sits under the value it set rather than out at
+                    // the far edge of the window with a hand's width of
+                    // nothing between.
+                    .child(div().flex_1()),
             )
         })
         .into_any_element()

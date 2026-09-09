@@ -102,9 +102,14 @@ impl Segments {
                     .h(px(22.))
                     .px(px(space::TIGHT))
                     .text_small()
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .text_ellipsis()
+                    // `truncate` and not the three styles it stands for:
+                    // setting them by hand left the label drawing at its full
+                    // width and running into its neighbour, so a row of seven
+                    // choices in a narrow box read as one word of nonsense.
+                    // A choice too narrow to read is still a poor choice, and
+                    // that is what `Field::wide` is for, but no arrangement
+                    // of them should ever overlap.
+                    .truncate()
                     .cursor_pointer()
                     .text_color(if i == current { theme.on_accent } else { theme.dim })
                     .when(i != current, |d| d.hover(|s| s.text_color(theme.text)))
@@ -301,7 +306,12 @@ pub fn figure(label: &str, value: &str, theme: &Theme, accent: Option<Hsla>) -> 
     div()
         .flex()
         .flex_col()
-        .min_w(px(52.))
+        // A floor wide enough that a row of figures reads as a row of
+        // columns. At 52 a wide value like `254/254` pushed its neighbour
+        // along and the strip came out ragged, which is the one thing a line
+        // of summary numbers should not be. Not wider: seven figures still
+        // have to fit the pane at the narrowest the window opens to.
+        .min_w(px(64.))
         .child(
             div()
                 .mono()
@@ -367,6 +377,9 @@ pub enum Kind {
     Ghost,
     /// A borderless word that stays lit while whatever it controls is on.
     Toggle(bool),
+    /// One of several sitting inside a [`bar`]: the same toggle, without a
+    /// frame of its own, because the bar around it is the frame.
+    Tab(bool),
 }
 
 /// A clickable button. The caller attaches the handler, since only it knows
@@ -385,6 +398,8 @@ pub fn button(
         Kind::Ghost => (transparent, theme.dim, transparent),
         Kind::Toggle(true) => (theme.accent_soft, theme.accent, transparent),
         Kind::Toggle(false) => (transparent, theme.dim, transparent),
+        Kind::Tab(true) => (theme.bg, theme.text, transparent),
+        Kind::Tab(false) => (transparent, theme.dim, transparent),
     };
     let hover_bg = match kind {
         Kind::Primary => theme.accent.opacity(0.86),
@@ -392,6 +407,7 @@ pub fn button(
         _ => theme.hover.blend(bg),
     };
 
+    let inside = matches!(kind, Kind::Tab(_));
     div()
         .id(id.into())
         .flex()
@@ -399,11 +415,10 @@ pub fn button(
         .justify_center()
         .gap(px(6.))
         .px(px(10.))
-        .h(px(26.))
-        .rounded(px(6.))
+        .h(px(if inside { 22. } else { 26. }))
+        .rounded(px(if inside { 5. } else { 6. }))
         .bg(bg)
-        .border_1()
-        .border_color(border)
+        .when(!inside, |d| d.border_1().border_color(border))
         .text_small()
         .font_weight(FontWeight::MEDIUM)
         .text_color(fg)
@@ -412,6 +427,26 @@ pub fn button(
         .hover(move |s| s.bg(hover_bg))
         .active(|s| s.opacity(0.7))
         .child(label.into())
+}
+
+/// The frame around a row of [`Kind::Tab`] buttons.
+///
+/// Four toggles side by side with nothing around them read as four loose
+/// words, not as one control with one of its choices lit: the only thing
+/// telling you they belong together was that they happened to be adjacent.
+/// The frame is what says "pick one of these", and it is what the lit one is
+/// lit against.
+pub fn bar(theme: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(1.))
+        .flex_shrink_0()
+        .p(px(2.))
+        .rounded(px(7.))
+        .bg(theme.raised)
+        .border_1()
+        .border_color(theme.border)
 }
 
 /// A borderless square button holding one icon.

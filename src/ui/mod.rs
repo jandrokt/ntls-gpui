@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod chart;
+pub mod command;
 pub mod complete;
 pub mod diff;
 pub mod editor;

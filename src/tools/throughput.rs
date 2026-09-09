@@ -77,10 +77,10 @@ impl Tool for Throughput {
             Field::text("duration", "Duration", "How long to run each direction")
                 .default("8s")
                 .validate(Validator::Duration)
-                .visible_if(VisibleIf::Equals("role", ROLE_CLIENT)),
+                .visible_if(VisibleIf::Equals("role", ROLE_CLIENT)).advanced(),
             Field::text("port", "Port", "The port the listening side uses; both machines must agree")
                 .default(&lanspeed::DEFAULT_PORT.to_string())
-                .validate(Validator::IntRange(1, 65535)),
+                .validate(Validator::IntRange(1, 65535)).advanced(),
             iface_field(),
         ]
     }

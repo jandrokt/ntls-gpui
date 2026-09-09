@@ -16,8 +16,8 @@ use super::Step;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Op {
-    /// Start this run, and wait for it.
-    Run(String),
+    /// Start this run, and wait for it, having first set these of its fields.
+    Run { name: String, with: Vec<(String, String)> },
     /// If the condition is false, jump; otherwise carry on.
     Check { condition: String, otherwise: usize },
     Jump(usize),
@@ -25,9 +25,16 @@ pub enum Op {
     Enter { times: usize, end: usize },
     /// End of a loop: go round again, or drop the counter and carry on.
     Again { start: usize },
+    /// Begin a walk over a list: work the expression out, and either jump
+    /// past the body or take the first item.
+    Each { name: String, over: String, end: usize },
+    /// End of a walk: take the next item, or drop the list and carry on.
+    Step { start: usize },
     Wait(f64),
     /// Work out an expression and keep the answer under a name.
     Set { name: String, value: String },
+    /// Work out an expression and say what it came to, changing nothing.
+    Log(String),
     Halt,
 }
 
@@ -42,8 +49,15 @@ pub struct Line {
 /// What the machine needs the caller to do, or what it just did.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Event {
-    /// Start this run and call [`Machine::resume`] when it finishes.
-    Run { step: usize, name: String },
+    /// Start this run and call [`Machine::resume`] when it finishes. `with`
+    /// names the fields to set first, each to whatever its expression comes
+    /// to; the caller works those out, the same way it answers a condition.
+    Run { step: usize, name: String, with: Vec<(String, String)> },
+    /// A walk over a list reached its next item. Keep it under this name,
+    /// then carry on. `at` and `of` are which one it is, for the trail.
+    Each { step: usize, name: String, value: String, at: usize, of: usize },
+    /// Work this out and put it in the trail.
+    Logged { step: usize, value: String },
     /// Pause, then carry on.
     Wait { step: usize, seconds: f64 },
     /// Work this out and keep it under this name, then carry on. The caller
@@ -69,13 +83,34 @@ pub enum Event {
 /// than any workflow that stops to run something ever gets.
 const MOST_OPERATIONS: usize = 1_000_000;
 
+/// What the machine cannot work out for itself.
+///
+/// Nothing in this module knows what a run is or how to read an expression,
+/// so the caller answers both and the whole machine can be tested without a
+/// window.
+pub trait Ask {
+    /// Whether a condition holds.
+    fn truth(&mut self, condition: &str) -> Result<bool, String>;
+    /// What a list comes to, one item per entry.
+    fn list(&mut self, expression: &str) -> Result<Vec<String>, String>;
+}
+
+/// One loop that is open, and how far through it the machine is.
+#[derive(Clone, Debug)]
+enum Frame {
+    /// A `repeat`, and how many passes are left.
+    Times(usize),
+    /// A `for each`, the items it is walking, and which one it is on.
+    Each { items: Vec<String>, at: usize },
+}
+
 /// A workflow part-way through.
 #[derive(Clone, Debug)]
 pub struct Machine {
     program: Vec<Line>,
     pc: usize,
-    /// How many passes each open loop has left.
-    counters: Vec<usize>,
+    /// The open loops, innermost last.
+    frames: Vec<Frame>,
     /// How many operations are left before it is given up on. For the whole
     /// run and not for one call, since a loop going round for ever goes round
     /// across as many calls as the caller cares to make.
@@ -88,7 +123,7 @@ impl Machine {
         Machine {
             program: compile(steps),
             pc: 0,
-            counters: Vec::new(),
+            frames: Vec::new(),
             operations_left: MOST_OPERATIONS,
             done: false,
         }
@@ -96,11 +131,13 @@ impl Machine {
 
     /// Works forward until something has to happen outside the machine.
     ///
-    /// `truth` answers a condition. It may fail, since a condition can name a
-    /// run that has not been done, and a condition that cannot be answered is
-    /// treated as false instead of as a reason to stop, since the step it
-    /// guards is exactly the step that should not run.
-    pub fn next(&mut self, truth: &mut impl FnMut(&str) -> Result<bool, String>) -> Event {
+    /// `ask` answers the questions this cannot: whether a condition holds,
+    /// and what a list comes to. Both may fail, since either can name a run
+    /// that has not been done. A condition that cannot be answered is treated
+    /// as false rather than as a reason to stop, since the step it guards is
+    /// exactly the step that should not run; a list that cannot be worked out
+    /// is treated as empty, for the same reason.
+    pub fn next(&mut self, ask: &mut impl Ask) -> Event {
         loop {
             if self.done {
                 return Event::Finished;
@@ -130,7 +167,8 @@ impl Machine {
             self.operations_left -= 1;
 
             match line.op {
-                Op::Run(name) => return Event::Run { step: line.step, name },
+                Op::Run { name, with } => return Event::Run { step: line.step, name, with },
+                Op::Log(value) => return Event::Logged { step: line.step, value },
                 Op::Wait(seconds) => return Event::Wait { step: line.step, seconds },
                 Op::Set { name, value } => return Event::Set { step: line.step, name, value },
                 Op::Halt => {
@@ -149,9 +187,9 @@ impl Machine {
                     // and then ran B. The trail said a step had not happened
                     // while the workflow was doing it.
                     let guards = self.program.get(self.pc).is_some_and(|l| {
-                        l.step == line.step && matches!(l.op, Op::Run(_) | Op::Halt)
+                        l.step == line.step && matches!(l.op, Op::Run { .. } | Op::Halt)
                     });
-                    match truth(&condition) {
+                    match ask.truth(&condition) {
                         Ok(true) => {}
                         Ok(false) => {
                             self.pc = otherwise;
@@ -173,18 +211,56 @@ impl Machine {
                     if times == 0 {
                         self.pc = end;
                     } else {
-                        self.counters.push(times);
+                        self.frames.push(Frame::Times(times));
                     }
                 }
-                Op::Again { start } => match self.counters.last_mut() {
-                    Some(1) | None => {
-                        self.counters.pop();
+                Op::Again { start } => match self.frames.last_mut() {
+                    Some(Frame::Times(1)) | None => {
+                        self.frames.pop();
                     }
-                    Some(left) => {
+                    Some(Frame::Times(left)) => {
                         *left -= 1;
                         self.pc = start + 1;
                     }
+                    // A `for each` closes with its own operation, so a frame
+                    // of the other kind here is a compiler fault, not a
+                    // workflow's. Dropping it is what keeps the stack honest.
+                    Some(Frame::Each { .. }) => {
+                        self.frames.pop();
+                    }
                 },
+                Op::Each { name, over, end } => {
+                    // A list that cannot be worked out is an empty one, for
+                    // the same reason an unanswerable condition is false: the
+                    // body is exactly what should not happen.
+                    let items = ask.list(&over).unwrap_or_default();
+                    let of = items.len();
+                    let Some(first) = items.first().cloned() else {
+                        self.pc = end;
+                        continue;
+                    };
+                    self.frames.push(Frame::Each { items, at: 0 });
+                    return Event::Each { step: line.step, name, value: first, at: 1, of };
+                }
+                Op::Step { start } => {
+                    let Some(Frame::Each { items, at }) = self.frames.last_mut() else {
+                        self.frames.pop();
+                        continue;
+                    };
+                    *at += 1;
+                    let Some(value) = items.get(*at).cloned() else {
+                        self.frames.pop();
+                        continue;
+                    };
+                    let (at, of) = (*at + 1, items.len());
+                    // The name is on the operation that opened the loop.
+                    let name = match &self.program[start].op {
+                        Op::Each { name, .. } => name.clone(),
+                        _ => String::new(),
+                    };
+                    self.pc = start + 1;
+                    return Event::Each { step: line.step, name, value, at, of };
+                }
             }
         }
     }
@@ -214,9 +290,12 @@ fn emit(steps: &[Step], out: &mut Vec<Line>, id: &mut usize) {
         *id += 1;
 
         match step {
-            Step::Run { name, condition } => {
+            Step::Run { name, condition, with } => {
                 let check = guard(out, me, condition);
-                out.push(Line { op: Op::Run(name.clone()), step: me });
+                out.push(Line {
+                    op: Op::Run { name: name.clone(), with: with.clone() },
+                    step: me,
+                });
                 land(out, check);
             }
             Step::Stop { condition } => {
@@ -225,6 +304,9 @@ fn emit(steps: &[Step], out: &mut Vec<Line>, id: &mut usize) {
                 land(out, check);
             }
             Step::Wait { seconds } => out.push(Line { op: Op::Wait(*seconds), step: me }),
+            Step::Log { value } => {
+                out.push(Line { op: Op::Log(value.clone()), step: me });
+            }
             Step::Set { name, value } => out.push(Line {
                 op: Op::Set { name: name.clone(), value: value.clone() },
                 step: me,
@@ -256,6 +338,33 @@ fn emit(steps: &[Step], out: &mut Vec<Line>, id: &mut usize) {
                 let end = out.len();
                 out[enter].op = Op::Enter { times: *times, end };
             }
+            Step::ForEach { name, over, body } => {
+                let each = out.len();
+                out.push(Line {
+                    op: Op::Each { name: name.clone(), over: over.clone(), end: 0 },
+                    step: me,
+                });
+                emit(body, out, id);
+                out.push(Line { op: Op::Step { start: each }, step: me });
+                let end = out.len();
+                out[each].op =
+                    Op::Each { name: name.clone(), over: over.clone(), end };
+            }
+            // A `while` needs no frame: the check at the top and the jump
+            // back at the bottom are the whole of it. What stops one that
+            // never comes false is the operation budget, the same thing that
+            // stops a nest of repeats.
+            Step::While { condition, body } => {
+                let check = out.len();
+                out.push(Line {
+                    op: Op::Check { condition: condition.clone(), otherwise: 0 },
+                    step: me,
+                });
+                emit(body, out, id);
+                out.push(Line { op: Op::Jump(check), step: me });
+                let end = out.len();
+                out[check].op = Op::Check { condition: condition.clone(), otherwise: end };
+            }
         }
     }
 }
@@ -280,25 +389,209 @@ mod tests {
     use super::*;
     use crate::flow::parse;
 
+    #[test]
+    fn a_walk_over_a_list_runs_its_body_once_for_each_item() {
+        let seen = traced(
+            "for each host in Sweep.host {\n  run \"Port scan\"\n}\nrun \"Report\"\n",
+            &[],
+            &[("Sweep.host", &["10.0.0.1", "10.0.0.2", "10.0.0.3"])],
+        );
+        assert_eq!(
+            seen,
+            vec![
+                "each host = 10.0.0.1 (1/3)",
+                "run Port scan",
+                "each host = 10.0.0.2 (2/3)",
+                "run Port scan",
+                "each host = 10.0.0.3 (3/3)",
+                "run Port scan",
+                "run Report",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_walk_over_nothing_does_nothing_and_carries_on() {
+        // An empty list is not a reason to stop: the sweep found nothing, so
+        // there is nothing to scan, and the step after it still happens.
+        let seen = traced(
+            "for each host in Sweep.host {\n  run \"Port scan\"\n}\nrun \"Report\"\n",
+            &[],
+            &[("Sweep.host", &[])],
+        );
+        assert_eq!(seen, vec!["run Report"]);
+
+        // And a list that cannot be worked out at all is an empty one, the
+        // same way a condition that cannot be answered is false.
+        let seen = traced(
+            "for each host in Nowhere.host {\n  run \"Port scan\"\n}\nrun \"Report\"\n",
+            &[],
+            &[],
+        );
+        assert_eq!(seen, vec!["run Report"]);
+    }
+
+    #[test]
+    fn walks_inside_walks_keep_their_own_places() {
+        let seen = traced(
+            "for each a in As {\n  for each b in Bs {\n    run \"X\"\n  }\n}\n",
+            &[],
+            &[("As", &["1", "2"]), ("Bs", &["x", "y"])],
+        );
+        assert_eq!(
+            seen,
+            vec![
+                "each a = 1 (1/2)",
+                "each b = x (1/2)",
+                "run X",
+                "each b = y (2/2)",
+                "run X",
+                "each a = 2 (2/2)",
+                "each b = x (1/2)",
+                "run X",
+                "each b = y (2/2)",
+                "run X",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_while_goes_round_until_its_condition_comes_false() {
+        // Answered true four times and then false, which is the shape of
+        // waiting for something to come up.
+        let flow = parse("while Queue.busy {\n  run \"Drain\"\n}\nrun \"Done\"\n");
+        let mut machine = Machine::new(&flow.steps);
+        let mut left = 3;
+        struct Countdown<'a>(&'a mut i32);
+        impl Ask for Countdown<'_> {
+            fn truth(&mut self, _: &str) -> Result<bool, String> {
+                *self.0 -= 1;
+                Ok(*self.0 >= 0)
+            }
+            fn list(&mut self, _: &str) -> Result<Vec<String>, String> {
+                Ok(Vec::new())
+            }
+        }
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            match machine.next(&mut Countdown(&mut left)) {
+                Event::Run { name, .. } => {
+                    seen.push(name);
+                    machine.resume(true);
+                }
+                Event::Finished => break,
+                _ => {}
+            }
+        }
+        assert_eq!(seen, vec!["Drain", "Drain", "Drain", "Done"]);
+    }
+
+    #[test]
+    fn a_while_that_never_comes_false_is_given_up_on_rather_than_hanging() {
+        // The one thing a condition-driven loop can do that a counted one
+        // cannot. A body that asks the caller for nothing spins entirely
+        // inside one call to `next`, which is made from the click that
+        // started the workflow, on the thread that draws the window: without
+        // a budget the application is simply gone. It has to end somewhere,
+        // and the trail has to say so rather than showing it as done.
+        let flow = parse("while always {\n}\n");
+        assert!(flow.problems.is_empty(), "{:?}", flow.problems);
+        let mut machine = Machine::new(&flow.steps);
+        let event = machine.next(&mut Table { truth: &[("always", Ok(true))], lists: &[] });
+        let Event::Failed { why, .. } = event else { panic!("expected a failure, got {event:?}") };
+        assert!(why.contains("gave up"), "{why}");
+        // And it is over: it does not carry on from where it was given up on.
+        assert_eq!(
+            machine.next(&mut Table { truth: &[("always", Ok(true))], lists: &[] }),
+            Event::Finished
+        );
+    }
+
+    #[test]
+    fn a_run_carries_the_fields_the_step_set() {
+        let seen = trace(
+            "run \"Port scan\" with target = host, ports = \"1-1024\"\n",
+            &[],
+        );
+        assert_eq!(seen, vec![r#"run Port scan with target=host,ports="1-1024""#]);
+    }
+
+    #[test]
+    fn a_note_says_something_and_changes_nothing() {
+        let seen = trace("print \"starting\"\nrun \"A\"\n", &[]);
+        assert_eq!(seen, vec![r#"log "starting""#, "run A"]);
+    }
+
+    /// Answers a machine's questions from two lookup tables.
+    struct Table<'a> {
+        truth: &'a [(&'a str, Result<bool, &'a str>)],
+        lists: &'a [(&'a str, &'a [&'a str])],
+    }
+
+    impl Ask for Table<'_> {
+        fn truth(&mut self, condition: &str) -> Result<bool, String> {
+            match self.truth.iter().find(|(c, _)| *c == condition) {
+                Some((_, Ok(yes))) => Ok(*yes),
+                Some((_, Err(why))) => Err((*why).to_string()),
+                None => Err(format!("no answer for {condition:?}")),
+            }
+        }
+
+        fn list(&mut self, expression: &str) -> Result<Vec<String>, String> {
+            match self.lists.iter().find(|(e, _)| *e == expression) {
+                Some((_, items)) => Ok(items.iter().map(|s| (*s).to_string()).collect()),
+                None => Err(format!("no list for {expression:?}")),
+            }
+        }
+    }
+
+    /// A machine that is never asked anything, for the workflows that ask
+    /// nothing.
+    struct Nothing;
+
+    impl Ask for Nothing {
+        fn truth(&mut self, _: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn list(&mut self, _: &str) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
+    }
+
     /// Runs a workflow to the end, answering conditions from a table, and
     /// reports what happened as short strings.
     fn trace(source: &str, truth: &[(&str, Result<bool, &str>)]) -> Vec<String> {
+        traced(source, truth, &[])
+    }
+
+    /// The same, for a workflow that walks a list.
+    fn traced(
+        source: &str,
+        truth: &[(&str, Result<bool, &str>)],
+        lists: &[(&str, &[&str])],
+    ) -> Vec<String> {
         let flow = parse(source);
         assert!(flow.problems.is_empty(), "{:?}", flow.problems);
         let mut machine = Machine::new(&flow.steps);
-        let mut answer = |condition: &str| match truth.iter().find(|(c, _)| *c == condition) {
-            Some((_, Ok(yes))) => Ok(*yes),
-            Some((_, Err(why))) => Err((*why).to_string()),
-            None => Err(format!("no answer for {condition:?}")),
-        };
+        let mut answer = Table { truth, lists };
 
         let mut seen = Vec::new();
         for _ in 0..500 {
             match machine.next(&mut answer) {
-                Event::Run { name, .. } => {
-                    seen.push(format!("run {name}"));
+                Event::Run { name, with, .. } => {
+                    let settings: Vec<String> =
+                        with.iter().map(|(f, v)| format!("{f}={v}")).collect();
+                    if settings.is_empty() {
+                        seen.push(format!("run {name}"));
+                    } else {
+                        seen.push(format!("run {name} with {}", settings.join(",")));
+                    }
                     machine.resume(true);
                 }
+                Event::Each { name, value, at, of, .. } => {
+                    seen.push(format!("each {name} = {value} ({at}/{of})"));
+                }
+                Event::Logged { value, .. } => seen.push(format!("log {value}")),
                 Event::Wait { seconds, .. } => seen.push(format!("wait {seconds}")),
                 Event::Set { name, value, .. } => seen.push(format!("set {name} = {value}")),
                 Event::Skipped { why, .. } => seen.push(format!("skip {why}")),
@@ -416,9 +709,9 @@ mod tests {
     fn a_run_that_fails_ends_the_workflow() {
         let flow = parse("run A\nrun B");
         let mut machine = Machine::new(&flow.steps);
-        assert!(matches!(machine.next(&mut |_| Ok(true)), Event::Run { .. }));
+        assert!(matches!(machine.next(&mut Nothing), Event::Run { .. }));
         machine.resume(false);
-        assert_eq!(machine.next(&mut |_| Ok(true)), Event::Finished);
+        assert_eq!(machine.next(&mut Nothing), Event::Finished);
         assert!(machine.done);
     }
 
@@ -457,7 +750,7 @@ mod tests {
         // marked with what happened to it.
         let flow = parse("run A\nif c {\n  run B\n}\nrun D");
         let mut machine = Machine::new(&flow.steps);
-        let steps: Vec<usize> = std::iter::from_fn(|| match machine.next(&mut |_| Ok(true)) {
+        let steps: Vec<usize> = std::iter::from_fn(|| match machine.next(&mut Nothing) {
             Event::Run { step, .. } => Some(step),
             _ => None,
         })

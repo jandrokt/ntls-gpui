@@ -30,7 +30,23 @@ pub struct Doc {
     /// When the file was last modified, so a change on disk is noticed.
     pub seen: Option<std::time::SystemTime>,
     pub scroll: gpui::ScrollHandle,
+    /// How much of the pane the preview takes while the source is open, as a
+    /// fraction. Zero hides it.
+    ///
+    /// A document that is mostly prose wants the room to write in; one that
+    /// is mostly figures wants to watch them. Neither is the default for the
+    /// other, so it is dragged.
+    pub preview: f32,
 }
+
+/// What the preview starts at, and the least and most it can be dragged to.
+///
+/// A preview narrower than this cannot show a line of prose, and one wider
+/// leaves nowhere to type; below the floor it snaps shut instead, which is
+/// what the drag is for as well as the button.
+pub const PREVIEW: f32 = 0.5;
+pub const PREVIEW_LEAST: f32 = 0.15;
+pub const PREVIEW_MOST: f32 = 0.85;
 
 impl Doc {
     /// What the document is called: its first heading, or its file name.
@@ -123,6 +139,7 @@ fn scan_docs(dir: &Path, rel: Option<String>, next_id: &mut usize, docs: &mut Ve
             open: false,
             folder: rel.clone(),
             scroll: gpui::ScrollHandle::new(),
+            preview: crate::ui::notes::PREVIEW,
         });
     }
     dirs.sort();
@@ -258,6 +275,9 @@ pub fn resolve(
 pub struct Snapshot {
     tables: Vec<Arc<Table>>,
     vars: std::collections::BTreeMap<String, crate::ui::store::Var>,
+    /// What the walks a running workflow is inside have their items under,
+    /// innermost last, so an inner walk may reuse an outer one's name.
+    bindings: Vec<(String, crate::expr::Value)>,
     resolving: std::cell::RefCell<Vec<String>>,
 }
 
@@ -266,8 +286,17 @@ impl Snapshot {
         Snapshot {
             tables: workspace.jobs.iter().map(|j| Arc::new(table_of(j))).collect(),
             vars: workspace.vars.clone(),
+            bindings: Vec::new(),
             resolving: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// The same, for a workflow part-way through a walk.
+    pub fn inside(
+        workspace: &Workspace,
+        bindings: &[(String, crate::expr::Value)],
+    ) -> Snapshot {
+        Snapshot { bindings: bindings.to_vec(), ..Snapshot::of(workspace) }
     }
 }
 
@@ -288,6 +317,16 @@ impl Source for Snapshot {
         let (_, var) = self.vars.iter().find(|(key, _)| key.eq_ignore_ascii_case(name))?;
         resolve(var, name, self, &self.resolving)
     }
+
+    fn bound(&self, name: &str) -> Option<crate::expr::Value> {
+        // Innermost first: a walk inside a walk may use the same name, and
+        // the one being walked now is the one meant.
+        self.bindings
+            .iter()
+            .rev()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
 }
 
 /// What a run looks like to something that only needs to know what it could be
@@ -296,6 +335,14 @@ impl Source for Snapshot {
 /// Completion and the workflow's condition controls offer those and never read
 /// a single row, so they take this instead of the table, and a scan with tens
 /// of thousands of rows costs them nothing.
+///
+/// What a run answered *is* here, though. Leaving it out was why nothing an
+/// HTTP request came back with could be found: completion listed the six
+/// columns of the request table and none of the answer, and the workflow's
+/// condition controls offered the same six, so the only way to reach a field
+/// of the JSON was to already know it was there and type the whole path
+/// blind. It costs a clone of a handful of `Arc`s, since the run worked it
+/// out when the answer arrived.
 pub fn shapes(workspace: &Workspace) -> Vec<Table> {
     workspace
         .jobs
@@ -308,6 +355,7 @@ pub fn shapes(workspace: &Workspace) -> Vec<Table> {
             columns: job.tool.columns().iter().map(|c| c.title.to_string()).collect(),
             stats: job.stats.iter().map(|kv| (kv.k.clone(), kv.v.clone())).collect(),
             elapsed: job.elapsed().map(|d| d.as_secs_f64()),
+            extras: extras_of(job),
             ..Table::default()
         })
         .collect()
@@ -336,7 +384,53 @@ fn table_of(job: &Job) -> Table {
             .collect(),
         stats: job.stats.iter().map(|kv| (kv.k.clone(), kv.v.clone())).collect(),
         elapsed: job.elapsed().map(|d| d.as_secs_f64()),
+        extras: extras_of(job),
     }
+}
+
+/// The structured values a run publishes beside its table.
+///
+/// Only the tools that receive a whole answer have any, and today that is the
+/// HTTP request. `status` is deliberately not among them: the table already
+/// has a STATUS column, and a name that means one thing at the top level and
+/// another inside `response` would be worse than a longer name.
+fn extras_of(job: &Job) -> Vec<(String, crate::expr::Value)> {
+    job.extras.clone()
+}
+
+/// The same, worked out from the answer itself.
+///
+/// Called once when an answer arrives and kept on the run, not worked out
+/// where it is read. The body is parsed here, and the side bar, completion
+/// and a running workflow all read these on every frame: parsing a megabyte
+/// of JSON that often is the difference between a window that draws and one
+/// that does not. Every value below an `Object` is behind an `Arc`, so
+/// handing out a copy costs a pointer.
+pub fn extras_for(answer: &crate::core::Answer) -> Vec<(String, crate::expr::Value)> {
+    use crate::expr::Value;
+
+    let headers = Value::Object(std::sync::Arc::new(
+        answer.headers.iter().map(|(k, v)| (k.clone(), Value::Text(v.clone()))).collect(),
+    ));
+    // Parsed once, here, rather than every time a document is drawn.
+    let json = Value::from_json(&answer.body).unwrap_or(Value::Nothing);
+
+    let response = Value::Object(std::sync::Arc::new(vec![
+        ("status".to_string(), Value::Number(f64::from(answer.status))),
+        ("reason".to_string(), Value::Text(answer.reason.clone())),
+        ("type".to_string(), Value::Text(answer.content_type.clone())),
+        ("headers".to_string(), headers.clone()),
+        ("body".to_string(), Value::Text(answer.body.clone())),
+        ("json".to_string(), json.clone()),
+        ("truncated".to_string(), Value::Bool(answer.truncated)),
+    ]));
+
+    vec![
+        ("json".to_string(), json),
+        ("body".to_string(), Value::Text(answer.body.clone())),
+        ("headers".to_string(), headers),
+        ("response".to_string(), response),
+    ]
 }
 
 #[cfg(test)]
@@ -353,6 +447,7 @@ mod tests {
             folder: None,
             seen: None,
             scroll: gpui::ScrollHandle::new(),
+            preview: crate::ui::notes::PREVIEW,
         }
     }
 

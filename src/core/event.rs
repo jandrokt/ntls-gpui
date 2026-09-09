@@ -71,6 +71,56 @@ pub fn kv(k: impl Into<String>, v: impl Into<String>) -> Kv {
     Kv { k: k.into(), v: v.into() }
 }
 
+/// The whole of one answer, for a tool whose result is a document and not a
+/// row.
+///
+/// A row says what happened and how long it took. This is the thing that came
+/// back. It is kept so that the answer can be read in full rather than
+/// glimpsed in the log, and so that a document or a workflow can reach any
+/// part of it instead of only the one value the run was told to capture.
+///
+/// It is written into the tool's file with everything else, so reopening a
+/// workspace tomorrow still has the answer in it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Answer {
+    /// The status line's code, and the reason beside it where there was one.
+    #[serde(default)]
+    pub status: u16,
+    #[serde(default)]
+    pub reason: String,
+    /// The content type with its parameters stripped, which is what decides
+    /// how the answer is read and coloured.
+    #[serde(default)]
+    pub content_type: String,
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub body: String,
+    /// Whether the body was cut short because it was larger than a tool keeps.
+    #[serde(default)]
+    pub truncated: bool,
+    /// How long the far end took to start answering, and how long the answer
+    /// then took to arrive, in milliseconds.
+    ///
+    /// The two halves of a slow request are different problems: a server
+    /// thinking for a second is not a megabyte crawling down a slow link,
+    /// and one number for both cannot tell you which you have. These are the
+    /// two the client can honestly measure — everything before the first byte,
+    /// and everything after it.
+    #[serde(default)]
+    pub waited: f64,
+    #[serde(default)]
+    pub read: f64,
+    /// What the request was, so the answer can be read without the form.
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub url: String,
+    /// Where it ended up, when that is not where it was sent.
+    #[serde(default)]
+    pub landed: String,
+}
+
 /// A single update from a running tool.
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -91,6 +141,9 @@ pub enum Event {
     /// Records a numeric observation for the live chart. A tool that emits
     /// samples gets a graph without asking for one.
     Sample { series: String, unit: String, value: f64 },
+    /// Keeps the whole of what came back, replacing whatever was kept before.
+    /// The last answer is the one a document is asking about.
+    Answered(Answer),
 }
 
 impl Event {

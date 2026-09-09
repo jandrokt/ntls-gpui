@@ -202,6 +202,7 @@ impl Colours {
             Kind::Link => self.accent,
             Kind::Marker | Kind::Delim => self.faint,
             Kind::Name => self.accent,
+            Kind::Key => self.accent,
             Kind::Function => self.number,
             Kind::Keyword => self.keyword,
             Kind::Str => self.string,
@@ -212,7 +213,7 @@ impl Colours {
 
     pub(crate) fn weight_of(kind: Kind) -> gpui::FontWeight {
         match kind {
-            Kind::Heading | Kind::Strong | Kind::Keyword => gpui::FontWeight::SEMIBOLD,
+            Kind::Heading | Kind::Strong | Kind::Keyword | Kind::Key => gpui::FontWeight::SEMIBOLD,
             _ => gpui::FontWeight::NORMAL,
         }
     }
@@ -280,6 +281,12 @@ impl Editor {
     /// Writes the file back. Saving is explicit, so an edit is never half
     /// applied to something a workflow might be reading.
     pub fn save(&mut self, cx: &mut Context<Self>) -> bool {
+        // A request body has no file behind it, and is given an empty path to
+        // say so. Writing one would put a payload in the working directory
+        // the moment somebody pressed the save key out of habit.
+        if self.path.as_os_str().is_empty() {
+            return false;
+        }
         if std::fs::write(&self.path, &self.text).is_err() {
             return false;
         }
@@ -410,7 +417,7 @@ impl Editor {
         self.select_to(to, cx);
     }
 
-    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selected_range = 0..self.text.len();
         self.selection_reversed = false;
         cx.notify();
@@ -492,13 +499,13 @@ impl Editor {
         self.save(cx);
     }
 
-    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.replace_text_in_range(None, &text, window, cx);
         }
     }
 
-    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.text[self.selected_range.clone()].to_string(),
@@ -506,7 +513,7 @@ impl Editor {
         }
     }
 
-    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             return;
         }
@@ -579,12 +586,82 @@ impl Editor {
         true
     }
 
+    /// One markdown formatting action, applied to the selection.
+    ///
+    /// The point of a toolbar is that it does what you would have typed, so
+    /// each of these is a toggle: pressing Bold on text that is already bold
+    /// takes the marks off again rather than doubling them.
+    pub fn markup(&mut self, what: Markup, cx: &mut Context<Self>) {
+        let here = self.selected_range.clone();
+        let (range, text, select) = match what {
+            Markup::Around(marks) => around(&self.text, &here, marks),
+            Markup::Prefix(mark) => prefix(&self.text, &here, mark),
+            Markup::Numbered => numbered(&self.text, &here),
+            Markup::Link => {
+                let inner = &self.text[here.clone()];
+                let shown = if inner.is_empty() { "text" } else { inner };
+                let put = format!("[{shown}](url)");
+                // The caret lands on `url`, which is the part that has to be
+                // typed whatever else was selected.
+                let at = here.start + put.len() - 4;
+                (here.clone(), put, at..at + 3)
+            }
+            Markup::Fence => {
+                let inner = &self.text[here.clone()];
+                let put = format!("```\n{inner}\n```");
+                let at = here.start + 4;
+                (here.clone(), put, at..at + inner.len())
+            }
+            Markup::Rule => {
+                let put = "\n---\n".to_string();
+                let at = here.start + put.len();
+                (here.clone(), put, at..at)
+            }
+            Markup::Expression => {
+                let inner = &self.text[here.clone()];
+                let put = format!("{{{{ {inner} }}}}");
+                let at = here.start + 3;
+                (here.clone(), put, at..at + inner.len())
+            }
+            Markup::Table => {
+                let put = "| Name | Value |\n| --- | --- |\n|  |  |\n".to_string();
+                let at = here.start + put.len();
+                (here.clone(), put, at..at)
+            }
+        };
+
+        self.text.replace_range(range, &text);
+        self.selected_range = select;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.dirty = true;
+        self.revision += 1;
+        self.refresh_offer(cx);
+        cx.notify();
+    }
+
     /// Where to draw the completion list, if there is one to draw.
     pub fn offer_at(&self) -> Option<Point<Pixels>> {
         if self.offering.is_empty() {
             return None;
         }
         self.caret_point()
+    }
+
+    /// Whether anything is selected, which decides what a right-click can
+    /// usefully offer.
+    pub fn has_selection(&self) -> bool {
+        !self.selected_range.is_empty()
+    }
+
+    /// How wide the text is laid out, once it has been laid out once.
+    ///
+    /// What the completion list is kept inside: it follows the caret, and a
+    /// caret near the right-hand end would otherwise put a 280-pixel list out
+    /// over whatever is beside the editor, which for a document is the
+    /// preview of the very text being typed.
+    pub fn laid_out_width(&self) -> Option<Pixels> {
+        self.bounds.map(|b| b.size.width)
     }
 
     // --- mouse ---------------------------------------------------------------
@@ -1232,6 +1309,68 @@ impl Focusable for Editor {
 mod tests {
     use super::*;
 
+    /// What a formatting action leaves behind: the whole text, and what is
+    /// selected afterwards.
+    fn did(text: &str, select: std::ops::Range<usize>, what: Markup) -> (String, String) {
+        let (range, put, chosen) = match what {
+            Markup::Around(marks) => around(text, &select, marks),
+            Markup::Prefix(mark) => prefix(text, &select, mark),
+            Markup::Numbered => numbered(text, &select),
+            _ => unreachable!("only the three that reach outside the selection"),
+        };
+        let mut out = text.to_string();
+        out.replace_range(range, &put);
+        let chosen = out[chosen].to_string();
+        (out, chosen)
+    }
+
+    #[test]
+    fn bold_goes_on_and_comes_off_again() {
+        // On.
+        let (text, chosen) = did("a word here", 2..6, Markup::Around("**"));
+        assert_eq!(text, "a **word** here");
+        assert_eq!(chosen, "word");
+
+        // Off, with the whole of it selected.
+        let (text, chosen) = did("a **word** here", 2..10, Markup::Around("**"));
+        assert_eq!(text, "a word here");
+        assert_eq!(chosen, "word");
+
+        // Off, with only the word selected, which is where pressing the
+        // button twice in a row leaves the selection.
+        let (text, chosen) = did("a **word** here", 4..8, Markup::Around("**"));
+        assert_eq!(text, "a word here");
+        assert_eq!(chosen, "word");
+    }
+
+    #[test]
+    fn a_line_mark_applies_to_every_line_the_selection_touches() {
+        let source = "one\ntwo\nthree";
+        // Selecting the middle of the first line and the middle of the last
+        // marks all three: a bullet is a property of a line, not of a word.
+        let (text, _) = did(source, 1..10, Markup::Prefix("- "));
+        assert_eq!(text, "- one\n- two\n- three");
+
+        // And again takes them off.
+        let (back, _) = did(&text, 1..16, Markup::Prefix("- "));
+        assert_eq!(back, source);
+    }
+
+    #[test]
+    fn a_numbered_list_counts_from_one_and_undoes_cleanly() {
+        let (text, _) = did("one\ntwo\nthree", 0..13, Markup::Numbered);
+        assert_eq!(text, "1. one\n2. two\n3. three");
+        let (back, _) = did(&text, 0..22, Markup::Numbered);
+        assert_eq!(back, "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn a_mark_on_one_line_leaves_its_neighbours_alone() {
+        let source = "one\ntwo\nthree";
+        let (text, _) = did(source, 5..6, Markup::Prefix("## "));
+        assert_eq!(text, "one\n## two\nthree");
+    }
+
     #[test]
     fn the_caret_the_ime_asks_for_while_composing_japanese_stays_on_a_character() {
         // The platform counts the caret in UTF-16 units from the start of the
@@ -1305,4 +1444,135 @@ mod tests {
         // does not have is a worse guess than showing the character.
         assert_eq!(&*flattened("one\rtwo"), "one\rtwo");
     }
+}
+
+/// One thing the formatting controls can do to the selection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Markup {
+    /// Put these marks on both sides, or take them off if they are there.
+    Around(&'static str),
+    /// Put this at the start of every line the selection touches, or take it
+    /// off if every one of them already has it.
+    Prefix(&'static str),
+    Numbered,
+    Link,
+    Fence,
+    Rule,
+    /// `{{ … }}`, which is what a document is written for.
+    Expression,
+    Table,
+}
+
+impl Markup {
+    pub fn label(self) -> &'static str {
+        match self {
+            Markup::Around("**") => "Bold",
+            Markup::Around("*") => "Italic",
+            Markup::Around("`") => "Code",
+            Markup::Around("~~") => "Strikethrough",
+            Markup::Around(_) => "Wrap",
+            Markup::Prefix("# ") => "Heading 1",
+            Markup::Prefix("## ") => "Heading 2",
+            Markup::Prefix("### ") => "Heading 3",
+            Markup::Prefix("- ") => "Bullet list",
+            Markup::Prefix("> ") => "Quote",
+            Markup::Prefix(_) => "Prefix",
+            Markup::Numbered => "Numbered list",
+            Markup::Link => "Link",
+            Markup::Fence => "Code block",
+            Markup::Rule => "Divider",
+            Markup::Expression => "Expression",
+            Markup::Table => "Table",
+        }
+    }
+}
+
+/// Marks on both sides of the selection, or off it if they are already there.
+///
+/// Returns what to replace as well as what to put there, because taking the
+/// marks off `**word**` with only `word` selected means reaching outside the
+/// selection for them.
+fn around(text: &str, range: &Range<usize>, marks: &str) -> (Range<usize>, String, Range<usize>) {
+    let inner = &text[range.clone()];
+    let width = marks.len();
+
+    // `**word**` with the whole of it selected.
+    if inner.len() >= 2 * width && inner.starts_with(marks) && inner.ends_with(marks) {
+        let bare = inner[width..inner.len() - width].to_string();
+        let end = range.start + bare.len();
+        return (range.clone(), bare, range.start..end);
+    }
+    // `**word**` with only `word` selected, which is what pressing Bold
+    // twice in a row leaves behind.
+    if text[..range.start].ends_with(marks) && text[range.end..].starts_with(marks) {
+        let wider = range.start - width..range.end + width;
+        let bare = inner.to_string();
+        let end = wider.start + bare.len();
+        return (wider.clone(), bare, wider.start..end);
+    }
+
+    let put = format!("{marks}{inner}{marks}");
+    let at = range.start + width;
+    (range.clone(), put, at..at + inner.len())
+}
+
+/// A mark at the start of every line the selection touches.
+fn prefix(text: &str, range: &Range<usize>, mark: &str) -> (Range<usize>, String, Range<usize>) {
+    // The whole of the first and last lines, not just what was selected: a
+    // heading is a property of a line.
+    let start = text[..range.start].rfind('\n').map_or(0, |at| at + 1);
+    let end = text[range.end..].find('\n').map_or(text.len(), |at| range.end + at);
+    let block = &text[start..end];
+
+    let all_have = block.lines().all(|line| line.trim_start().starts_with(mark.trim_end()));
+    let put: Vec<String> = block
+        .lines()
+        .map(|line| {
+            if all_have {
+                // Off again: the mark and the one space after it.
+                line.trim_start().strip_prefix(mark.trim_end()).map_or_else(
+                    || line.to_string(),
+                    |rest| rest.strip_prefix(' ').unwrap_or(rest).to_string(),
+                )
+            } else {
+                format!("{mark}{line}")
+            }
+        })
+        .collect();
+    let put = put.join("\n");
+    let end = start + put.len();
+    (start..end_of_block(text, range), put, start..end)
+}
+
+/// `1. `, `2. `, `3. ` down the selected lines.
+fn numbered(text: &str, range: &Range<usize>) -> (Range<usize>, String, Range<usize>) {
+    let start = text[..range.start].rfind('\n').map_or(0, |at| at + 1);
+    let end = text[range.end..].find('\n').map_or(text.len(), |at| range.end + at);
+    let block = &text[start..end];
+
+    let numbered_already = block.lines().all(|line| {
+        let trimmed = line.trim_start();
+        trimmed
+            .split_once(". ")
+            .is_some_and(|(head, _)| !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()))
+    });
+    let put: Vec<String> = block
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            if numbered_already {
+                line.trim_start().split_once(". ").map_or_else(|| line.to_string(), |(_, rest)| rest.to_string())
+            } else {
+                format!("{}. {line}", i + 1)
+            }
+        })
+        .collect();
+    let put = put.join("\n");
+    let end = start + put.len();
+    (start..end_of_block(text, range), put, start..end)
+}
+
+/// The end of the last line the selection touches.
+fn end_of_block(text: &str, range: &Range<usize>) -> usize {
+    text[range.end..].find('\n').map_or(text.len(), |at| range.end + at)
 }

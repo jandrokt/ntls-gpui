@@ -108,6 +108,18 @@ pub struct Job {
     pub stats: Vec<Kv>,
     pub progress: Option<(usize, usize, Option<String>)>,
     pub charts: Vec<Series>,
+    /// The last whole answer the tool received, for the tools that get one.
+    /// The response pane reads it, and so does any document that asks about
+    /// a part of it.
+    pub answer: Option<crate::core::Answer>,
+    /// What that answer looks like to an expression: `json`, `body`,
+    /// `headers` and `response`, worked out once when the answer lands.
+    ///
+    /// Derived from `answer` and never written to disk. It is read wherever
+    /// an expression names this run — a document being drawn, the completion
+    /// list, a workflow deciding its next step — and those all happen on the
+    /// thread that draws the window, often every frame.
+    pub extras: Vec<(String, crate::expr::Value)>,
 
     /// The widest cell seen in each column, in characters. Column widths are
     /// derived from this so a column never reserves room for text that is
@@ -122,6 +134,11 @@ pub struct Job {
     // --- interaction ------------------------------------------------------
     /// The form's editors, one per field, in field order.
     pub inputs: Vec<Option<Entity<TextInput>>>,
+    /// The form's body editors, one per field in field order, and `None` for
+    /// every field that is not a body. Kept apart from `inputs` because a
+    /// body is a different widget: several lines, coloured, and with no file
+    /// behind it.
+    pub bodies: Vec<Option<Entity<super::editor::Editor>>>,
     pub filter_input: Entity<TextInput>,
     pub filter_revision: usize,
     pub filter: String,
@@ -140,6 +157,21 @@ pub struct Job {
     /// only: a comparison is a way of looking, not part of the result.
     pub compare_with: Option<usize>,
     pub show_form: bool,
+    /// Whether the answer takes the pane. Only the tools that receive a whole
+    /// answer have one to show, and it starts hidden: the table is what a run
+    /// is normally read from, and the body is what you open when the table
+    /// has told you something is wrong.
+    pub show_response: bool,
+    /// When the answer was last copied, so the button can say it did
+    /// something. A control that gives no sign of having worked reads as a
+    /// control that did not.
+    pub copied_at: Option<std::time::Instant>,
+    /// Which half of the answer the response pane is showing, and whether
+    /// the body is laid out or left exactly as it arrived.
+    pub show_headers: bool,
+    pub raw_body: bool,
+    /// Whether the settings most runs never touch are unfolded.
+    pub more_open: bool,
     /// Whether the graph takes the whole pane. It is always drawn when there
     /// is anything to draw; the button decides how much room it gets.
     pub chart_expanded: bool,
@@ -172,6 +204,7 @@ impl Job {
         tool: Arc<dyn Tool>,
         params: Params,
         inputs: Vec<Option<Entity<TextInput>>>,
+        bodies: Vec<Option<Entity<super::editor::Editor>>>,
         filter_input: Entity<TextInput>,
     ) -> Job {
         let columns = tool.columns().len();
@@ -189,11 +222,18 @@ impl Job {
             stats: Vec::new(),
             progress: None,
             charts: Vec::new(),
+            answer: None,
+            more_open: false,
+            copied_at: None,
+            show_headers: false,
+            raw_body: false,
+            extras: Vec::new(),
             content_width: vec![0; columns],
             column_override: vec![None; columns],
             started: None,
             finished: None,
             inputs,
+            bodies,
             filter_input,
             filter_revision: 0,
             filter: String::new(),
@@ -203,6 +243,7 @@ impl Job {
             folder: None,
             compare_with: None,
             show_form: true,
+            show_response: false,
             chart_expanded: false,
             field_error: None,
             table_scroll: UniformListScrollHandle::new(),
@@ -249,6 +290,7 @@ impl Job {
                     values: s.values.clone(),
                 })
                 .collect(),
+            answer: self.answer.clone(),
         }
     }
 
@@ -271,6 +313,9 @@ impl Job {
             .iter()
             .map(|s| Series { name: s.name.clone(), unit: s.unit.clone(), values: s.values.clone() })
             .collect();
+        self.answer = record.answer.clone();
+        self.extras =
+            self.answer.as_ref().map(crate::ui::notes::extras_for).unwrap_or_default();
 
         self.content_width = vec![0; self.tool.columns().len()];
         for row in &self.rows {
@@ -388,6 +433,13 @@ impl Job {
                 }
             }
             Event::Stats(stats) => self.stats = stats,
+            // The newest answer replaces the one before it: a run that asks
+            // the same thing sixty times is asking about the last reply, and
+            // keeping all sixty would be keeping sixty bodies in memory.
+            Event::Answered(answer) => {
+                self.extras = crate::ui::notes::extras_for(&answer);
+                self.answer = Some(answer);
+            }
             Event::Progress { done, total, label } => self.progress = Some((done, total, label)),
             Event::Sample { series, unit, value } => {
                 let s = match self.charts.iter_mut().find(|s| s.name == series) {

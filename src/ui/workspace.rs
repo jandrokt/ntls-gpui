@@ -883,6 +883,7 @@ mod tests {
             }],
             log: Vec::new(),
             charts: Vec::new(),
+            answer: None,
         };
 
         // The pieces a restored job must bring back with it.
@@ -910,6 +911,7 @@ mod tests {
                 folder: None,
                 seen: None,
                 scroll: gpui::ScrollHandle::new(),
+            preview: crate::ui::notes::PREVIEW,
             });
         }
         // Star the last one, so the drawn order is 3, 1, 2.
@@ -949,6 +951,7 @@ mod tests {
             folder: Some("survey".into()),
             seen: None,
             scroll: gpui::ScrollHandle::new(),
+            preview: crate::ui::notes::PREVIEW,
         };
         let doc2 = crate::ui::notes::Doc {
             id: 2,
@@ -959,6 +962,7 @@ mod tests {
             folder: Some("survey".into()),
             seen: None,
             scroll: gpui::ScrollHandle::new(),
+            preview: crate::ui::notes::PREVIEW,
         };
         ws.docs.push(doc1);
         ws.docs.push(doc2);
@@ -1063,6 +1067,7 @@ mod tests {
             folder: Some("parent/child".into()),
             seen: None,
             scroll: gpui::ScrollHandle::new(),
+            preview: crate::ui::notes::PREVIEW,
         };
         ws.docs.push(doc1);
         assert_eq!(ws.docs_in(Some("parent/child")).len(), 1);

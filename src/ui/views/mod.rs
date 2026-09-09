@@ -255,8 +255,22 @@ impl Actions for gpui::Div {
                 cx.notify();
             }))
             .on_action(cx.listener(|app, _: &app::AddTool, window, cx| app.open_palette(window, cx)))
-            .on_action(cx.listener(|app, _: &app::Run, window, cx| app.run_selected(window, cx)))
-            .on_action(cx.listener(|app, _: &app::Stop, _, cx| app.stop_selected(cx)))
+            // Run and Stop act on whatever is on screen. A workflow has a
+            // Run button of its own and did not answer the key or the menu
+            // beside it, which left the one way of starting one that could
+            // not be reached from the keyboard.
+            .on_action(cx.listener(|app, _: &app::Run, window, cx| {
+                match app.workspace().showing() {
+                    Some(super::workspace::Item::Flow(id)) => app.start_flow(id, window, cx),
+                    _ => app.run_selected(window, cx),
+                }
+            }))
+            .on_action(cx.listener(|app, _: &app::Stop, _, cx| {
+                match app.workspace().showing() {
+                    Some(super::workspace::Item::Flow(id)) => app.stop_flow(id, cx),
+                    _ => app.stop_selected(cx),
+                }
+            }))
             .on_action(cx.listener(|app, _: &app::Settings, window, cx| {
                 // On a document or a workflow, the settings key edits the
                 // source. Same idea: show me the thing behind
@@ -309,6 +323,18 @@ impl Actions for gpui::Div {
             .on_action(cx.listener(|app, _: &app::ToggleChart, _, cx| {
                 if let Some(job) = app.selected_job_mut() {
                     job.chart_expanded = !job.chart_expanded;
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|app, _: &app::ToggleResponse, _, cx| {
+                if let Some(job) = app.selected_job_mut()
+                    && job.answer.is_some()
+                {
+                    job.show_response = !job.show_response;
+                    // The two cannot both have the pane.
+                    if job.show_response {
+                        job.show_form = false;
+                    }
                     cx.notify();
                 }
             }))

@@ -24,6 +24,21 @@ pub struct Sheet {
     pub trail: Vec<Mark>,
     /// The workflow part-way through, while it is running.
     pub machine: Option<Machine>,
+    /// Everything the run said, oldest first.
+    ///
+    /// The trail says what became of each step and keeps only the latest
+    /// pass of it, which is the wrong shape for a walk: a `print` inside one
+    /// says something different every time round, and all but the last of
+    /// them would be gone. This keeps the lot, in the order it happened.
+    pub printed: Vec<Printed>,
+    /// Whether the log is open.
+    pub log_open: bool,
+    /// What the walks it is inside have their items under, innermost last.
+    ///
+    /// Not a workspace variable: an item may be a whole object out of an
+    /// answer, and it belongs to this run of this workflow rather than to
+    /// the workspace, which should not be left holding a `slide` afterwards.
+    pub bindings: Vec<(String, crate::expr::Value)>,
     /// What it is waiting on, if anything.
     pub busy: Option<Busy>,
     pub scroll: gpui::ScrollHandle,
@@ -32,6 +47,16 @@ pub struct Sheet {
     /// Selecting a step is what puts its controls on screen, so this is the
     /// whole of the editor's state: everything else it knows is in the file.
     pub cursor: Option<Spot>,
+}
+
+/// One line of a run's log: when, which step, and what it said.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Printed {
+    pub at: std::time::SystemTime,
+    pub step: Option<usize>,
+    pub text: String,
+    /// Whether it is something going wrong, so the log can show it as such.
+    pub bad: bool,
 }
 
 /// One thing that happened, against the step it happened to.
@@ -74,6 +99,8 @@ pub enum Outcome {
     Done,
     /// It worked something out and kept it, and this is what it kept.
     Set(String),
+    /// It said something into the trail and changed nothing.
+    Said(String),
     /// It could not be carried out, and why.
     Failed(String),
 }
@@ -85,13 +112,17 @@ impl Outcome {
             Outcome::Running => "running",
             Outcome::Done => "done",
             Outcome::Set(_) => "set",
+            Outcome::Said(_) => "printed",
             Outcome::Failed(_) => "failed",
         }
     }
 
     pub fn detail(&self) -> String {
         match self {
-            Outcome::Skipped(why) | Outcome::Failed(why) | Outcome::Set(why) => why.clone(),
+            Outcome::Skipped(why)
+            | Outcome::Failed(why)
+            | Outcome::Set(why)
+            | Outcome::Said(why) => why.clone(),
             _ => String::new(),
         }
     }
@@ -101,12 +132,29 @@ impl Outcome {
             Outcome::Skipped(_) => crate::core::Status::Info,
             Outcome::Running => crate::core::Status::Warn,
             Outcome::Done | Outcome::Set(_) => crate::core::Status::Up,
+            Outcome::Said(_) => crate::core::Status::Info,
             Outcome::Failed(_) => crate::core::Status::Down,
         }
     }
 }
 
 impl Sheet {
+    /// Adds a line to the run log.
+    ///
+    /// Bounded: a `print` inside a walk over a thousand hosts is a thousand
+    /// lines, and a workflow left running all night should not grow without
+    /// end. The oldest go first, which is the right end to lose.
+    pub fn say(&mut self, step: Option<usize>, text: String, bad: bool) {
+        /// How many lines of one run are kept.
+        const MOST: usize = 2_000;
+
+        self.printed.push(Printed { at: std::time::SystemTime::now(), step, text, bad });
+        if self.printed.len() > MOST {
+            let over = self.printed.len() - MOST;
+            self.printed.drain(..over);
+        }
+    }
+
     /// What it is called: the first comment line, or the file name.
     pub fn title(&self) -> String {
         for line in self.source.lines() {
@@ -248,6 +296,9 @@ fn scan_flows(dir: &Path, rel: Option<String>, next_id: &mut usize, flows: &mut 
             folder: rel.clone(),
             trail: Vec::new(),
             machine: None,
+            printed: Vec::new(),
+            log_open: false,
+            bindings: Vec::new(),
             busy: None,
             scroll: gpui::ScrollHandle::new(),
             cursor: None,
@@ -309,6 +360,9 @@ mod tests {
             seen: None,
             trail: Vec::new(),
             machine: None,
+            printed: Vec::new(),
+            log_open: false,
+            bindings: Vec::new(),
             busy: None,
             scroll: gpui::ScrollHandle::new(),
             cursor: None,

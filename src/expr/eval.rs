@@ -20,6 +20,18 @@ pub trait Source {
     fn var(&self, _name: &str) -> Option<String> {
         None
     }
+
+    /// A name bound to a whole value rather than to text.
+    ///
+    /// What a `for each` puts its item under. A workspace variable is text,
+    /// which is all a variable ever needs to be, but the item of a walk may
+    /// be an object out of an answer, and flattening that to text would make
+    /// `slide.title` unanswerable in the body of the very loop that produced
+    /// the slide. Checked before anything else, so the name means the item
+    /// for as long as the walk is on it.
+    fn bound(&self, _name: &str) -> Option<Value> {
+        None
+    }
 }
 
 /// A source with nothing in it, for a document evaluated on its own.
@@ -27,7 +39,6 @@ pub trait Source {
 pub struct Empty;
 
 #[cfg(test)]
-
 impl Source for Empty {
     fn table(&self, _: &str) -> Option<Arc<Table>> {
         None
@@ -108,6 +119,10 @@ fn name_value(name: &str, source: &dyn Source) -> Result<Value, String> {
         "nothing" => return Ok(Value::Nothing),
         _ => {}
     }
+    // What a walk is on, which shadows everything for as long as it is on it.
+    if let Some(value) = source.bound(name) {
+        return Ok(value);
+    }
     // A bare name is a run, so `Router.rtt` reads as well as `tool("Router")`.
     if let Some(table) = source.table(name) {
         return Ok(Value::Table(table));
@@ -140,6 +155,10 @@ fn index(subject: &Value, key: &Value) -> Result<Value, String> {
             Ok(items.get(at as usize).cloned().unwrap_or(Value::Nothing))
         }
         Value::Table(_) => field_value(subject, &key.show()),
+        // An answer is indexed by the name of a field, so a name that a dot
+        // cannot spell -- one with a space or a dash in it, which plenty of
+        // services use -- is still reachable: `response.headers["content-type"]`.
+        Value::Object(_) => field_value(subject, &key.show()),
         Value::Nothing => Ok(Value::Nothing),
         other => Err(format!("{} cannot be indexed", other.kind())),
     }
@@ -150,6 +169,17 @@ fn field_value(subject: &Value, field: &str) -> Result<Value, String> {
         && matches!(field, "length" | "count" | "len")
     {
         return Ok(Value::Number(items.len() as f64));
+    }
+    // A field of an answer is the field of that name in it. A name that is
+    // not there is nothing rather than an error, exactly as a field of a run
+    // that has not happened is: a service that omits a value on a quiet day
+    // should not stop the document that mentions it from rendering.
+    if let Value::Object(_) = subject {
+        return Ok(match field {
+            "keys" => Value::List(subject.keys().into_iter().map(Value::Text).collect()),
+            "length" | "count" | "len" => Value::Number(subject.keys().len() as f64),
+            name => subject.field(name).unwrap_or(Value::Nothing),
+        });
     }
     let Value::Table(table) = subject else {
         // Reading a field of nothing is nothing, so a document about a tool
@@ -174,10 +204,16 @@ fn field_value(subject: &Value, field: &str) -> Result<Value, String> {
         "warn" => Value::Number(table.count_status("warn") as f64),
         "elapsed" => table.elapsed.map(Value::Number).unwrap_or(Value::Nothing),
         "ok" => Value::Bool(table.state == "done"),
-        // Anything else names a column, then a figure from the summary. A
-        // document reads `Ping.rtt.avg()` far better than `col("RTT")`.
+        // Anything else names one of the structured values the tool
+        // published, then a column, then a figure from the summary. A
+        // document reads `Ping.rtt.avg()` far better than `col("RTT")`, and
+        // `"Health".json.queue.depth` better than either.
         other => table
-            .column(other)
+            .extras
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(other))
+            .map(|(_, value)| value.clone())
+            .or_else(|| table.column(other))
             .or_else(|| table.stat(other))
             .ok_or_else(|| format!("{} has no {other}", table.name))?,
     })
@@ -507,6 +543,7 @@ mod tests {
             statuses: vec!["up".into(), "up".into(), "down".into()],
             stats: vec![("loss".into(), "33%".into()), ("avg".into(), "20.0 ms".into())],
             elapsed: Some(3.0),
+            extras: Vec::new(),
         }))
     }
 
@@ -596,6 +633,94 @@ mod tests {
         // Figures with nothing quoted anywhere are still added.
         assert_eq!(value("Router.up + Router.rows").show(), "5");
         assert_eq!(value("1 + 2 + 3").show(), "6");
+    }
+
+    /// A run that publishes a whole answer, the way the HTTP request does.
+    fn answered() -> One {
+        let json = Value::from_json(
+            r#"{"queue": {"depth": 12, "name": "mail"}, "hosts": ["a", "b"], "live": true}"#,
+        )
+        .expect("it to parse");
+        let headers = Value::Object(Arc::new(vec![(
+            "content-type".to_string(),
+            Value::Text("application/json".to_string()),
+        )]));
+        One(Arc::new(Table {
+            name: "Health".into(),
+            tool: "http".into(),
+            target: "https://example.com/health".into(),
+            state: "done".into(),
+            columns: vec!["#".into(), "STATUS".into()],
+            rows: vec![vec!["1".into(), "200".into()]],
+            statuses: vec!["up".into()],
+            stats: Vec::new(),
+            elapsed: Some(0.2),
+            extras: vec![
+                ("json".to_string(), json.clone()),
+                (
+                    "response".to_string(),
+                    Value::Object(Arc::new(vec![
+                        ("status".to_string(), Value::Number(200.0)),
+                        ("headers".to_string(), headers),
+                        ("json".to_string(), json),
+                    ])),
+                ),
+            ],
+        }))
+    }
+
+    #[test]
+    fn any_property_of_an_answer_can_be_reached_from_a_document() {
+        let source = answered();
+        let value = |text: &str| run(text, &source).expect("it to evaluate").show();
+
+        // Straight down into the object, however deep.
+        assert_eq!(value("Health.json.queue.depth"), "12");
+        assert_eq!(value("Health.json.queue.name"), "mail");
+        assert_eq!(value("Health.json.live"), "true");
+        // An array in the answer is a list, so the language's own list
+        // handling applies to it.
+        assert_eq!(value("Health.json.hosts[0]"), "a");
+        assert_eq!(value("Health.json.hosts.count()"), "2");
+        // And the answer itself, for the parts that are not the body.
+        assert_eq!(value("Health.response.status"), "200");
+
+        // A name a dot cannot spell is still reachable by index, which is
+        // most header names.
+        assert_eq!(value(r#"Health.response.headers["content-type"]"#), "application/json");
+
+        // Arithmetic and conditions work on it like any other figure, which
+        // is the point of reaching it at all.
+        assert_eq!(value("Health.json.queue.depth * 2"), "24");
+        assert_eq!(value("if Health.json.queue.depth > 10 then \"busy\" else \"idle\""), "busy");
+    }
+
+    #[test]
+    fn a_property_that_is_not_there_is_nothing_rather_than_an_error() {
+        // A service that omits a value on a quiet day must not stop the
+        // document that mentions it from rendering.
+        let source = answered();
+        assert_eq!(run("Health.json.missing", &source).expect("it to evaluate").show(), "");
+        assert_eq!(run("Health.json.queue.missing.deeper", &source).expect("ok").show(), "");
+        // The names it does have can be listed, for finding out what came
+        // back without guessing.
+        let keys = run("Health.json.keys", &source).expect("ok").show();
+        assert!(keys.contains("queue") && keys.contains("hosts"), "{keys}");
+    }
+
+    #[test]
+    fn a_whole_object_written_into_a_document_reads_as_json() {
+        let source = answered();
+        let shown = run("Health.json.queue", &source).expect("ok").show();
+        assert!(shown.starts_with('{') && shown.contains("\"depth\":12"), "{shown}");
+    }
+
+    #[test]
+    fn an_answer_that_is_not_json_is_nothing_and_not_a_failure() {
+        // HTML, or a stack trace. Asking for a field of it gets nothing, so
+        // the paragraph around it still renders.
+        assert!(Value::from_json("<html><body>no</body></html>").is_none());
+        assert!(Value::from_json("").is_none());
     }
 
     #[test]

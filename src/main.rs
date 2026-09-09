@@ -152,6 +152,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Filter Results", ui::app::FocusFilter),
                 MenuItem::action("Toggle Log", ui::app::ToggleLog),
                 MenuItem::action("Toggle Chart", ui::app::ToggleChart),
+                MenuItem::action("Toggle Response", ui::app::ToggleResponse),
                 MenuItem::action("Toggle Theme", ui::app::ToggleTheme),
                 MenuItem::action("Notifications", ui::app::ShowNotices),
             ],

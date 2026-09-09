@@ -16,6 +16,15 @@ pub enum Language {
     /// A bare expression, with no prose or `{{ }}` around it. What a
     /// variable's formula is.
     Expr,
+    /// JSON: what a service answers with, and what gets typed into a request
+    /// body.
+    Json,
+    /// XML, and near enough to HTML to read one.
+    Xml,
+    /// Anything else. Nothing is coloured, and naming it at all is what lets
+    /// the editor and the response view still count lines and still use a
+    /// monospaced face for something they cannot read.
+    Text,
 }
 
 /// What a run of characters is.
@@ -40,6 +49,22 @@ pub enum Kind {
     Str,
     Number,
     Comment,
+    /// The name of a thing rather than the thing: a field of an object, an
+    /// attribute of a tag. Drawn like a name and weighted like a heading,
+    /// because in a page of JSON the names are the structure and the values
+    /// are the content.
+    Key,
+}
+
+/// What one line's colouring needs to know about the lines before it.
+///
+/// Only two things carry: a fenced code block in markdown, and a comment in
+/// XML that was not closed. Everything else either lives inside one line or
+/// reads the same whether or not it was finished.
+#[derive(Default)]
+struct Carried {
+    in_fence: bool,
+    in_comment: bool,
 }
 
 /// One coloured run, as a byte range within its line.
@@ -62,12 +87,60 @@ pub const FUNCTIONS: [&str; 30] = [
 ];
 
 /// The words a workflow is written with.
-pub const FLOW_WORDS: [&str; 6] = ["run", "stop", "if", "else", "repeat", "wait"];
+pub const FLOW_WORDS: [&str; 13] = [
+    "run", "with", "stop", "if", "else", "repeat", "for", "each", "while", "wait", "set",
+    "print", "log",
+];
 
 /// The words an expression is written with.
 const EXPR_WORDS: [&str; 10] = [
     "if", "then", "else", "true", "false", "nothing", "and", "or", "not", "in",
 ];
+
+/// One line, in whichever language, given whatever the lines before it left
+/// open.
+fn line_spans(language: Language, line: &str, state: &mut Carried) -> Vec<Span> {
+    match language {
+        Language::Flow => flow_line(line),
+        Language::Expr => inside(line, 0),
+        Language::Json => json_line(line),
+        Language::Xml => xml_line(line, &mut state.in_comment),
+        Language::Text => Vec::new(),
+        Language::Markdown => {
+            if line.trim_start().starts_with("```") {
+                state.in_fence = !state.in_fence;
+                vec![span(0..line.len(), Kind::Code)]
+            } else if state.in_fence {
+                with_expressions(line, Kind::Code)
+            } else {
+                markdown_line(line)
+            }
+        }
+    }
+}
+
+/// Colours a whole document as byte ranges into the whole of it.
+///
+/// [`highlight`] answers one list per line, relative to that line, which is
+/// what an editor drawing a line at a time wants. Something drawn in one
+/// piece, like an answer in the response pane, wants the offsets to be into
+/// the text it was handed.
+pub fn highlight_flat(language: Language, source: &str) -> Vec<Span> {
+    let mut out = Vec::new();
+    let mut state = Carried::default();
+    let mut at = 0usize;
+
+    // `split` and not `lines`, because these offsets have to land on the text
+    // exactly as it was given: `lines` drops a carriage return and the last
+    // newline, and every span past the first of those would be adrift.
+    for line in source.split('\n') {
+        for run in cover(line, line_spans(language, line, &mut state)) {
+            out.push(span(at + run.range.start..at + run.range.end, run.kind));
+        }
+        at += line.len() + 1;
+    }
+    out
+}
 
 /// Colours a whole document, one list of spans per line.
 ///
@@ -77,25 +150,10 @@ const EXPR_WORDS: [&str; 10] = [
 /// what it missed.
 pub fn highlight(language: Language, source: &str) -> Vec<Vec<Span>> {
     let mut out = Vec::new();
-    let mut in_fence = false;
+    let mut state = Carried::default();
 
     for line in source.lines() {
-        let spans = match language {
-            Language::Flow => flow_line(line),
-            Language::Expr => inside(line, 0),
-            Language::Markdown => {
-                let is_fence = line.trim_start().starts_with("```");
-                if is_fence {
-                    in_fence = !in_fence;
-                    vec![span(0..line.len(), Kind::Code)]
-                } else if in_fence {
-                    with_expressions(line, Kind::Code)
-                } else {
-                    markdown_line(line)
-                }
-            }
-        };
-        out.push(cover(line, spans));
+        out.push(cover(line, line_spans(language, line, &mut state)));
     }
     out
 }
@@ -280,6 +338,187 @@ fn starts_emphasis(rest: &str) -> Option<(&'static str, Kind)> {
     None
 }
 
+// --- JSON -------------------------------------------------------------------
+
+/// One line of JSON.
+///
+/// A line is a complete unit here, and that is not an approximation: JSON
+/// forbids a raw newline inside a string, so nothing can be left open at the
+/// end of one.
+fn json_line(line: &str) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut at = 0usize;
+
+    while at < line.len() {
+        let rest = &line[at..];
+        let ch = rest.chars().next().unwrap_or(' ');
+
+        if ch.is_whitespace() {
+            at += ch.len_utf8();
+            continue;
+        }
+        if ch == '"' {
+            let end = at + quoted_end(rest, '"');
+            // A string with a colon after it is naming the thing that
+            // follows, not being it.
+            let kind =
+                if line[end..].trim_start().starts_with(':') { Kind::Key } else { Kind::Str };
+            spans.push(span(at..end, kind));
+            at = end;
+            continue;
+        }
+        if ch == '-' || ch.is_ascii_digit() {
+            let end = at
+                + rest
+                    .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))
+                    .unwrap_or(rest.len());
+            spans.push(span(at..end, Kind::Number));
+            at = end;
+            continue;
+        }
+        if ch.is_ascii_alphabetic() {
+            let end = at + rest.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(rest.len());
+            // `true`, `false` and `null` are the only bare words JSON has. A
+            // word that is not one of them is a mistake, and colouring it as
+            // a name is how it stands out from the words that are.
+            let kind = match &line[at..end] {
+                "true" | "false" | "null" => Kind::Keyword,
+                _ => Kind::Name,
+            };
+            spans.push(span(at..end, kind));
+            at = end;
+            continue;
+        }
+        if matches!(ch, '{' | '}' | '[' | ']' | ':' | ',') {
+            spans.push(span(at..at + 1, Kind::Delim));
+            at += 1;
+            continue;
+        }
+        at += ch.len_utf8();
+    }
+    spans
+}
+
+/// How long the quoted run at the front of `rest` is, both quotes included.
+///
+/// One that is never closed runs to the end of the line, which is what it is
+/// while it is still being typed.
+fn quoted_end(rest: &str, quote: char) -> usize {
+    let mut escaped = false;
+    for (at, ch) in rest.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            c if c == quote => return at + c.len_utf8(),
+            _ => {}
+        }
+    }
+    rest.len()
+}
+
+// --- XML --------------------------------------------------------------------
+
+/// One line of XML, given whether the line before it left a comment open.
+///
+/// Only comments are carried between lines. Everything else XML has is either
+/// inside one tag or is the text between two, and both of those read the same
+/// whether or not they are finished.
+fn xml_line(line: &str, in_comment: &mut bool) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut at = 0usize;
+
+    while at < line.len() {
+        if *in_comment {
+            match line[at..].find("-->") {
+                Some(end) => {
+                    spans.push(span(at..at + end + 3, Kind::Comment));
+                    at += end + 3;
+                    *in_comment = false;
+                }
+                None => {
+                    spans.push(span(at..line.len(), Kind::Comment));
+                    at = line.len();
+                }
+            }
+            continue;
+        }
+
+        // Whatever sits before the next tag is the text of the document, and
+        // `cover` fills it in.
+        let Some(open) = line[at..].find('<') else { break };
+        let open = at + open;
+
+        if line[open..].starts_with("<!--") {
+            *in_comment = true;
+            at = open;
+            continue;
+        }
+        let close = line[open..].find('>').map_or(line.len(), |e| open + e + 1);
+        spans.extend(xml_tag(&line[open..close], open));
+        at = close;
+    }
+    spans
+}
+
+/// One tag, from its opening bracket to its closing one.
+///
+/// `offset` is where the tag starts in its line, since the spans belong to the
+/// line and not to the tag.
+fn xml_tag(tag: &str, offset: usize) -> Vec<Span> {
+    let mut spans = Vec::new();
+
+    // The bracket, with whatever punctuation follows it: the `/` of a closing
+    // tag, the `?` of a declaration, the `!` of a doctype.
+    let name_at = tag
+        .char_indices()
+        .skip(1)
+        .find(|(_, c)| c.is_alphanumeric() || *c == '_' || *c == ':')
+        .map_or(tag.len(), |(i, _)| i);
+    spans.push(span(offset..offset + name_at, Kind::Delim));
+
+    let mut at = name_at;
+    let end_of_name =
+        at + tag[at..].find(|c: char| !is_name_char(c)).unwrap_or(tag.len() - at);
+    if end_of_name > at {
+        spans.push(span(offset + at..offset + end_of_name, Kind::Name));
+        at = end_of_name;
+    }
+
+    while at < tag.len() {
+        let rest = &tag[at..];
+        let ch = rest.chars().next().unwrap_or(' ');
+
+        if ch.is_whitespace() {
+            at += ch.len_utf8();
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            let end = at + quoted_end(rest, ch);
+            spans.push(span(offset + at..offset + end, Kind::Str));
+            at = end;
+            continue;
+        }
+        if is_name_char(ch) {
+            let end = at + rest.find(|c: char| !is_name_char(c)).unwrap_or(rest.len());
+            spans.push(span(offset + at..offset + end, Kind::Key));
+            at = end;
+            continue;
+        }
+        // `=`, and the `/` and `>` that close it.
+        spans.push(span(offset + at..offset + at + ch.len_utf8(), Kind::Delim));
+        at += ch.len_utf8();
+    }
+    spans
+}
+
+/// Whether a character can appear in a tag or attribute name.
+fn is_name_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | ':' | '-' | '.')
+}
+
 /// The inside of a `{{ … }}`, so that a name reads differently from a call.
 fn expression(text: &str, offset: usize) -> Vec<Span> {
     let open = 2.min(text.len());
@@ -432,6 +671,144 @@ mod tests {
                 (Kind::Str, "\"down\""),
             ]
         );
+    }
+
+    #[test]
+    fn flat_offsets_land_on_the_text_they_were_given() {
+        // The offsets are into the whole document, and every span after the
+        // first newline depends on that arithmetic being right.
+        let source = "{\n  \"a\": 1\n}";
+        for run in highlight_flat(Language::Json, source) {
+            // Every span has to be a real slice of the source, and the whole
+            // has to be covered end to end with nothing overlapping.
+            assert!(source.get(run.range.clone()).is_some(), "{:?}", run.range);
+        }
+        let flat = highlight_flat(Language::Json, source);
+        // In order, never overlapping, and what falls between two of them is
+        // only ever the newline that separates their lines: a span covers a
+        // line and nothing covers the break after it.
+        let mut at = 0;
+        let mut rebuilt = String::new();
+        for run in &flat {
+            assert!(run.range.start >= at, "out of order at {at}");
+            rebuilt.push_str(&source[at..run.range.start]);
+            rebuilt.push_str(&source[run.range.clone()]);
+            at = run.range.end;
+        }
+        rebuilt.push_str(&source[at..]);
+        assert_eq!(rebuilt, source, "the spans and the gaps have to be the whole of it");
+
+        // The name on the second line is found where it actually is.
+        let name = flat
+            .iter()
+            .find(|r| r.kind == Kind::Key)
+            .map(|r| &source[r.range.clone()])
+            .expect("a name");
+        assert_eq!(name, "\"a\"");
+    }
+
+    #[test]
+    fn a_carriage_return_does_not_shift_every_later_span() {
+        // `lines` drops the carriage return, so counting offsets from it
+        // would put every span after the first line one byte early.
+        let source = "{\r\n  \"a\": 1\r\n}";
+        for run in highlight_flat(Language::Json, source) {
+            assert!(source.get(run.range.clone()).is_some(), "{:?}", run.range);
+        }
+        let found: Vec<&str> = highlight_flat(Language::Json, source)
+            .iter()
+            .filter(|r| r.kind == Kind::Key)
+            .map(|r| &source[r.range.clone()])
+            .collect();
+        assert_eq!(found, vec!["\"a\""]);
+    }
+
+    #[test]
+    fn json_reads_as_names_and_values_and_not_as_one_colour() {
+        let line = r#"  {"name": "ok", "count": 12, "live": true, "spare": null}"#;
+        assert_eq!(
+            marked(line, &highlight(Language::Json, line)[0]),
+            vec![
+                (Kind::Delim, "{"),
+                (Kind::Key, "\"name\""),
+                (Kind::Delim, ":"),
+                (Kind::Str, "\"ok\""),
+                (Kind::Delim, ","),
+                (Kind::Key, "\"count\""),
+                (Kind::Delim, ":"),
+                (Kind::Number, "12"),
+                (Kind::Delim, ","),
+                (Kind::Key, "\"live\""),
+                (Kind::Delim, ":"),
+                (Kind::Keyword, "true"),
+                (Kind::Delim, ","),
+                (Kind::Key, "\"spare\""),
+                (Kind::Delim, ":"),
+                (Kind::Keyword, "null"),
+                (Kind::Delim, "}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quote_inside_a_json_string_does_not_end_it() {
+        let line = r#"{"say": "a \" and more", "n": 1}"#;
+        let spans = highlight(Language::Json, line);
+        let strings: Vec<&str> =
+            marked(line, &spans[0]).into_iter().filter(|(k, _)| *k == Kind::Str).map(|(_, s)| s).collect();
+        assert_eq!(strings, vec![r#""a \" and more""#]);
+        // And the name after it is still read as a name.
+        assert!(marked(line, &spans[0]).contains(&(Kind::Key, "\"n\"")));
+    }
+
+    #[test]
+    fn xml_picks_out_the_tags_the_attributes_and_their_values() {
+        let line = r#"<item id="7" name="a">text</item>"#;
+        assert_eq!(
+            marked(line, &highlight(Language::Xml, line)[0]),
+            vec![
+                (Kind::Delim, "<"),
+                (Kind::Name, "item"),
+                (Kind::Key, "id"),
+                (Kind::Delim, "="),
+                (Kind::Str, "\"7\""),
+                (Kind::Key, "name"),
+                (Kind::Delim, "="),
+                (Kind::Str, "\"a\""),
+                (Kind::Delim, ">"),
+                (Kind::Delim, "</"),
+                (Kind::Name, "item"),
+                (Kind::Delim, ">"),
+            ]
+        );
+        // The text between the tags is the text of the document.
+        let spans = &highlight(Language::Xml, line)[0];
+        assert!(spans.iter().any(|s| s.kind == Kind::Text && &line[s.range.clone()] == "text"));
+    }
+
+    #[test]
+    fn an_xml_comment_runs_on_until_it_is_closed() {
+        let source = "<a>\n<!-- one\ntwo -->\n<b/>";
+        let spans = highlight(Language::Xml, source);
+        let line = |n: usize| {
+            let text = source.lines().nth(n).unwrap();
+            marked(text, &spans[n])
+        };
+        // The middle two lines are comment from end to end.
+        assert!(line(1).iter().all(|(k, _)| *k == Kind::Comment), "{:?}", line(1));
+        assert!(line(2).iter().all(|(k, _)| *k == Kind::Comment), "{:?}", line(2));
+        // And the tag after it is a tag again.
+        assert!(line(3).contains(&(Kind::Name, "b")));
+    }
+
+    #[test]
+    fn plain_text_is_left_alone_but_still_covered() {
+        let source = "just words\nand more";
+        let spans = highlight(Language::Text, source);
+        assert_eq!(spans.len(), 2);
+        // Covered end to end in one run, so the renderer still shapes it in
+        // one pass.
+        assert_eq!(spans[0], vec![Span { range: 0..10, kind: Kind::Text }]);
     }
 
     #[test]

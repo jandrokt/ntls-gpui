@@ -42,8 +42,11 @@ pub enum Shape {
     Run,
     If,
     Repeat,
+    ForEach,
+    While,
     Wait,
     Set,
+    Log,
     Stop,
 }
 
@@ -53,8 +56,11 @@ impl Shape {
             Shape::Run => "Run a tool",
             Shape::If => "Branch",
             Shape::Repeat => "Repeat",
+            Shape::ForEach => "For each of",
+            Shape::While => "While",
             Shape::Wait => "Wait",
             Shape::Set => "Set a variable",
+            Shape::Log => "Print a line",
             Shape::Stop => "Stop",
         }
     }
@@ -66,19 +72,39 @@ impl Shape {
     /// The step it makes, ready to be filled in.
     pub fn blank(self) -> Step {
         match self {
-            Shape::Run => Step::Run { name: String::new(), condition: None },
+            Shape::Run => {
+                Step::Run { name: String::new(), condition: None, with: Vec::new() }
+            }
             Shape::If => {
                 Step::If { condition: String::new(), then: Vec::new(), otherwise: Vec::new() }
             }
             Shape::Repeat => Step::Repeat { times: 2, body: Vec::new() },
+            Shape::ForEach => Step::ForEach {
+                name: String::new(),
+                over: String::new(),
+                body: Vec::new(),
+            },
+            Shape::While => Step::While { condition: String::new(), body: Vec::new() },
             Shape::Wait => Step::Wait { seconds: 30.0 },
             Shape::Set => Step::Set { name: String::new(), value: String::new() },
+            Shape::Log => Step::Log { value: String::new() },
             Shape::Stop => Step::Stop { condition: None },
         }
     }
 
-    pub const ALL: [Shape; 6] =
-        [Shape::Run, Shape::If, Shape::Repeat, Shape::Wait, Shape::Set, Shape::Stop];
+    /// In the order the menu offers them: what a workflow does, then how it
+    /// decides, then how it goes round, then the rest.
+    pub const ALL: [Shape; 9] = [
+        Shape::Run,
+        Shape::If,
+        Shape::Repeat,
+        Shape::ForEach,
+        Shape::While,
+        Shape::Wait,
+        Shape::Set,
+        Shape::Log,
+        Shape::Stop,
+    ];
 }
 
 /// One thing the editor can do to one step.
@@ -95,9 +121,11 @@ pub enum Change {
     /// without rebuilding it.
     Wrap,
     SetRun(String),
-    /// The name a `set` step keeps its answer under.
+    /// The name a `set` step keeps its answer under, or the one a `for each`
+    /// puts each item under.
     SetVarName(String),
-    /// The expression a `set` step works out.
+    /// The expression a `set` step works out, the list a `for each` walks, or
+    /// the note a `log` writes. One box, whichever step is open.
     SetVarValue(String),
     /// One part of a value that is being built, not typed: which run
     /// or variable, which of its figures, and how to summarise it.
@@ -166,14 +194,20 @@ pub fn apply(steps: &mut Vec<Step>, spot: &Spot, change: &Change) -> Option<Spot
             Some(spot.clone())
         }
         Change::SetVarName(name) => {
-            if let Step::Set { name: it, .. } = at_mut(steps, spot)? {
-                *it = name.trim().to_string();
+            match at_mut(steps, spot)? {
+                Step::Set { name: it, .. } | Step::ForEach { name: it, .. } => {
+                    *it = name.trim().to_string();
+                }
+                _ => {}
             }
             Some(spot.clone())
         }
         Change::SetVarValue(value) => {
-            if let Step::Set { value: it, .. } = at_mut(steps, spot)? {
-                *it = value.trim().to_string();
+            match at_mut(steps, spot)? {
+                Step::Set { value: it, .. }
+                | Step::ForEach { over: it, .. }
+                | Step::Log { value: it } => *it = value.trim().to_string(),
+                _ => {}
             }
             Some(spot.clone())
         }
@@ -259,7 +293,10 @@ fn inner(step: &Step, which: usize) -> Option<&Vec<Step>> {
     match (step, which) {
         (Step::If { then, .. }, 0) => Some(then),
         (Step::If { otherwise, .. }, 1) => Some(otherwise),
-        (Step::Repeat { body, .. }, 0) => Some(body),
+        (
+            Step::Repeat { body, .. } | Step::ForEach { body, .. } | Step::While { body, .. },
+            0,
+        ) => Some(body),
         _ => None,
     }
 }
@@ -268,7 +305,10 @@ fn inner_mut(step: &mut Step, which: usize) -> Option<&mut Vec<Step>> {
     match (step, which) {
         (Step::If { then, .. }, 0) => Some(then),
         (Step::If { otherwise, .. }, 1) => Some(otherwise),
-        (Step::Repeat { body, .. }, 0) => Some(body),
+        (
+            Step::Repeat { body, .. } | Step::ForEach { body, .. } | Step::While { body, .. },
+            0,
+        ) => Some(body),
         _ => None,
     }
 }
@@ -279,8 +319,14 @@ pub fn condition_of(step: &Step) -> &str {
         Step::Run { condition, .. } | Step::Stop { condition } => {
             condition.as_deref().unwrap_or("")
         }
-        Step::If { condition, .. } => condition,
-        Step::Repeat { .. } | Step::Wait { .. } | Step::Set { .. } => "",
+        // A `while` is a condition and a body, so the controls that build a
+        // condition build its one too.
+        Step::If { condition, .. } | Step::While { condition, .. } => condition,
+        Step::Repeat { .. }
+        | Step::ForEach { .. }
+        | Step::Wait { .. }
+        | Step::Set { .. }
+        | Step::Log { .. } => "",
     }
 }
 
@@ -290,15 +336,22 @@ fn set_condition(step: &mut Step, text: String) {
         Step::Run { condition, .. } | Step::Stop { condition } => {
             *condition = (!text.is_empty()).then_some(text);
         }
-        Step::If { condition, .. } => *condition = text,
-        Step::Repeat { .. } | Step::Wait { .. } | Step::Set { .. } => {}
+        Step::If { condition, .. } | Step::While { condition, .. } => *condition = text,
+        Step::Repeat { .. }
+        | Step::ForEach { .. }
+        | Step::Wait { .. }
+        | Step::Set { .. }
+        | Step::Log { .. } => {}
     }
 }
 
 /// Whether a step can carry a condition at all. A wait and a repeat cannot,
 /// so the editor does not offer them one.
 pub fn takes_a_condition(step: &Step) -> bool {
-    matches!(step, Step::Run { .. } | Step::Stop { .. } | Step::If { .. })
+    matches!(
+        step,
+        Step::Run { .. } | Step::Stop { .. } | Step::If { .. } | Step::While { .. }
+    )
 }
 
 // --- conditions, built not typed ---------------------------------------------
@@ -341,6 +394,11 @@ impl Test {
     /// Longest first, so `>=` is not read as `>`.
     pub const ALL: [Test; 6] =
         [Test::AtLeast, Test::AtMost, Test::IsNot, Test::Is, Test::More, Test::Less];
+}
+
+/// Whether one segment of a dotted path is a name and not something else.
+fn is_name(part: &str) -> bool {
+    !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// A condition in the shape the editor can build: one field of one run,
@@ -388,7 +446,12 @@ impl Guide {
             Some((subject, field)) => (subject.trim(), field.trim()),
             None => (left, ""),
         };
-        if !field.is_empty() && !field.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        // The field may be a path and not a name. A run that came back with
+        // an answer has a whole structure under it, and
+        // `Health.json.queue.depth > 10` is the ordinary way to ask about
+        // one; reading only a single name meant the controls gave up on
+        // every such condition and showed the raw line instead.
+        if !field.is_empty() && !field.split('.').all(is_name) {
             return None;
         }
 
@@ -425,7 +488,7 @@ impl Guide {
                 Some((subject, field)) => (subject.trim(), field.trim()),
                 None => (left, ""),
             };
-            if !field.is_empty() && !field.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            if !field.is_empty() && !field.split('.').all(is_name) {
                 return None;
             }
             if let Some(subject) = parse_subject(subject_part) {
@@ -440,7 +503,7 @@ impl Guide {
 
         if let Some((subject_part, field)) = condition.split_once('.') {
             let field = field.trim();
-            if !field.is_empty() && !field.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            if !field.is_empty() && !field.split('.').all(is_name) {
                 return None;
             }
             let subject = parse_subject(subject_part.trim())?;
@@ -643,8 +706,34 @@ fn parse_subject(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::flow::{parse, write};
+
+    #[test]
+    fn a_condition_can_name_a_path_into_what_a_run_answered() {
+        // The controls read only a single name after the dot, so every
+        // condition about an answer, which is the ordinary shape for an HTTP
+        // request, fell through to the raw line and could not be edited with
+        // them.
+        let guide = Guide::read("Health.json.queue.depth > 10").expect("it to read");
+        assert_eq!(guide.subject, "Health");
+        assert_eq!(guide.field, "json.queue.depth");
+        assert_eq!(guide.test, Test::More);
+        assert_eq!(guide.value, "10");
+
+        // A run whose name has a space in it is still one subject, path and
+        // all.
+        let guide =
+            Guide::read(r#"tool("HTTP request").response.status == 200"#).expect("it to read");
+        assert_eq!(guide.subject, "HTTP request");
+        assert_eq!(guide.field, "response.status");
+
+        // And what is still not a path is still refused, so the editor goes
+        // on showing anything more involved as written.
+        assert!(Guide::read("Health.json[0] > 1").is_none());
+        assert!(Guide::read("Health..depth > 1").is_none());
+    }
 
     fn tree(source: &str) -> Vec<Step> {
         let flow = parse(source);
@@ -678,7 +767,7 @@ mod tests {
     fn a_step_deep_inside_is_reached_and_changed() {
         let mut steps = tree("repeat 2 {\n  if c {\n    run A\n  }\n}");
         let spot = Spot { inside: vec![(0, 0), (0, 0)], index: 0 };
-        assert_eq!(at(&steps, &spot), Some(&Step::Run { name: "A".into(), condition: None }));
+        assert_eq!(at(&steps, &spot), Some(&Step::Run { name: "A".into(), condition: None, with: Vec::new() }));
         apply(&mut steps, &spot, &Change::SetRun("Sweep".into())).unwrap();
         assert_eq!(shown(&steps), "repeat 2 {\n  if c {\n    run Sweep\n  }\n}\n");
     }

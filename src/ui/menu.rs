@@ -64,6 +64,14 @@ pub enum Act {
     TagDoc(usize, Tag),
     FavouriteDoc(usize),
 
+    /// A markdown mark on whatever is selected in a document's source.
+    Format(crate::ui::editor::Markup),
+    /// The clipboard, for the right-click that expects to find it there.
+    CutSelection,
+    CopySelection,
+    PasteSelection,
+    SelectAllText,
+
     // Workflows.
     OpenFlow(usize),
     RunFlow(usize),
@@ -97,6 +105,11 @@ pub enum Act {
     TogglePanel,
     ToggleTheme,
     OpenPalette,
+
+    /// One of the commands that act on whatever is in front of you. The keys
+    /// and the menus already do these; this is the palette naming the same
+    /// one rather than a second copy of it.
+    Global(crate::ui::command::Global),
 }
 
 /// One line of a menu.
@@ -163,6 +176,47 @@ impl Menu {
             .sum();
         gpui::px(rows + 8.)
     }
+}
+
+/// The menu a right-click inside a document's source opens.
+///
+/// The clipboard first, because that is what a right-click in a text box is
+/// for, then the marks, which are the same ones the toolbar has. `selected`
+/// decides whether the entries that act on a selection are worth offering.
+pub fn for_source(selected: bool) -> Vec<Item> {
+    use crate::ui::editor::Markup;
+
+    let mut items = vec![Item::choice("Paste", "note", Act::PasteSelection)];
+    if selected {
+        items.insert(0, Item::choice("Copy", "note", Act::CopySelection));
+        items.insert(0, Item::choice("Cut", "close", Act::CutSelection));
+    }
+    items.push(Item::choice("Select all", "note", Act::SelectAllText));
+    items.push(Item::Separator);
+    items.push(Item::Heading("Format".into()));
+    for what in [
+        Markup::Around("**"),
+        Markup::Around("*"),
+        Markup::Around("`"),
+        Markup::Link,
+    ] {
+        items.push(Item::plain(what.label(), Act::Format(what)));
+    }
+    items.push(Item::Separator);
+    items.push(Item::Heading("Insert".into()));
+    for what in [
+        Markup::Prefix("# "),
+        Markup::Prefix("- "),
+        Markup::Numbered,
+        Markup::Prefix("> "),
+        Markup::Fence,
+        Markup::Table,
+        Markup::Rule,
+        Markup::Expression,
+    ] {
+        items.push(Item::plain(what.label(), Act::Format(what)));
+    }
+    items
 }
 
 /// The menu for a workspace in the side bar.

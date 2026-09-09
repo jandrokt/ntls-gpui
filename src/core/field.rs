@@ -15,6 +15,9 @@ pub enum FieldKind {
     Select,
     /// A switch.
     Bool,
+    /// A body: several lines, in a monospaced face, coloured as whatever it
+    /// is. What a request payload is typed into.
+    Code,
 }
 
 /// Marks a field's semantic purpose so the UI can wire tools together without
@@ -153,6 +156,10 @@ impl Expand {
 pub enum VisibleIf {
     Equals(&'static str, &'static str),
     NotEquals(&'static str, &'static str),
+    /// Hidden while the field named holds any of these. For the cases a
+    /// single `NotEquals` cannot say, such as a body being meaningless on
+    /// both GET and HEAD.
+    NoneOf(&'static str, &'static [&'static str]),
 }
 
 impl VisibleIf {
@@ -160,6 +167,10 @@ impl VisibleIf {
         match self {
             VisibleIf::Equals(k, v) => p.str(k) == *v,
             VisibleIf::NotEquals(k, v) => p.str(k) != *v,
+            VisibleIf::NoneOf(k, vs) => {
+                let held = p.str(k);
+                !vs.iter().any(|v| held == *v)
+            }
         }
     }
 }
@@ -182,6 +193,29 @@ pub struct Field {
     pub validate: Option<Validator>,
     pub expand: Option<Expand>,
     pub visible_if: Option<VisibleIf>,
+    /// Which other field says what language a [`FieldKind::Code`] field is
+    /// written in.
+    ///
+    /// The language is not fixed, because for a request body it is whatever
+    /// the body type is set to, and that is a choice made in another field a
+    /// moment earlier. Naming the field rather than the language is what lets
+    /// the colouring follow it.
+    pub syntax_from: Option<&'static str>,
+    /// Asks for a row of its own at the form's full width, instead of a cell
+    /// in the grid of preferences.
+    ///
+    /// For a field the grid's column is too narrow for: a set of seven
+    /// choices, which the grid crushes into unreadable stubs, or a body that
+    /// wants room to be typed into.
+    pub wide: bool,
+    /// A field most runs never touch, which the form folds away.
+    ///
+    /// Ten fields at one weight is a wall, and the wall is the same height
+    /// whether you came to change the target or the TLS behaviour. Marking
+    /// the fiddly ones puts the two or three that matter in front and the
+    /// rest one click away, without hiding anything: a folded section that
+    /// holds something set away from its default says so, and opens itself.
+    pub advanced: bool,
 }
 
 impl Field {
@@ -198,6 +232,9 @@ impl Field {
             validate: None,
             expand: None,
             visible_if: None,
+            syntax_from: None,
+            wide: false,
+            advanced: false,
         }
     }
 
@@ -216,6 +253,23 @@ impl Field {
         }
     }
 
+    /// A body, typed over several lines and coloured as whatever `syntax_from`
+    /// says it is. Always its own full-width row: a payload in a grid cell is
+    /// a payload nobody can read.
+    pub fn code(
+        key: &'static str,
+        label: &'static str,
+        help: &'static str,
+        syntax_from: &'static str,
+    ) -> Field {
+        Field {
+            kind: FieldKind::Code,
+            syntax_from: Some(syntax_from),
+            wide: true,
+            ..Field::text(key, label, help)
+        }
+    }
+
     pub fn boolean(key: &'static str, label: &'static str, help: &'static str, default: bool) -> Field {
         Field {
             kind: FieldKind::Bool,
@@ -226,6 +280,16 @@ impl Field {
 
     pub fn role(mut self, role: Role) -> Field {
         self.role = role;
+        self
+    }
+    /// Gives the field a row of its own at full width.
+    pub fn wide(mut self) -> Field {
+        self.wide = true;
+        self
+    }
+    /// Folds this away under "More settings".
+    pub fn advanced(mut self) -> Field {
+        self.advanced = true;
         self
     }
     pub fn default(mut self, v: &str) -> Field {
@@ -450,5 +514,24 @@ mod rate_tests {
         assert!(Validator::Rate.check("0.5").is_err());
         // One byte a second is absurd but expressible, so it is honoured.
         assert_eq!(parse_rate("1"), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+
+    #[test]
+    fn none_of_hides_the_field_for_every_name_it_lists() {
+        let rule = VisibleIf::NoneOf("method", &["GET", "HEAD"]);
+        let asking = |method: &str| {
+            let mut p = Params::default();
+            p.set("method", method);
+            rule.eval(&p)
+        };
+        assert!(!asking("GET"), "a GET carries no body");
+        assert!(!asking("HEAD"), "nor does a HEAD");
+        assert!(asking("POST"), "a POST does");
+        assert!(asking("PATCH"), "and so does a PATCH");
     }
 }

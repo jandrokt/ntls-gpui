@@ -5,16 +5,34 @@
 //! tools in the same workspace.
 
 use gpui::{
-    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
+    AnyElement, AppContext, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px, relative,
 };
 
 use crate::doc::{Block, Span, blocks};
 use crate::ui::app::App;
+use crate::ui::editor::Markup;
 use crate::ui::icons::icon;
 use crate::ui::notes::Data;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{Kind, Type, button, space, text};
+
+/// The edge between the source and the preview, while it is being dragged.
+///
+/// The drag carries nothing: which document it belongs to is on the handler,
+/// and the type alone is what tells one drag from another.
+#[derive(Clone)]
+pub struct DocSplit;
+
+/// A drag needs something to draw under the pointer, and this one wants
+/// nothing: the edge itself is the feedback.
+pub struct Nothing;
+
+impl gpui::Render for Nothing {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
 
 /// How wide a column of prose is allowed to get. Beyond this a line is hard to
 /// come back from at the start of the next one.
@@ -34,6 +52,14 @@ impl App {
         let data = Data::of(self.workspace());
         let Some(doc) = self.workspace().doc(id) else { return div().into_any_element() };
         let (title, path, scroll) = (doc.title(&data), doc.path.clone(), doc.scroll.clone());
+        let split = doc.preview.clamp(0., crate::ui::notes::PREVIEW_MOST);
+        let showing_preview = editor.is_none() || split > 0.;
+        // How wide the source half is right now, which is what one whole
+        // fraction of the drag is worth.
+        let source_width = editor
+            .as_ref()
+            .and_then(|e| e.read(cx).laid_out_width())
+            .map_or(600., f32::from);
         let dirty = editor.as_ref().is_some_and(|e| e.read(cx).dirty);
         // The expressions are worked out here, not in the file: the document
         // is the question and the tools are the answer, and the answer changes.
@@ -121,12 +147,32 @@ impl App {
                             app.toggle_editing(item, window, cx)
                         })),
                     )
+                    // The preview is worth watching while a document about
+                    // figures is written, and in the way while one about
+                    // words is. Only while there is a source to make room
+                    // for: with the source shut, the preview is the pane.
+                    .when(editor.is_some(), |d| {
+                        d.child(
+                            button(
+                                "doc-preview",
+                                "Preview",
+                                Kind::Toggle(showing_preview),
+                                theme,
+                            )
+                            .on_click(cx.listener(move |app, _, _, cx| {
+                                app.toggle_doc_preview(id, cx)
+                            })),
+                        )
+                    })
                     .child(
                         button("doc-external", "Open\u{2026}", Kind::Ghost, theme)
                             .on_click(cx.listener(move |app, _, _, cx| app.edit_doc(id, cx))),
                     ),
             )
             .child(super::rule(theme))
+            // What a markdown editor is for: the marks, without having to
+            // remember them.
+            .children(editor.clone().map(|editor| toolbar(editor, theme, cx)))
             // While it is being edited the pane is split: the source on the
             // left, and what it comes to on the right. A document's figures
             // are the reason to write one, so they are worth watching as you
@@ -140,37 +186,150 @@ impl App {
                         div()
                             .flex()
                             .flex_col()
-                            .w(relative(0.5))
+                            .when(showing_preview, |d| d.w(relative(1. - split)))
+                            .when(!showing_preview, |d| d.flex_1())
                             .min_w_0()
-                            .border_r_1()
-                            .border_color(theme.border)
                             .child(source_pane(editor, theme, cx))
                     }))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("doc-{id}")))
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .min_h_0()
-                            .px(px(space::GUTTER))
-                            .py(px(space::SECTION))
-                            .overflow_y_scroll()
-                            .track_scroll(&scroll)
-                            .when(empty, |d| {
-                                d.child(
-                                    div()
-                                        .text_small()
-                                        .text_color(theme.faint)
-                                        .child("This document is empty. Edit writes into it."),
-                                )
-                            })
-                            .children(body),
-                    ),
+                    // The edge between the two, dragged to give one of them
+                    // more room.
+                    .when(editor.is_some() && showing_preview, |d| {
+                        d.child(
+                            div()
+                                .id("doc-split")
+                                .w(px(5.))
+                                .flex_shrink_0()
+                                .h_full()
+                                .bg(theme.border)
+                                .cursor_col_resize()
+                                .hover(|s| s.bg(theme.accent))
+                                .on_drag(DocSplit, |_, _, _, cx| cx.new(|_| Nothing))
+                                .on_drag_move(cx.listener(
+                                    move |app, e: &gpui::DragMoveEvent<DocSplit>, _, cx| {
+                                        app.drag_doc_split(
+                                            id,
+                                            f32::from(e.event.position.x),
+                                            e.bounds,
+                                            source_width,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                        )
+                    })
+                    .when(showing_preview, |d| {
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("doc-{id}")))
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .px(px(space::GUTTER))
+                                .py(px(space::SECTION))
+                                .overflow_y_scroll()
+                                .track_scroll(&scroll)
+                                .when(empty, |d| {
+                                    d.child(
+                                        div()
+                                            .text_small()
+                                            .text_color(theme.faint)
+                                            .child("This document is empty. Edit writes into it."),
+                                    )
+                                })
+                                .children(body),
+                        )
+                    }),
             )
             .into_any_element()
     }
+}
+
+/// The formatting controls, above the source.
+///
+/// Markdown is a small language and almost nobody remembers all of it. These
+/// do what you would have typed, to whatever is selected, and each is a
+/// toggle: pressing Bold on bold text takes the marks off again.
+fn toolbar(
+    editor: gpui::Entity<crate::ui::editor::Editor>,
+    theme: &Theme,
+    cx: &mut Context<App>,
+) -> AnyElement {
+    let groups: [&[(&'static str, Markup)]; 4] = [
+        &[
+            ("H1", Markup::Prefix("# ")),
+            ("H2", Markup::Prefix("## ")),
+            ("H3", Markup::Prefix("### ")),
+        ],
+        &[
+            ("B", Markup::Around("**")),
+            ("I", Markup::Around("*")),
+            ("S", Markup::Around("~~")),
+            ("<>", Markup::Around("`")),
+        ],
+        &[
+            ("\u{2022}", Markup::Prefix("- ")),
+            ("1.", Markup::Numbered),
+            ("\u{201c}", Markup::Prefix("> ")),
+        ],
+        &[
+            ("Link", Markup::Link),
+            ("Code", Markup::Fence),
+            ("Table", Markup::Table),
+            ("Rule", Markup::Rule),
+            ("{{ }}", Markup::Expression),
+        ],
+    ];
+
+    let mut row = div()
+        .flex()
+        .items_center()
+        .gap(px(space::TIGHT))
+        .flex_shrink_0()
+        .px(px(space::GUTTER))
+        .py(px(space::SNUG))
+        .border_b_1()
+        .border_color(theme.border);
+
+    for (at, group) in groups.iter().enumerate() {
+        if at > 0 {
+            row = row.child(
+                div().w(px(1.)).h(px(16.)).mx(px(space::SNUG)).flex_shrink_0().bg(theme.rule),
+            );
+        }
+        for (label, what) in group.iter().copied() {
+            let editor = editor.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("md-{label}")))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(24.))
+                    .min_w(px(26.))
+                    .px(px(6.))
+                    .rounded(px(5.))
+                    .text_small()
+                    .text_color(theme.dim)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                    .child(label)
+                    .tooltip({
+                        let theme = *theme;
+                        let label = what.label();
+                        move |_, cx| cx.new(|_| super::chrome::Tip { label, theme }).into()
+                    })
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        editor.update(cx, |editor, cx| {
+                            editor.markup(what, cx);
+                            window.focus(&editor.focus_handle);
+                        });
+                    })),
+            );
+        }
+    }
+    row.into_any_element()
 }
 
 /// The editable half: the source, and whatever completion is offering.
@@ -179,11 +338,12 @@ pub(super) fn source_pane(
     theme: &Theme,
     cx: &mut Context<App>,
 ) -> AnyElement {
-    let (offering, at, offer) = {
+    let (offering, at, offer, room) = {
         let held = editor.read(cx);
-        (held.offering.clone(), held.offering_at, held.offer_at())
+        (held.offering.clone(), held.offering_at, held.offer_at(), held.laid_out_width())
     };
     let scroll = editor.read(cx).scroll.clone();
+    let selected = editor.read(cx).has_selection();
 
     div()
         .relative()
@@ -191,6 +351,15 @@ pub(super) fn source_pane(
         .flex_col()
         .flex_1()
         .min_h_0()
+        // A right-click in a text box is expected to offer the clipboard, and
+        // in a markdown one, the marks as well.
+        .on_mouse_down(
+            gpui::MouseButton::Right,
+            cx.listener(move |app, e: &gpui::MouseDownEvent, _, cx| {
+                app.open_menu(e.position, crate::ui::menu::for_source(selected), cx);
+                cx.stop_propagation();
+            }),
+        )
         .child(
             div()
                 .id("editor-scroll")
@@ -210,11 +379,21 @@ pub(super) fn source_pane(
         // The list follows the caret, so it reads as belonging to what is
         // being typed instead of to the pane.
         .children(offer.map(|origin| {
+            // Kept inside the editor. The list follows the caret, and a caret
+            // near the right-hand end used to put it out over the preview
+            // beside it, hiding the very text being typed.
+            const LIST: f32 = 280.;
+            let left = match room {
+                Some(width) => f32::from(origin.x)
+                    .min((f32::from(width) - LIST).max(0.))
+                    .max(0.),
+                None => f32::from(origin.x),
+            };
             div()
                 .absolute()
-                .left(origin.x + px(space::GUTTER))
+                .left(px(left) + px(space::GUTTER))
                 .top(origin.y + px(space::ROOMY) - scroll.offset().y)
-                .w(px(280.))
+                .w(px(LIST))
                 .max_h(px(220.))
                 .flex()
                 .flex_col()

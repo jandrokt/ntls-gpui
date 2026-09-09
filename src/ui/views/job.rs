@@ -14,7 +14,7 @@ use crate::ui::icons::icon;
 use crate::ui::job::Job;
 use crate::ui::store::Tag;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::{
+use crate::ui::widgets::{bar, 
     Kind, Segment, Segments, Type, button, dot, figure, icon_button, pill, progress_bar, space,
     switch, text,
 };
@@ -53,7 +53,12 @@ impl App {
         let form = show_form.then(|| self.form(theme, window, cx)).flatten();
         let summary = self.summary_strip(theme);
         let charts = expanded_chart.then(|| self.charts(theme)).flatten();
-        let show_table = show_table && comparison.is_none();
+        // The answer takes the room the table would have. They are two
+        // readings of the same run and stacking them leaves neither enough
+        // height to be worth having.
+        let answer = self.response(theme, window, cx);
+        let has_answer = answer.is_some();
+        let show_table = show_table && comparison.is_none() && !has_answer;
         let table = show_table.then(|| self.table(columns, theme, cx));
         let handoff = show_table.then(|| self.handoff_bar(theme, cx)).flatten();
 
@@ -72,11 +77,12 @@ impl App {
             .children(summary)
             .children(charts)
             .children(comparison)
+            .children(answer)
             .children(table)
             .children(handoff)
             // With no table to take the slack, the form floats at the top
             // and does not stretch down the pane.
-            .when(!show_table, |d| d.child(div().flex_1()))
+            .when(!show_table && !has_answer, |d| d.child(div().flex_1()))
             .into_any_element()
     }
 
@@ -114,6 +120,10 @@ impl App {
         let show_form = job.show_form;
         let panel_open = self.panel_open;
         let (has_charts, chart_expanded) = (!job.charts.is_empty(), job.chart_expanded);
+        // Only the tools that receive a whole answer have one to offer, so
+        // the button is not there at all for the ones that never will.
+        let has_answer_to_show = job.answer.is_some();
+        let showing_response = job.show_response;
         let failure = match &job.state {
             crate::ui::job::State::Failed(e) => Some(e.clone()),
             _ => None,
@@ -181,11 +191,16 @@ impl App {
                         d.child(
                         // The name is editable in place: clicking it is how a
                         // run gets called something other than its tool.
+                        //
+                        // Sized to what it says rather than taking the whole
+                        // row, so the star that belongs to it stays beside
+                        // it instead of drifting into the middle of the
+                        // header. A long name still gives way.
                         div()
                             .flex()
                             .flex_col()
-                            .flex_1()
                             .min_w_0()
+                            .max_w(px(420.))
                             .child({
                                 div()
                                     .id("rename-open")
@@ -217,55 +232,97 @@ impl App {
                             ),
                         )
                     })
-                    .children(elapsed.map(|e| {
-                        div()
-                            .text_meta()
-                            .text_color(theme.faint)
-                            .whitespace_nowrap()
-                            .child(e)
-                    }))
-                    .child(status_pill(&state, theme))
-                    .child(
-                        icon_button(
-                            "favorite",
-                            if favorite { "star-filled" } else { "star" },
-                            favorite,
-                            theme,
+                    // Everything but the name, which is not what
+                    // renaming is about. Naming a run and colouring it
+                    // are one act: the box, the swatches and the way out
+                    // take the row to themselves. Leaving the switcher
+                    // and the run buttons alongside them put more in the
+                    // row than fits, and two things asking for the
+                    // leftover space at once, so they overlapped.
+                    .when(!renaming, |d| {
+                        d
+                        .child(
+                            icon_button(
+                                "favorite",
+                                if favorite { "star-filled" } else { "star" },
+                                favorite,
+                                theme,
+                            )
+                            .on_click(cx.listener(|app, _, _, cx| app.toggle_favorite(cx))),
                         )
-                        .on_click(cx.listener(|app, _, _, cx| app.toggle_favorite(cx))),
-                    )
-                    .child(
-                        // Words, not symbols. A row of small glyphs is a
-                        // puzzle; three short labels are read at a glance.
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(2.))
-                            .child(
-                                button("toggle-chart", "Graph", Kind::Toggle(chart_expanded), theme)
-                                    .when(!has_charts, |d| d.opacity(0.3))
-                                    .on_click(cx.listener(|app, _, _, cx| {
-                                        if let Some(job) = app.selected_job_mut() {
-                                            job.chart_expanded = !job.chart_expanded;
+                        // A gap, so the name and the controls are two groups and
+                        // not one crowded row.
+                        .child(div().flex_1().min_w(px(space::SNUG)))
+                        .children(elapsed.map(|e| {
+                            div()
+                                .mono()
+                                .text_meta()
+                                .text_color(theme.faint)
+                                .whitespace_nowrap()
+                                .child(e)
+                        }))
+                        .child(status_pill(&state, theme))
+                        // What is on screen, as one control. Four toggles side
+                        // by side read as four loose words; the frame is what
+                        // says they are a set with one of them chosen. A tool
+                        // that never draws a graph or never receives an answer
+                        // has no such choice, so it is not offered one.
+                        .child(
+                            bar(theme)
+                                .when(has_charts, |d| {
+                                    d.child(
+                                        button(
+                                            "toggle-chart",
+                                            "Graph",
+                                            Kind::Tab(chart_expanded),
+                                            theme,
+                                        )
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            if let Some(job) = app.selected_job_mut() {
+                                                job.chart_expanded = !job.chart_expanded;
+                                                cx.notify();
+                                            }
+                                        })),
+                                    )
+                                })
+                                .when(has_answer_to_show, |d| {
+                                    d.child(
+                                        button(
+                                            "toggle-response",
+                                            "Response",
+                                            Kind::Tab(showing_response),
+                                            theme,
+                                        )
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            if let Some(job) = app.selected_job_mut() {
+                                                job.show_response = !job.show_response;
+                                                // The two cannot both have the
+                                                // pane, and the answer is what
+                                                // was just asked for.
+                                                if job.show_response {
+                                                    job.show_form = false;
+                                                }
+                                            }
                                             cx.notify();
-                                        }
-                                    })),
-                            )
-                            .child(
-                                button("toggle-log", "Output", Kind::Toggle(panel_open), theme)
-                                    .on_click(cx.listener(|app, _, _, cx| app.toggle_panel(cx))),
-                            )
-                            .child(
-                                button("toggle-form", "Settings", Kind::Toggle(show_form), theme)
-                                    .on_click(cx.listener(|app, _, window, cx| {
-                                        if let Some(job) = app.selected_job_mut() {
-                                            job.show_form = !job.show_form;
-                                        }
-                                        app.focus_form(window, cx);
-                                    })),
-                            ),
-                    )
-                    .children(self.run_controls(theme, cx)),
+                                        })),
+                                    )
+                                })
+                                .child(
+                                    button("toggle-log", "Output", Kind::Tab(panel_open), theme)
+                                        .on_click(cx.listener(|app, _, _, cx| app.toggle_panel(cx))),
+                                )
+                                .child(
+                                    button("toggle-form", "Settings", Kind::Tab(show_form), theme)
+                                        .on_click(cx.listener(|app, _, window, cx| {
+                                            if let Some(job) = app.selected_job_mut() {
+                                                job.show_form = !job.show_form;
+                                            }
+                                            app.focus_form(window, cx);
+                                        })),
+                                ),
+                        )
+                        .children(self.run_controls(theme, cx))
+                    }),
             )
             .children(failure.map(|e| {
                 div()
@@ -346,6 +403,21 @@ impl App {
     /// target gets a line of its own at full width and the rest sit in a grid
     /// beneath it. The help for a field appears when the field does, under
     /// the caret, or under the mistake.
+    ///
+    /// A field that asks for a line of its own is laid out where the tool put
+    /// it, not gathered with the other wide ones at the top. Gathering them
+    /// read fine while the only wide field was the target, but the HTTP tool
+    /// has three, in the middle: the body ended up above the Body type that
+    /// says what the body is, and the query, headers and credentials were
+    /// pushed below the payload. So the narrow fields pack into a wrapped
+    /// row, and a wide field closes whichever row is open and takes the next
+    /// line.
+    ///
+    /// Two things keep it from being a wall. The settings most runs never
+    /// touch fold away, so what is in front of you is the question and not
+    /// the whole of the tool; and the help has one line at the foot of the
+    /// form rather than a reserved line under every field, which was costing
+    /// a third of the form's height to say nothing at all.
     fn form(
         &mut self,
         theme: &Theme,
@@ -357,8 +429,19 @@ impl App {
         let fields = job.tool.fields();
         let error = job.field_error.clone();
 
-        let mut primary: Vec<AnyElement> = Vec::new();
-        let mut rest: Vec<AnyElement> = Vec::new();
+        // The form top to bottom, one entry per line of it, and the row of
+        // narrow fields still being filled. Twice over: what is always shown,
+        // and what is folded away behind "More settings".
+        let mut blocks: Vec<AnyElement> = Vec::new();
+        let mut packing: Vec<AnyElement> = Vec::new();
+        let mut folded: Vec<AnyElement> = Vec::new();
+        let mut folding: Vec<AnyElement> = Vec::new();
+        // The one line of help, which belongs to whichever field has the
+        // caret. A mistake outranks it: that is the thing to fix.
+        let mut helping: Option<(String, bool)> = None;
+        // Whether anything folded away has been set away from its default,
+        // which is what stops the fold from hiding a surprise.
+        let mut touched = 0usize;
 
         for (i, field) in fields.iter().enumerate() {
             let job = self.selected_job()?;
@@ -369,9 +452,20 @@ impl App {
                 .inputs
                 .get(i)
                 .and_then(Option::as_ref)
-                .is_some_and(|e| e.read(cx).focus_handle.is_focused(window));
+                .is_some_and(|e| e.read(cx).focus_handle.is_focused(window))
+                || job
+                    .bodies
+                    .get(i)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|e| e.read(cx).focus_handle.is_focused(window));
             let bad = error.as_ref().filter(|(fi, _)| *fi == i).map(|(_, m)| m.clone());
-            let wide = field.role == crate::core::Role::Target;
+            // Read while the job is still borrowed; the cell below is built
+            // from `self` and cannot hold on to it.
+            let away_from_default =
+                field.advanced && job.params.str(field.key) != field.default;
+            // The target is the question, so it gets a line of its own, and
+            // so does anything that says it needs one.
+            let wide = field.wide || field.role == crate::core::Role::Target;
 
             let editor: AnyElement = match field.kind {
                 FieldKind::Text => {
@@ -408,12 +502,55 @@ impl App {
                     let current = job.params.str(field.key);
                     segmented(self, field, &current, theme, cx)
                 }
+                FieldKind::Code => {
+                    let Some(Some(body)) = job.bodies.get(i) else { continue };
+                    // The language follows whatever the field it takes its
+                    // answer from is set to, so switching the body type
+                    // recolours what is already typed.
+                    let language = crate::ui::app::body_language(field, &job.params);
+                    let colours = crate::ui::editor::Colours::of(theme);
+                    body.update(cx, |body, cx| {
+                        body.colours = colours;
+                        if body.language != language {
+                            body.language = language;
+                            cx.notify();
+                        }
+                    });
+                    div()
+                        .id(SharedString::from(format!("body-{i}")))
+                        .flex()
+                        .flex_col()
+                        .h(px(180.))
+                        .w_full()
+                        .px(px(space::SNUG))
+                        .py(px(space::TIGHT))
+                        .rounded(px(6.))
+                        .bg(theme.raised)
+                        .border_1()
+                        .border_color(if bad.is_some() {
+                            theme.down
+                        } else if focused {
+                            theme.accent
+                        } else {
+                            theme.border
+                        })
+                        .overflow_hidden()
+                        .child(body.clone())
+                        .into_any_element()
+                }
             };
 
-            let hint = bad.clone().or_else(|| {
-                focused.then(|| selected_desc(field, self.selected_job())).filter(|s| !s.is_empty())
-            });
-            let hint_color = if bad.is_some() { theme.down } else { theme.faint };
+            // The help goes to the one line at the foot of the form. A
+            // mistake claims it whether or not the field has the caret,
+            // because a form that will not run has to say why somewhere.
+            if let Some(why) = bad.clone() {
+                helping = Some((why, true));
+            } else if focused && helping.as_ref().is_none_or(|(_, bad)| !bad) {
+                let help = selected_desc(field, self.selected_job());
+                if !help.is_empty() {
+                    helping = Some((help, false));
+                }
+            }
 
             let row = div()
                 .flex()
@@ -421,31 +558,40 @@ impl App {
                 .gap(px(5.))
                 .when(!wide, |d| d.w(px(232.)))
                 .when(wide, |d| d.w_full())
-                .child(
-                    div()
-                        .text_meta()
-                        .text_color(theme.dim)
-                        .child(field.label),
-                )
+                .child(div().text_meta().text_color(theme.dim).child(field.label))
                 .child(editor)
-                .child(
-                    // The hint has a reserved line, so a field does not jump
-                    // when its help appears. It is exactly one line box tall:
-                    // anything shorter clips the text it is reserving room
-                    // for, and the hint turns into an ellipsis.
-                    div()
-                        .w_full()
-                        .h(text::LINE)
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_meta()
-                        .text_color(hint_color)
-                        .child(hint.unwrap_or_default()),
-                )
                 .into_any_element();
 
-            if wide { primary.push(row) } else { rest.push(row) }
+            let (into, packing_here) = if field.advanced {
+                if away_from_default {
+                    touched += 1;
+                }
+                (&mut folded, &mut folding)
+            } else {
+                (&mut blocks, &mut packing)
+            };
+            if wide {
+                if !packing_here.is_empty() {
+                    into.push(narrow_row(std::mem::take(packing_here)));
+                }
+                into.push(div().flex().flex_col().max_w(px(560.)).child(row).into_any_element());
+            } else {
+                packing_here.push(row);
+            }
         }
+        if !packing.is_empty() {
+            blocks.push(narrow_row(packing));
+        }
+        if !folding.is_empty() {
+            folded.push(narrow_row(folding));
+        }
+
+        // A fold that hides something set away from its default is a fold
+        // that hides a surprise, so it opens itself and says how many.
+        let job = self.selected_job()?;
+        let open = job.more_open || touched > 0;
+        let more = folded.len();
+        let (hint, wrong) = helping.map_or((String::new(), false), |(h, bad)| (h, bad));
 
         Some(
             div()
@@ -462,16 +608,17 @@ impl App {
                         .px(px(GUTTER))
                         .py(px(space::ROOMY))
                         .overflow_y_scroll()
-                        .child(div().flex().flex_col().max_w(px(560.)).children(primary))
-                        .when(!rest.is_empty(), |d| {
-                            d.child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap_x(px(space::SECTION))
-                                    .gap_y(px(space::SNUG))
-                                    .children(rest),
-                            )
+                        .children(blocks)
+                        .when(more > 0, |d| {
+                            d.child(fold(open, touched, theme, cx)).when(open, |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(space::ROOMY))
+                                        .children(folded),
+                                )
+                            })
                         })
                         .child(
                             div()
@@ -483,7 +630,258 @@ impl App {
                                 .child(
                                     button("form-defaults", "Reset", Kind::Ghost, theme)
                                         .on_click(cx.listener(|app, _, _, cx| app.reset_fields(cx))),
+                                )
+                                .child(div().flex_1())
+                                // One line of help for the whole form,
+                                // always in the same place, so nothing has
+                                // to reserve room for it.
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .max_w(px(520.))
+                                        .h(text::LINE)
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_meta()
+                                        .text_color(if wrong { theme.down } else { theme.faint })
+                                        .child(hint),
                                 ),
+                        ),
+                )
+                .child(rule(theme))
+                .into_any_element(),
+        )
+    }
+
+    /// What the server actually said.
+    ///
+    /// A row says what happened and the log says a little about it; this is
+    /// the answer itself, and it is the thing you open a request tool to
+    /// read. JSON and XML are coloured so the shape can be seen at a glance;
+    /// anything else is left alone but still monospaced, because an answer is
+    /// data and data does not line up in a proportional face.
+    fn response(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let job = self.selected_job()?;
+        if !job.show_response {
+            return None;
+        }
+        let answer = job.answer.as_ref()?;
+
+        let (headers_shown, raw) = (job.show_headers, job.raw_body);
+        let (body, language) = shown(answer, headers_shown, raw);
+        // The tool keeps up to eight megabytes of an answer so a value can be
+        // captured out of it. Drawing eight megabytes is a different matter:
+        // it is one text element with a highlight range per token, hundreds
+        // of thousands of them, laid out on the thread that draws the window.
+        // What is shown is the part anybody reads, and the strip above says
+        // when there is more.
+        let (body, clipped) = clip_for_reading(body);
+
+        let colours = crate::ui::editor::Colours::of(theme);
+        let highlights: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> =
+            crate::ui::syntax::highlight_flat(language, &body)
+                .into_iter()
+                .filter(|s| !s.range.is_empty())
+                .map(|s| {
+                    (
+                        s.range,
+                        gpui::HighlightStyle {
+                            color: Some(colours.of_kind(s.kind)),
+                            font_weight: Some(crate::ui::editor::Colours::weight_of(s.kind)),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+
+        let ok = (200..400).contains(&answer.status);
+        let head = format!("{} {}", answer.status, answer.reason);
+        let kind = if answer.content_type.is_empty() {
+            "no content type".to_string()
+        } else {
+            answer.content_type.clone()
+        };
+        let size = crate::dl::names::bytes(answer.body.len() as u64);
+        let lines = body.lines().count();
+        let truncated = answer.truncated;
+        let headers = answer.headers.len();
+        // The two halves of the time it took. A server thinking for a second
+        // and a megabyte crawling down a slow link are different problems,
+        // and one number for both cannot say which you have.
+        let timing = (answer.waited > 0. || answer.read > 0.).then(|| {
+            format!(
+                "waited {} \u{b7} read {}",
+                crate::tools::stats::ms(std::time::Duration::from_secs_f64(
+                    answer.waited / 1000.
+                )),
+                crate::tools::stats::ms(std::time::Duration::from_secs_f64(
+                    answer.read / 1000.
+                ))
+            )
+        });
+        let landed = (!answer.landed.is_empty()).then(|| answer.landed.clone());
+        let asked = (!answer.url.is_empty())
+            .then(|| format!("{} {}", answer.method, answer.url));
+        let can_copy = answer.body.clone();
+        // The button says so for a moment after it worked. Long enough to
+        // read, short enough not to be mistaken for a state.
+        const SAID_FOR: std::time::Duration = std::time::Duration::from_millis(1400);
+        let just_copied = job.copied_at.is_some_and(|at| at.elapsed() < SAID_FOR);
+        // The label goes back on its own, which needs a frame to go back on.
+        if just_copied {
+            window.request_animation_frame();
+        }
+        let pretty_possible =
+            !headers_shown && response_language(&answer.content_type)
+                == crate::ui::syntax::Language::Json;
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    // What the answer was, before what it said.
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(space::SNUG))
+                        .flex_shrink_0()
+                        .px(px(GUTTER))
+                        .py(px(space::SNUG))
+                        .child(if ok {
+                            pill(head.clone(), theme.up, theme.up_soft)
+                        } else {
+                            pill(head.clone(), theme.down, theme.down_soft)
+                        })
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_meta()
+                                .text_color(theme.dim)
+                                .truncate()
+                                .child(format!("{kind} · {size} · {lines} lines")),
+                        )
+                        .children(timing.map(|timing| {
+                            div().text_meta().text_color(theme.dim).child(timing)
+                        }))
+                        .when(truncated, |d| {
+                            d.child(pill("cut short", theme.warn, theme.warn_soft))
+                        })
+                        .when(clipped, |d| {
+                            d.child(pill("showing the first part", theme.warn, theme.warn_soft))
+                        })
+                        .child(div().flex_1())
+                        // Which half of the answer, how it is laid out, and
+                        // a way to take it somewhere else.
+                        .child(
+                            button(
+                                "response-body-half",
+                                "Body",
+                                Kind::Toggle(!headers_shown),
+                                theme,
+                            )
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                if let Some(job) = app.selected_job_mut() {
+                                    job.show_headers = false;
+                                    cx.notify();
+                                }
+                            })),
+                        )
+                        .child(
+                            button(
+                                "response-headers-half",
+                                format!("Headers ({headers})"),
+                                Kind::Toggle(headers_shown),
+                                theme,
+                            )
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                if let Some(job) = app.selected_job_mut() {
+                                    job.show_headers = true;
+                                    cx.notify();
+                                }
+                            })),
+                        )
+                        .when(pretty_possible, |d| {
+                            d.child(
+                                button("response-raw", "Raw", Kind::Toggle(raw), theme).on_click(
+                                    cx.listener(|app, _, _, cx| {
+                                        if let Some(job) = app.selected_job_mut() {
+                                            job.raw_body = !job.raw_body;
+                                            cx.notify();
+                                        }
+                                    }),
+                                ),
+                            )
+                        })
+                        .child(
+                            button(
+                                "response-copy",
+                                if just_copied { "Copied" } else { "Copy" },
+                                if just_copied { Kind::Toggle(true) } else { Kind::Ghost },
+                                theme,
+                            )
+                            .on_click(cx.listener(move |app, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    can_copy.clone(),
+                                ));
+                                if let Some(job) = app.selected_job_mut() {
+                                    job.copied_at = Some(std::time::Instant::now());
+                                }
+                                cx.notify();
+                            })),
+                        ),
+                )
+                // What was asked, and where it ended up when that is not
+                // where it was sent. A redirect that lands somewhere else is
+                // the answer to a different question than the one typed.
+                .children(asked.map(|asked| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(space::SNUG))
+                        .flex_shrink_0()
+                        .px(px(GUTTER))
+                        .pb(px(space::SNUG))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .mono()
+                                .text_meta()
+                                .text_color(theme.faint)
+                                .truncate()
+                                .child(asked),
+                        )
+                        .children(landed.map(|landed| {
+                            div()
+                                .min_w_0()
+                                .mono()
+                                .text_meta()
+                                .text_color(theme.warn)
+                                .truncate()
+                                .child(format!("\u{2192} {landed}"))
+                        }))
+                }))
+                .child(rule(theme))
+                .child(
+                    div()
+                        .id("response-body")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_scroll()
+                        .px(px(GUTTER))
+                        .py(px(space::SNUG))
+                        .font_family(crate::ui::theme::MONO)
+                        .text_small()
+                        .text_color(theme.text)
+                        .child(
+                            gpui::StyledText::new(body).with_highlights(highlights),
                         ),
                 )
                 .child(rule(theme))
@@ -1267,6 +1665,93 @@ fn field_switch(
         .child(switch(&format!("field-{field_index}"), on, theme))
 }
 
+/// What the response pane shows, and how to colour it.
+///
+/// Three choices in one place: which half of the answer, whether the body is
+/// laid out or left as it arrived, and what language that makes it. Minified
+/// JSON is one line a thousand characters wide, unreadable and unscrollable
+/// at once; laid out it is the shape the service actually sent. Raw is for
+/// when the question is about the bytes, and the headers are a list of names
+/// and values whatever the body happens to be.
+fn shown(
+    answer: &crate::core::Answer,
+    headers: bool,
+    raw: bool,
+) -> (String, crate::ui::syntax::Language) {
+    use crate::ui::syntax::Language;
+
+    if headers {
+        let listed = answer
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return (listed, Language::Text);
+    }
+    let language = response_language(&answer.content_type);
+    match language {
+        Language::Json if !raw => (pretty_json(&answer.body), language),
+        _ => (answer.body.clone(), language),
+    }
+}
+
+/// How much of an answer the pane draws.
+///
+/// Generous enough that a real answer arrives whole, small enough that the
+/// window still draws in a frame. An answer larger than this is a file, and
+/// the download tool is the one that fetches files.
+const READABLE: usize = 256 * 1024;
+
+/// The part of an answer worth drawing, and whether anything was left out.
+///
+/// Cut on a line boundary where there is one nearby, so the last line shown
+/// is a whole line rather than half a token, and on a character boundary
+/// always, because slicing a `str` anywhere else is not allowed.
+fn clip_for_reading(body: String) -> (String, bool) {
+    if body.len() <= READABLE {
+        return (body, false);
+    }
+    let mut end = READABLE;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &body[..end];
+    let end = head.rfind('\n').map_or(end, |at| at + 1);
+    (body[..end].to_string(), true)
+}
+
+/// Which language an answer is read in, from what the server said it was.
+///
+/// The content type and not the body: a service that says `application/json`
+/// and sends an HTML error page is telling you something, and guessing from
+/// the bytes would hide it. HTML is read as XML, which is close enough to see
+/// the shape of a page.
+fn response_language(content_type: &str) -> crate::ui::syntax::Language {
+    use crate::ui::syntax::Language;
+    let kind = content_type.to_ascii_lowercase();
+    if kind.contains("json") {
+        Language::Json
+    } else if kind.contains("xml") || kind.contains("html") {
+        Language::Xml
+    } else {
+        Language::Text
+    }
+}
+
+/// An answer laid out over several lines, when it is JSON.
+///
+/// Almost nothing sends JSON with newlines in it, and one line a thousand
+/// characters wide cannot be read or scrolled. Anything that does not parse is
+/// handed back untouched: a truncated body is still worth showing, and so is
+/// one that was never JSON whatever its content type claimed.
+fn pretty_json(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| body.to_string())
+}
+
 /// One colour a thing can be tagged with.
 pub(super) fn swatch(
     tag: Tag,
@@ -1305,6 +1790,52 @@ pub(super) fn swatch(
 
 /// The width the note column takes once there is anything in it.
 const NOTE_WIDTH: Pixels = px(200.);
+
+/// The line that opens and shuts the settings most runs never touch.
+///
+/// It says how many are set away from their default, because a fold that
+/// quietly holds a changed setting is worse than no fold: the run would do
+/// something the visible half of the form does not account for.
+fn fold(open: bool, touched: usize, theme: &Theme, cx: &mut Context<App>) -> AnyElement {
+    div()
+        .id("form-more")
+        .flex()
+        .items_center()
+        .gap(px(space::SNUG))
+        .h(px(26.))
+        .w(px(232.))
+        .px(px(space::SNUG))
+        .rounded(px(6.))
+        .cursor_pointer()
+        .text_meta()
+        .text_color(theme.dim)
+        .hover(|s| s.bg(theme.hover))
+        .child(icon(if open { "chevron-down" } else { "chevron-right" }, px(11.), theme.faint))
+        .child("More settings")
+        .when(touched > 0, |d| {
+            d.child(pill(format!("{touched} changed"), theme.accent, theme.accent_soft))
+        })
+        .on_click(cx.listener(|app, _, _, cx| {
+            if let Some(job) = app.selected_job_mut() {
+                job.more_open = !job.more_open;
+                cx.notify();
+            }
+        }))
+        .into_any_element()
+}
+
+/// One line of the form: the narrow fields that fit side by side on it. They
+/// wrap when the window is too tight for the lot, which is why the row is a
+/// wrap and not a fixed set of columns.
+fn narrow_row(fields: Vec<AnyElement>) -> AnyElement {
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_x(px(space::SECTION))
+        .gap_y(px(space::SNUG))
+        .children(fields)
+        .into_any_element()
+}
 
 /// What the row for this machine's own address is called, in the words the
 /// system it is running on uses for itself.
@@ -1675,6 +2206,114 @@ fn selected_desc(field: &crate::core::Field, job: Option<&Job>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn answered() -> crate::core::Answer {
+        crate::core::Answer {
+            status: 200,
+            reason: "OK".into(),
+            content_type: "application/json".into(),
+            headers: vec![
+                ("content-type".into(), "application/json".into()),
+                ("server".into(), "gunicorn".into()),
+            ],
+            body: r#"{"a":1,"b":[2,3]}"#.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_response_pane_shows_the_half_that_was_asked_for() {
+        use crate::ui::syntax::Language;
+        let answer = answered();
+
+        // The body, laid out, and coloured as what it is.
+        let (body, language) = shown(&answer, false, false);
+        assert!(body.contains("\n"), "minified JSON is laid out: {body:?}");
+        assert_eq!(language, Language::Json);
+
+        // Raw is exactly what arrived, still read as JSON.
+        let (body, language) = shown(&answer, false, true);
+        assert_eq!(body, r#"{"a":1,"b":[2,3]}"#);
+        assert_eq!(language, Language::Json);
+
+        // The headers are a list of names and values, whatever the body is.
+        let (body, language) = shown(&answer, true, false);
+        assert_eq!(body, "content-type: application/json\nserver: gunicorn");
+        assert_eq!(language, Language::Text);
+    }
+
+    #[test]
+    fn an_answer_that_is_not_json_is_left_exactly_as_it_came() {
+        let answer = crate::core::Answer {
+            content_type: "text/plain".into(),
+            body: "79.116.21.76\n".into(),
+            ..answered()
+        };
+        // Laying out is a thing that can be done to JSON and to nothing
+        // else, so the toggle changes nothing here.
+        let (laid, _) = shown(&answer, false, false);
+        let (raw, _) = shown(&answer, false, true);
+        assert_eq!(laid, "79.116.21.76\n");
+        assert_eq!(raw, laid);
+    }
+
+    #[test]
+    fn an_answer_is_read_in_the_language_the_server_said_it_was() {
+        use crate::ui::syntax::Language;
+        // The content type and not the body: a service that says JSON and
+        // sends an HTML error page is telling you something, and guessing
+        // from the bytes would hide it.
+        assert_eq!(super::response_language("application/json"), Language::Json);
+        assert_eq!(super::response_language("application/vnd.api+json"), Language::Json);
+        assert_eq!(super::response_language("text/xml"), Language::Xml);
+        assert_eq!(super::response_language("TEXT/HTML; charset=utf-8"), Language::Xml);
+        assert_eq!(super::response_language("text/plain"), Language::Text);
+        assert_eq!(super::response_language(""), Language::Text);
+    }
+
+    #[test]
+    fn minified_json_is_laid_out_before_it_is_shown() {
+        // Almost nothing sends JSON with newlines in it, and one line a
+        // thousand characters wide can be neither read nor scrolled.
+        let laid_out = super::pretty_json(r#"{"a":1,"b":[2,3]}"#);
+        assert!(laid_out.lines().count() > 1, "{laid_out}");
+        assert!(laid_out.contains("\"a\": 1"), "{laid_out}");
+
+        // Anything that is not JSON comes back untouched: a body cut short
+        // is still worth showing, and so is one that was never JSON whatever
+        // its content type claimed.
+        assert_eq!(super::pretty_json("<html>"), "<html>");
+        assert_eq!(super::pretty_json("{\"a\":1"), "{\"a\":1");
+    }
+
+    #[test]
+    fn an_answer_too_big_to_draw_is_cut_on_a_line_and_says_so() {
+        // The tool keeps megabytes so a value can be captured out of them.
+        // Drawing megabytes is one text element with a highlight range per
+        // token, on the thread that draws the window.
+        let small = "one\ntwo\n".to_string();
+        let (body, clipped) = super::clip_for_reading(small.clone());
+        assert_eq!((body, clipped), (small, false));
+
+        let huge = "abcdefgh\n".repeat(60_000);
+        let (body, clipped) = super::clip_for_reading(huge);
+        assert!(clipped);
+        assert!(body.len() <= super::READABLE);
+        // On a line boundary, so the last line shown is a whole one.
+        assert!(body.ends_with('\n'), "{:?}", &body[body.len() - 12..]);
+    }
+
+    #[test]
+    fn a_wide_character_at_the_cut_is_not_sliced_through() {
+        // Slicing a `str` anywhere but a character boundary is not allowed,
+        // and an answer full of accents or CJK puts one wherever it likes.
+        let body = "\u{4e16}\u{754c}".repeat(200_000);
+        let (shown, clipped) = super::clip_for_reading(body);
+        assert!(clipped);
+        // It got back a valid string at all, which is the whole assertion.
+        assert!(shown.chars().count() > 0);
+        assert!(shown.len() <= super::READABLE);
+    }
     use super::*;
     use crate::core::col;
 

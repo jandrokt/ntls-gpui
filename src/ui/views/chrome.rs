@@ -239,7 +239,11 @@ impl App {
                                 .text_small()
                                 .text_color(theme.faint)
                                 .truncate()
-                                .child("Search or run a command"),
+                                // What the box does, all three of them. The
+                                // second and third are the ones nobody finds
+                                // on their own, and this strip is where
+                                // people go looking.
+                                .child("Search, run a tool, or > for commands"),
                         )
                         .child(keycap(&crate::sys::shortcut_label("cmd-k"), theme))
                         .on_click(cx.listener(|app, _, window, cx| app.open_palette(window, cx))),
@@ -574,7 +578,7 @@ impl App {
             .child(count_badge(count, theme))
             .when(closable, |d| {
                 d.child(
-                    close_button(format!("ws-close-{id}"), theme).on_mouse_down(
+                    close_button(format!("ws-close-{id}"), "treerow", false, theme).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |app, _, _, cx| {
                             app.close_workspace(index, cx);
@@ -1028,8 +1032,6 @@ impl App {
             .into_any_element()
     }
 
-    /// What this machine is attached to, useful to have open while a
-    /// scan runs.
     // --- the editor's tab strip -------------------------------------------
 
     /// A tab per open tool, in the order the keyboard walks them.
@@ -1596,6 +1598,12 @@ fn section(
                 .px(px(space::TIGHT))
                 .rounded(px(4.))
                 .text_meta()
+                // Out of the way until the pointer is on the heading. Four
+                // groups meant four standing offers to delete everything in
+                // one, which is a lot of destruction to leave lying around a
+                // list you read all day. Once armed it stays put, because
+                // then it is a question waiting for an answer.
+                .when(!armed, |d| d.opacity(0.).group_hover("section", |s| s.opacity(1.)))
                 .when(armed, |d| d.bg(theme.down_soft).text_color(theme.down))
                 .when(!armed, |d| d.text_color(theme.faint).hover(|s| s.text_color(theme.down)))
                 .cursor_pointer()
@@ -1689,6 +1697,9 @@ fn folder_header(
 fn tree_shell(id: String, selected: bool, theme: &Theme) -> gpui::Stateful<gpui::Div> {
     div()
         .id(SharedString::from(id))
+        // What the row's own close button watches, so the cross is out of
+        // the way until the pointer is on the row it belongs to.
+        .group("treerow")
         .flex()
         .items_center()
         .gap(px(space::TIGHT))
@@ -1701,7 +1712,19 @@ fn tree_shell(id: String, selected: bool, theme: &Theme) -> gpui::Stateful<gpui:
         .when(!selected, |d| d.hover(|s| s.bg(theme.hover)))
 }
 
-pub(super) fn close_button(id: String, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+/// `group` names the row or tab this sits in, and `always` is whether it is
+/// the one being looked at.
+///
+/// Out of the way until the pointer is on its row. A dozen tabs and rows,
+/// each with a standing × beside its name, is a dozen small glyphs competing
+/// with the words they belong to; the one you are on keeps its × because
+/// that is the one you are most likely to be closing.
+pub(super) fn close_button(
+    id: String,
+    group: &'static str,
+    always: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(SharedString::from(id))
         .flex()
@@ -1712,6 +1735,7 @@ pub(super) fn close_button(id: String, theme: &Theme) -> gpui::Stateful<gpui::Di
         .rounded(px(3.))
         .text_meta()
         .text_color(theme.faint)
+        .when(!always, |d| d.opacity(0.).group_hover(group, |s| s.opacity(1.)))
         .hover(|s| s.bg(theme.track).text_color(theme.text))
         .child("×")
 }
@@ -1740,6 +1764,7 @@ fn tree_row(
 
     div()
         .id(SharedString::from(format!("row-{id}")))
+        .group("treerow")
         .flex()
         .flex_col()
         .flex_shrink_0()
@@ -1836,7 +1861,7 @@ fn tree_row(
                     }
                     _ => div().w(px(0.)).into_any_element(),
                 })
-                .child(close_button(format!("row-close-{id}"), theme).on_mouse_down(
+                .child(close_button(format!("row-close-{id}"), "treerow", selected, theme).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |app, _, _, cx| {
                         app.close_job(id, cx);
@@ -1898,6 +1923,7 @@ fn doc_row(
 
     div()
         .id(SharedString::from(format!("doc-{id}")))
+        .group("treerow")
         .flex()
         .flex_col()
         .flex_shrink_0()
@@ -1963,7 +1989,7 @@ fn doc_row(
                 .when(mark.favorite, |d| {
                     d.child(div().flex_shrink_0().child(icon("star-filled", px(11.), theme.warn)))
                 })
-                .child(close_button(format!("doc-close-{id}"), theme).on_mouse_down(
+                .child(close_button(format!("doc-close-{id}"), "treerow", selected, theme).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |app, _, _, cx| {
                         app.close_doc_tab(id, cx);
@@ -2004,6 +2030,7 @@ fn flow_row(
 
     div()
         .id(SharedString::from(format!("flow-{id}")))
+        .group("treerow")
         .flex()
         .flex_col()
         .flex_shrink_0()
@@ -2080,7 +2107,7 @@ fn flow_row(
                     d.child(div().flex_shrink_0().child(icon("star-filled", px(11.), theme.warn)))
                 })
                 .when(running, |d| d.child(ring(theme.accent)))
-                .child(close_button(format!("flow-close-{id}"), theme).on_mouse_down(
+                .child(close_button(format!("flow-close-{id}"), "treerow", selected, theme).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |app, _, _, cx| {
                         app.close_flow_tab(id, cx);
@@ -2122,7 +2149,7 @@ fn flow_tab(
                 .child(sheet.title()),
         )
         .when(sheet.running(), |d| d.child(ring(theme.accent)))
-        .child(close_button(format!("flowtab-close-{id}"), theme).on_mouse_down(
+        .child(close_button(format!("flowtab-close-{id}"), "tabrow", active, theme).on_mouse_down(
             MouseButton::Left,
             cx.listener(move |app, _, _, cx| {
                 app.close_flow_tab(id, cx);
@@ -2161,7 +2188,7 @@ fn doc_tab(
                 .truncate()
                 .child(title),
         )
-        .child(close_button(format!("doctab-close-{id}"), theme).on_mouse_down(
+        .child(close_button(format!("doctab-close-{id}"), "tabrow", active, theme).on_mouse_down(
             MouseButton::Left,
             cx.listener(move |app, _, _, cx| {
                 app.close_doc_tab(id, cx);
@@ -2175,6 +2202,7 @@ fn doc_tab(
 fn tab_shell(id: String, active: bool, theme: &Theme) -> gpui::Stateful<gpui::Div> {
     div()
         .id(SharedString::from(id))
+        .group("tabrow")
         .relative()
         .flex()
         .items_center()
@@ -2209,6 +2237,7 @@ fn tab(job: &Job, active: bool, theme: &Theme, cx: &mut Context<App>) -> AnyElem
 
     div()
         .id(SharedString::from(format!("tab-{id}")))
+        .group("tabrow")
         .flex()
         .items_center()
         .gap(px(space::TIGHT))
@@ -2267,7 +2296,7 @@ fn tab(job: &Job, active: bool, theme: &Theme, cx: &mut Context<App>) -> AnyElem
         .when(running, |d| d.child(ring(theme.accent)))
         // A tab is a view of a tool, so closing it closes the view. The tool
         // stays in the side bar and its file stays on disk.
-        .child(close_button(format!("tab-close-{id}"), theme).on_mouse_down(
+        .child(close_button(format!("tab-close-{id}"), "tabrow", active, theme).on_mouse_down(
             MouseButton::Left,
             cx.listener(move |app, _, _, cx| {
                 app.close_tab(id, cx);

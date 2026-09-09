@@ -35,10 +35,41 @@ single socket.
 ### HTTP checks
 
 The HTTP tool sends whatever you tell it to: any method, query parameters
-(escaped for you), headers, Basic or Bearer credentials, a body as text, JSON
-or form. It can go through a proxy, follow redirects or not, force HTTP/1.1,
-and skip certificate checking for the appliance in the rack with a self-signed
-cert.
+(escaped for you), headers, Basic or Bearer credentials, a body as text, JSON,
+XML or form. It can go through a proxy, follow redirects or not, force
+HTTP/1.1, and skip certificate checking for the appliance in the rack with a
+self-signed cert.
+
+The body gets an editor rather than a one-line box, coloured for whichever
+body type you picked, so a payload of any size is something you can read.
+**Attachments** takes one file per line, `/tmp/report.pdf` or
+`name=/tmp/report.pdf` to choose what the part is called; sending any turns
+the request into `multipart/form-data`, and a `form` body is split into
+fields alongside the files.
+
+Paste a `curl` line into the URL box and the rest of the form fills itself:
+the method, the headers, the body and its type, the credentials, and the
+switches that change the request. A bearer token arrives as a header and
+becomes the credential, where you would think to look for it. Anything the
+line does not say is left as it was, so a `curl` without `-k` doesn't turn
+off a switch you had on. That is how an HTTP request is usually handed
+round — in an issue, in a service's own docs, off a browser's *copy as
+cURL* — and retyping one a field at a time is the tedium the form was
+supposed to remove.
+
+**Response** shows what came back: the status, the content type, the size,
+and the body itself. JSON is pretty-printed and coloured, XML is coloured,
+and anything else is left alone but set in a monospaced face so columns line
+up. **Headers** swaps the body for what came back with it, **Raw** leaves the
+body exactly as it arrived when the question is about the bytes, and **Copy**
+takes it away with you.
+
+Beside the size are the two halves of the time it took: **waited**, which is
+everything up to the first byte — name resolution, the connection, the
+handshake, and the far end's own thinking — and **read**, which is the answer
+arriving. A server thinking for a second and a megabyte crawling down a slow
+link are different problems, and one number for both can't tell you which one
+you have.
 
 Two fields turn a request into a check. **Expect** says what a good answer
 is: `any`, `2xx`, `404`, `200-204`, or a list. Anything else turns
@@ -50,6 +81,30 @@ If what you capture is a number it gets graphed next to the response time, and
 it shows up in the run's summary, so `{{ "Status page".value.last() }}` works
 in a document. Set the request count to 60 with a one minute interval and
 you've got a monitor.
+
+Capture is for one value per request, on every request. For the rest of the
+answer, a document or a workflow can reach into the last one directly:
+
+```
+{{ http.response.status }}                  200
+{{ http.response.type }}                    application/json
+{{ http.response.headers["x-request-id"] }} a header, by a name a dot can't spell
+{{ http.json.queue.depth }}                 straight down into the JSON
+{{ http.json.hosts[0] }}                    an array in it is a list
+{{ http.json.keys }}                        what came back, without guessing
+{{ if http.response.status == 200 then "up" else "down" }}
+```
+
+Name the run instead of the tool (`"Status page".json.queue.depth`) when the
+workspace has more than one. A property that isn't there is nothing rather
+than an error, so a service that omits a value on a quiet day doesn't stop
+the document from rendering.
+
+You don't have to know the shape in advance. Type a dot after the run and
+completion lists what it answered beside its columns, with what's actually
+there next to each name; keep going and it walks down into the answer a level
+at a time. The workflow's condition controls offer the same paths under *What
+it answered*.
 
 ## Installing
 
@@ -127,6 +182,45 @@ workspaces, open tools, documents by a line inside them, workflows by a run
 they start, network interfaces, and every row of every result table. An address
 you scanned last week is one query away, and picking it opens the workspace,
 the tool and the row.
+
+It matches five ways, best first: the whole of what you typed, the start of a
+name, the start of a word inside one, anywhere inside one, and finally its
+letters in order but not together — so `psc` finds the port scan. Whichever
+letters answered are picked out in the row, because a match three words in
+otherwise looks like no match at all. Answers arrive under a heading each,
+with the heading holding the best answer first.
+
+And it does things, not only finds them. Everything in the menus is in there —
+run, stop, duplicate, export, compare, close, rename the workspace, switch
+between light and dark — named after whatever is in front of you, so it reads
+`Run Port scan` and not `Run`. Each shows the keys that also do it, which is
+the bar teaching them rather than replacing them. A command that would do
+nothing isn't offered: no Stop while nothing runs, no *Next workspace* when
+there is only one.
+
+`>` narrows the list to those, when a word like `run` would otherwise name a
+tool, a run and a command at once. With nothing typed at all, the bar opens on
+what you last used.
+
+Every tool's form puts the question in front and folds the rest away. What
+you came to change — the target, and the one or two knobs a run actually
+turns — is what you see; timeouts, concurrency, retries and the like sit
+under **More settings**. A fold that holds something set away from its
+default says how many and opens itself, so it can't hide a setting the run
+will act on. The help for whichever field has the caret has one line at the
+foot of the form, rather than a reserved line under every field.
+
+A tool's pane is one shape whatever the tool: what it is called and what it
+is pointed at on the left, and on the right what state it is in, one control
+for switching between the table, the graph, the response and the settings,
+and the run buttons. Only the switches that mean something are there — a tool
+that never draws a graph is not offered one.
+
+The window keeps its affordances out of the way until you want them. A tab's
+close cross and a side bar row's appear when the pointer is on them, and stay
+on the one you are looking at; a group heading's *Delete all* appears when the
+pointer is on the heading. Four standing offers to delete everything in a
+group is a lot of destruction to leave lying around a list you read all day.
 
 `⌘R` runs, `⌘.` stops. Stopping keeps what was found, and the buttons become
 Resume and Restart. The IP scan and DNS lookup also have a *Keep earlier
@@ -262,8 +356,20 @@ where it is, in red, with the reason.
 
 The editor highlights as you type and completes what it knows about: runs in
 this workspace, variables, the columns and summary figures of whatever run you
-named before the dot, and the language's functions. Tab accepts, arrows walk
-the list, escape dismisses.
+named before the dot, whatever it answered, and the language's functions. Tab
+accepts, arrows walk the list, escape dismisses.
+
+A toolbar sits above the source with the marks nobody remembers all of:
+headings, bold, italic, strikethrough, inline code, bullet and numbered
+lists, quotes, links, code blocks, tables, dividers, and `{{ }}`. Each acts on
+the selection and each is a toggle, so pressing **B** on bold text takes the
+marks off again; a line mark like a heading or a bullet applies to every line
+the selection touches. Right-clicking the source offers the same, with the
+clipboard above it.
+
+**Preview** hides the rendered half when you would rather have the room to
+write, and the edge between the two drags. Dragged far enough it shuts, and
+the button puts it back.
 
 *Open in another editor…* hands the file to whatever you normally write
 markdown in.
@@ -276,10 +382,10 @@ workflow writes that down, and you build it by clicking.
 
 ![The workflow editor with steps, a condition and a variable being set](docs/workflow.png)
 
-*Add step* offers the six kinds. Every block ends in a faint `+ step` for
-putting one inside a branch or a repeat. Click a step and its controls appear
+*Add step* offers the nine kinds. Every block ends in a faint `+ step` for
+putting one inside a branch or a loop. Click a step and its controls appear
 on its line: which run a `run` starts, how many passes a `repeat` does, how
-long a `wait` waits.
+long a `wait` waits, what a `for each` walks.
 
 Conditions are picked, not typed. *only if* opens four controls (which run,
 which of its figures, how to compare, what to compare against) and each one
@@ -312,17 +418,77 @@ stop if Sweep.down > 20
 | Step | Does |
 | --- | --- |
 | `run "Name"` | Starts a run in this workspace and waits for it |
+| `run "Name" with field = …` | The same, having set some of that tool's fields first |
 | `if … { } else { }` | Branches |
 | `repeat 3 { }` | Repeats a fixed number of times |
+| `for each x in … { }` | Once for every item of a list, with the item under `x` |
+| `while … { }` | Round again for as long as a condition holds |
 | `wait 30s` | Pauses |
 | `set name = expression` | Works something out and keeps it |
+| `print expression` | Says something into the run log and changes nothing |
 | `stop` | Ends the workflow |
 
-`run` and `stop` can carry their own `if`. Conditions are evaluated when the
-step is reached, not when the workflow starts, so a step sees what the steps
-before it found. A step whose condition is false is skipped and says so. A run
-that fails stops the workflow; carrying on would mean acting on results that
-don't exist.
+`run`, `stop` and `while` can carry their own `if`. Conditions are evaluated
+when the step is reached, not when the workflow starts, so a step sees what
+the steps before it found. A step whose condition is false is skipped and says
+so. A run that fails stops the workflow; carrying on would mean acting on
+results that don't exist.
+
+### Doing something to each of them
+
+A workflow that can only run tools exactly as they were left is a list of
+buttons. `for each` and `with` are what make it a program: walk what the last
+run found, and point the next tool at each one.
+
+```text
+# Scan whatever answered
+
+run "Sweep"
+log "sweeping found " + Sweep.up + " hosts"
+
+for each host in Sweep.host {
+  run "Ports" with target = host, ports = "1-1024"
+  if Ports.open > 0 {
+    run "Grab the banner" with target = host
+  }
+}
+```
+
+**Log** keeps everything a run said, oldest first, stamped with how far into
+the run each line was. That is where `print` goes, and it is the only place
+every pass of one survives: the trail against a step keeps the latest pass,
+so a `print` inside a loop would otherwise show only its last time round.
+Failures and the start and end of the run are in there too, so it reads as a
+record of what happened.
+
+The list is any expression: a column of a run (`Sweep.host`), an array out of
+an answer (`Health.json.hosts`), or a single value, which counts as a list of
+one. An item that is an object keeps its shape, so the body can ask it for a
+field:
+
+```text
+for each slide in Catalogue.json.slideshow.slides {
+  run "Echo" with target = "https://example.com/" + slide.id
+  print "sent " + slide.title
+}
+```
+
+The name belongs to the walk, not to the workspace: it is gone when the
+workflow finishes, and a walk inside a walk may reuse a name without the outer
+one losing its place. Every step inside a loop says how many passes it did.
+
+`with` sets the tool's own fields, by their names, each to whatever its
+expression comes to at that moment. Completion offers the names once the line
+says which tool it is. A field that tool does not have, or a value that cannot
+be worked out, stops the workflow and says which one: running it as it
+happened to be left would be doing something other than what was asked. The
+tool keeps what it was last run with, so its form and its results agree
+afterwards.
+
+A `while` goes round for as long as its condition holds, which is what `repeat`
+cannot say: waiting for something to come up, or draining a queue. It cannot
+run away with the window — a workflow that asks for more than a million
+operations is given up on where it stands, and the trail says so.
 
 ## Expressions
 

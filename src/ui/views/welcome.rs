@@ -42,7 +42,11 @@ impl App {
                     .flex_col()
                     .gap(px(space::SECTION))
                     .w_full()
-                    .max_w(px(860.))
+                    // Wide enough for the longest thing a tool says about
+                    // itself. At 860 the description column came out around
+                    // 280 pixels and every other line was cut off mid-word,
+                    // with half the window empty beside it.
+                    .max_w(px(1080.))
                     .px(px(48.))
                     .pt(px(56.))
                     .pb(px(48.))

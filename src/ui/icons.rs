@@ -38,6 +38,8 @@ icons![
     "sun",
     "download",
     "explorer",
+    "list",
+    "info",
     "panel",
     "sidebar",
     "gear",
