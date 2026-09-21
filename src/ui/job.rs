@@ -60,16 +60,73 @@ pub struct LogLine {
 }
 
 /// A live chart: one named series of observations.
+///
+/// A sample is `None` where the tool had nothing to record — a probe that
+/// timed out — so the hole keeps its place on the time axis and the chart
+/// breaks its line across it instead of drawing straight over the outage.
 #[derive(Clone, Debug)]
 pub struct Series {
     pub name: String,
     pub unit: String,
-    pub values: Vec<f64>,
+    pub values: Vec<Option<f64>>,
 }
 
-/// How many samples a chart keeps. Past this the oldest fall off the left,
-/// the way a live graph should.
-const MAX_SAMPLES: usize = 1200;
+impl Series {
+    /// How many samples actually carry a number. A series of nothing but
+    /// holes has no shape to draw.
+    pub fn points(&self) -> usize {
+        self.values.iter().filter(|v| v.is_some()).count()
+    }
+
+    /// The newest sample, which is `None` while the thing being watched is
+    /// not answering. The last number known is not the current one.
+    pub fn latest(&self) -> Option<f64> {
+        self.values.last().copied().flatten()
+    }
+}
+
+/// Files one observation against the series it belongs to, opening that
+/// series if this is the first thing heard about it.
+fn record(
+    charts: &mut Vec<Series>,
+    series: String,
+    unit: String,
+    value: Option<f64>,
+    keep: usize,
+) {
+    let s = match charts.iter_mut().position(|s| s.name == series) {
+        Some(i) => &mut charts[i],
+        // A gap is a hole in a line and cannot start one, so a tool whose
+        // first probes all fail does not open a chart with nothing in it.
+        None if value.is_none() => return,
+        None => {
+            charts.push(Series { name: series, unit, values: Vec::new() });
+            charts.last_mut().expect("just pushed")
+        }
+    };
+    s.values.push(value);
+    trim(s, keep);
+}
+
+/// Drops whatever no longer fits in the window a chart is allowed, oldest
+/// first, and then any hole left at the left edge: a chart that begins with
+/// samples nothing was recorded for begins with empty space.
+fn trim(s: &mut Series, keep: usize) {
+    let keep = keep.clamp(2, MAX_CHART_CEILING);
+    if s.values.len() > keep {
+        s.values.drain(..s.values.len() - keep);
+    }
+    let lead = s.values.iter().take_while(|v| v.is_none()).count();
+    s.values.drain(..lead);
+}
+
+/// The most a chart will ever hold, whatever the settings are edited to say.
+const MAX_CHART_CEILING: usize = 10_000;
+
+/// How many samples a chart keeps when nobody has said. The settings own the
+/// real figure; this is what a job uses until it is told, and the ceiling a
+/// chart is never allowed past.
+const MAX_SAMPLES: usize = 100;
 
 /// How many log lines are kept. A wide scan can log thousands and only the
 /// recent ones are ever read.
@@ -175,6 +232,9 @@ pub struct Job {
     /// Whether the graph takes the whole pane. It is always drawn when there
     /// is anything to draw; the button decides how much room it gets.
     pub chart_expanded: bool,
+    /// How many samples the charts keep, from the settings. It is kept on the
+    /// job because that is where the samples arrive.
+    chart_keep: usize,
     pub field_error: Option<(usize, String)>,
 
     pub table_scroll: UniformListScrollHandle,
@@ -245,6 +305,7 @@ impl Job {
             show_form: true,
             show_response: false,
             chart_expanded: false,
+            chart_keep: MAX_SAMPLES,
             field_error: None,
             table_scroll: UniformListScrollHandle::new(),
             shown: 0,
@@ -313,6 +374,12 @@ impl Job {
             .iter()
             .map(|s| Series { name: s.name.clone(), unit: s.unit.clone(), values: s.values.clone() })
             .collect();
+        // A file written when the window was wider than it is now still holds
+        // everything it held then.
+        let keep = self.chart_keep;
+        for s in &mut self.charts {
+            trim(s, keep);
+        }
         self.answer = record.answer.clone();
         self.extras =
             self.answer.as_ref().map(crate::ui::notes::extras_for).unwrap_or_default();
@@ -442,17 +509,7 @@ impl Job {
             }
             Event::Progress { done, total, label } => self.progress = Some((done, total, label)),
             Event::Sample { series, unit, value } => {
-                let s = match self.charts.iter_mut().find(|s| s.name == series) {
-                    Some(s) => s,
-                    None => {
-                        self.charts.push(Series { name: series, unit, values: Vec::new() });
-                        self.charts.last_mut().expect("just pushed")
-                    }
-                };
-                s.values.push(value);
-                if s.values.len() > MAX_SAMPLES {
-                    s.values.remove(0);
-                }
+                record(&mut self.charts, series, unit, value, self.chart_keep)
             }
         }
     }
@@ -612,8 +669,21 @@ impl Job {
         (count(Level::Good), count(Level::Warn), count(Level::Error))
     }
 
+    /// Sets how many samples the charts keep, bringing what they already
+    /// hold down to it. Lowering the setting should show in the graph in
+    /// front of you, not on the next run.
+    pub fn set_chart_keep(&mut self, keep: usize) {
+        if self.chart_keep == keep {
+            return;
+        }
+        self.chart_keep = keep;
+        for s in &mut self.charts {
+            trim(s, keep);
+        }
+    }
+
     /// The most recent chart samples, for the sparkline in the side bar.
-    pub fn spark(&self, width: usize) -> Option<&[f64]> {
+    pub fn spark(&self, width: usize) -> Option<&[Option<f64>]> {
         let s = self.charts.first()?;
         let n = s.values.len().min(width);
         (n > 0).then(|| &s.values[s.values.len() - n..])
@@ -792,6 +862,63 @@ fn leading_number(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use super::{Series, record};
+
+    fn samples(charts: &[Series]) -> Vec<Option<f64>> {
+        charts.first().map(|s| s.values.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_probe_that_got_no_reply_leaves_a_hole_and_not_a_line_across_it() {
+        let mut charts = Vec::new();
+        record(&mut charts, "rtt".into(), " ms".into(), Some(10.0), 100);
+        record(&mut charts, "rtt".into(), String::new(), None, 100);
+        record(&mut charts, "rtt".into(), String::new(), None, 100);
+        record(&mut charts, "rtt".into(), " ms".into(), Some(12.0), 100);
+
+        // Both failures keep their place, so the break is as wide as the
+        // outage was long.
+        assert_eq!(samples(&charts), vec![Some(10.0), None, None, Some(12.0)]);
+        assert_eq!(charts[0].points(), 2);
+        assert_eq!(charts[0].latest(), Some(12.0));
+    }
+
+    #[test]
+    fn a_run_that_never_answers_opens_no_chart_at_all() {
+        let mut charts = Vec::new();
+        for _ in 0..5 {
+            record(&mut charts, "rtt".into(), String::new(), None, 100);
+        }
+        assert!(charts.is_empty(), "a graph of nothing is not worth a panel");
+    }
+
+    #[test]
+    fn a_chart_keeps_the_last_few_samples_and_starts_on_a_real_one() {
+        let mut charts = Vec::new();
+        for i in 0..10 {
+            record(&mut charts, "rtt".into(), " ms".into(), Some(i as f64), 4);
+        }
+        assert_eq!(samples(&charts), vec![Some(6.0), Some(7.0), Some(8.0), Some(9.0)]);
+
+        // Trimming can leave the window opening on a hole, and a chart that
+        // begins with empty space begins with nothing to draw.
+        record(&mut charts, "rtt".into(), String::new(), None, 4);
+        record(&mut charts, "rtt".into(), String::new(), None, 4);
+        assert_eq!(samples(&charts), vec![Some(8.0), Some(9.0), None, None]);
+        record(&mut charts, "rtt".into(), String::new(), None, 2);
+        assert_eq!(samples(&charts), vec![], "nothing but holes is nothing");
+    }
+
+    /// While the thing being watched is silent there is no current reading,
+    /// and the last one known is not it.
+    #[test]
+    fn the_figure_beside_a_chart_is_blank_during_an_outage() {
+        let mut charts = Vec::new();
+        record(&mut charts, "rtt".into(), " ms".into(), Some(10.0), 100);
+        record(&mut charts, "rtt".into(), String::new(), None, 100);
+        assert_eq!(charts[0].latest(), None);
+    }
+
     use super::{Row, compare, place, shorten, upsert};
 
     #[test]

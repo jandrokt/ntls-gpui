@@ -185,11 +185,17 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                         cells![seq, from, ms(r.rtt), r.ttl_text(), r.detail_line()],
                     );
                 }
-                Err(e) => emit.row(
-                    Status::Down,
-                    target.to_string(),
-                    cells![seq, target, "-", "", failure_text(e)],
-                ),
+                Err(e) => {
+                    // A probe that got no reply is a hole in the graph, not a
+                    // line from the last reply to the next one: an outage
+                    // should look like an outage.
+                    emit.emit(Event::gap("round-trip time"));
+                    emit.row(
+                        Status::Down,
+                        target.to_string(),
+                        cells![seq, target, "-", "", failure_text(e)],
+                    );
+                }
             }
 
             let s = st.lock().unwrap();

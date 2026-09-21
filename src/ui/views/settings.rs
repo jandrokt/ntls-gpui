@@ -99,6 +99,24 @@ impl App {
     fn results_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let follow = self.settings.follow_results;
         let keep = self.settings.default_for("keep") == Some("true");
+        let samples = self.settings.chart_samples;
+        let windows: Vec<(SharedString, bool, usize)> = [50usize, 100, 250, 1000]
+            .into_iter()
+            .map(|n| (SharedString::from(n.to_string()), n == samples, n))
+            .collect();
+        let samples_choice = choose(
+            self,
+            "chart-samples",
+            windows,
+            theme,
+            cx,
+            |app: &mut App, n: usize, _: &mut Window, cx| {
+                app.settings.chart_samples = n;
+                app.retrim_charts();
+                app.save_settings();
+                cx.notify();
+            },
+        );
 
         section(
             "Results",
@@ -121,6 +139,12 @@ impl App {
                     toggle("keep", keep, theme, cx, |app, on, _, cx| {
                         app.set_field_default("keep", Some(if on { "true" } else { "false" }), cx);
                     }),
+                ),
+                setting(
+                    "Points on a graph",
+                    "How much of a run the graph shows. Older readings fall off the left.",
+                    theme,
+                    samples_choice,
                 ),
             ],
         )

@@ -908,7 +908,7 @@ impl App {
         let inline = (!job.chart_expanded)
             .then(|| job.charts.first())
             .flatten()
-            .filter(|s| s.values.len() > 1)
+            .filter(|s| s.points() > 1)
             .map(|s| spark(s.values.clone(), theme.accent, px(132.), px(30.)));
         let bar = job
             .progress

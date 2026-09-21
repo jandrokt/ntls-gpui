@@ -1802,6 +1802,17 @@ impl App {
         cx.notify();
     }
 
+    /// Brings every chart down to the number of samples the settings now ask
+    /// for, so a smaller window is the one on screen straight away.
+    pub fn retrim_charts(&mut self) {
+        let keep = self.settings.chart_keep();
+        for w in &mut self.workspaces {
+            for j in &mut w.jobs {
+                j.set_chart_keep(keep);
+            }
+        }
+    }
+
     /// Writes the settings file. It is small and written rarely, so it is
     /// written whole every time, not kept in step by hand.
     pub fn save_settings(&self) {
@@ -2228,7 +2239,9 @@ impl App {
         let mut open_panel = false;
         let mut just_finished = None;
         let follow = self.settings.follow_results;
+        let keep = self.settings.chart_keep();
         let Some(job) = self.job_anywhere_mut(job_id) else { return };
+        job.set_chart_keep(keep);
         // Read before the rows arrive: it is where the reader was on the frame
         // they are about to change.
         let end = follow.then(|| job.end_in_view()).flatten();

@@ -171,6 +171,10 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
 
     let done = Arc::new(AtomicUsize::new(0));
     let up = Arc::new(AtomicUsize::new(0));
+    // Hosts that answered and whose hardware address the scan never learnt.
+    // An empty column is a question, and the end of the run is where it gets
+    // answered.
+    let nameless = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
 
     // A single publisher keeps the stat bar coherent while workers finish in
@@ -204,6 +208,7 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
     for _ in 0..workers.max(1) {
         let (queue, prober, emit, done, up, cancel) =
             (queue.clone(), prober.clone(), emit.clone(), done.clone(), up.clone(), cancel.clone());
+        let nameless = nameless.clone();
         let (seen, answered) = (seen.clone(), answered.clone());
         handles.push(tokio::spawn(async move {
             loop {
@@ -248,6 +253,9 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
                     }
                     Ok(r) => {
                         up.fetch_add(1, Ordering::Relaxed);
+                        if r.mac.is_empty() {
+                            nameless.fetch_add(1, Ordering::Relaxed);
+                        }
                         let name = if resolve {
                             dns::reverse_name(addr, Duration::from_millis(900)).await
                         } else {
@@ -318,6 +326,18 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
             kv("kept", quiet.len().to_string()),
             kv("elapsed", elapsed(start.elapsed())),
         ]);
+    }
+
+    // The hardware column empty against a host that answered has a reason,
+    // and it is not one the reader can be expected to work out.
+    let missing = nameless.load(Ordering::Relaxed);
+    if missing > 0
+        && let Some(why) = prober.hardware_gap()
+    {
+        emit.info(format!(
+            "{missing} of {} host(s) that answered gave no hardware address: {why}",
+            up.load(Ordering::Relaxed)
+        ));
     }
 
     let found = up.load(Ordering::Relaxed);

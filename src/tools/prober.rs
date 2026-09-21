@@ -106,6 +106,41 @@ impl Probe {
     }
 }
 
+/// Whether an ICMP answer is the target's own, and the reason it is not when
+/// it is not.
+///
+/// What answered matters as much as that something answered. A router saying
+/// an address cannot be reached is not that address replying, and it was
+/// being counted as one: a dead host on a subnet whose router bothers to
+/// answer came back up, with the router's address in the FROM column and a
+/// real round-trip time beside it. A sweep of such a subnet called every
+/// empty address alive.
+///
+/// An echo reply carries the same question one step further. It is the
+/// target's answer only when the target is what sent it; something else
+/// answering in its place -- a router with proxy ARP on, a gateway standing
+/// in for a whole subnet, another machine that has taken the address -- is
+/// not the host being asked about, whatever the round-trip time says.
+fn answered_itself(rep: &icmp::Reply, addr: IpAddr) -> Result<(), ProbeError> {
+    match rep.kind {
+        icmp::ReplyKind::Echo if rep.from == addr => Ok(()),
+        icmp::ReplyKind::Echo => Err(ProbeError::Other(format!(
+            "{} answered for it, not {addr} itself",
+            rep.from
+        ))),
+        icmp::ReplyKind::Unreachable => Err(ProbeError::Other(format!(
+            "{}, from {}",
+            icmp::unreachable_note(rep.code),
+            rep.from
+        ))),
+        // These go out with a full hop limit, so one running out is a packet
+        // that died on the way, not a host that answered.
+        icmp::ReplyKind::TimeExceeded => {
+            Err(ProbeError::Other(format!("hop limit exceeded at {}", rep.from)))
+        }
+    }
+}
+
 /// Why a probe failed, in the words the table cell wants.
 pub fn failure_text(e: &ProbeError) -> String {
     e.to_string()
@@ -141,8 +176,19 @@ pub struct Prober {
     /// Resolves hardware addresses for hosts found over ICMP, which does not
     /// reveal them on its own. `None` when the lookup is off or unavailable.
     macs: Option<arp::ArpProber>,
+    /// Why a host that answered might still have no hardware address against
+    /// it, for the scan to say once at the end if any did. `None` when the
+    /// lookup was never asked for, since an empty column somebody switched
+    /// off needs no explaining.
+    hardware_gap: Option<String>,
     notes: Vec<(Level, String)>,
 }
+
+/// What it means when the machine can ask the wire and still learns nothing:
+/// the host answered a ping that a router carried, and nothing on this link
+/// holds its address.
+const ARP_WENT_UNANSWERED: &str =
+    "nothing answered an ARP request for them, which is what a host reached through a router looks like from here";
 
 /// How long a hardware lookup is given, and the range the scan's own timeout
 /// can move it inside.
@@ -177,6 +223,7 @@ impl Prober {
             payload: p.usize("size", 56),
             timeout,
             macs: None,
+            hardware_gap: None,
             notes: Vec::new(),
         };
 
@@ -208,11 +255,11 @@ impl Prober {
         // ICMP tells you a host is there but nothing about what it is. When
         // the targets are on this link, a second ARP lookup fills that in, and
         // it only runs for hosts that actually answered.
-        if pr.kind == METHOD_ICMP
-            && p.bool("vendors")
-            && targets.iter().any(|t| iface::is_local_link(*t))
-        {
-            pr.macs = arp::ArpProber::new(Some(&iface_name), src).ok();
+        if pr.kind == METHOD_ICMP && p.bool("vendors") {
+            let anywhere_local = targets.iter().any(|t| iface::is_local_link(*t));
+            if anywhere_local {
+                pr.macs = arp::ArpProber::new(Some(&iface_name), src).ok();
+            }
             // An empty hardware column is otherwise unexplained, and the
             // reason is worth saying once.
             match pr.macs.as_ref() {
@@ -220,14 +267,29 @@ impl Prober {
                     for n in macs.notes() {
                         pr.notes.push((Level::Warn, n));
                     }
+                    pr.hardware_gap = Some(
+                        "this system will not show them to an unprivileged process".into(),
+                    );
                 }
                 Some(macs) if macs.mode() == arp::Mode::Raw => {
                     pr.notes.push((
                         Level::Info,
                         "resolving hardware addresses with real ARP requests".into(),
                     ));
+                    pr.hardware_gap = Some(ARP_WENT_UNANSWERED.into());
                 }
-                _ => {}
+                Some(_) => pr.hardware_gap = Some(ARP_WENT_UNANSWERED.into()),
+                // Nothing being on this link is a fact about the range, and
+                // the one reason the column can be empty that is worth
+                // saying before a single host has answered.
+                None if !anywhere_local => {
+                    let gap = "hardware addresses are a property of the local link and cannot be resolved for a host reached through a router";
+                    pr.notes.push((Level::Info, gap.into()));
+                    pr.hardware_gap = Some(gap.into());
+                }
+                None => {
+                    pr.hardware_gap = Some("the ARP prober could not be opened".into());
+                }
             }
         }
 
@@ -238,6 +300,12 @@ impl Prober {
     /// itself was told to be.
     fn mac_timeout(&self) -> Duration {
         self.timeout.clamp(MAC_LOOKUP_MIN, MAC_LOOKUP_MAX)
+    }
+
+    /// Why a host that answered could still have no hardware address, said
+    /// once at the end of a scan that learnt none for some of them.
+    pub fn hardware_gap(&self) -> Option<&str> {
+        self.hardware_gap.as_deref()
     }
 
     /// Caveats worth showing the user before results start arriving.
@@ -281,27 +349,7 @@ impl Prober {
             .ok_or(ProbeError::Icmp(icmp::PingError::Cancelled))?
             .map_err(ProbeError::Icmp)?;
 
-        // What answered matters as much as that something answered. A router
-        // saying an address cannot be reached is not that address replying,
-        // and it was being counted as one: a dead host on a subnet whose
-        // router bothers to answer came back up, with the router's address in
-        // the FROM column and a real round-trip time beside it. A sweep of
-        // such a subnet called every empty address alive.
-        match rep.kind {
-            icmp::ReplyKind::Echo => {}
-            icmp::ReplyKind::Unreachable => {
-                return Err(ProbeError::Other(format!(
-                    "{}, from {}",
-                    icmp::unreachable_note(rep.code),
-                    rep.from
-                )));
-            }
-            // These go out with a full hop limit, so one running out is a
-            // packet that died on the way, not a host that answered.
-            icmp::ReplyKind::TimeExceeded => {
-                return Err(ProbeError::Other(format!("hop limit exceeded at {}", rep.from)));
-            }
-        }
+        answered_itself(&rep, addr)?;
 
         let mut out = Probe {
             rtt: rep.rtt,
@@ -344,4 +392,45 @@ pub fn resolve_targets(spec: &str, iface_name: &str, emit: &Emitter) -> Result<V
 /// How many targets are somewhere ARP cannot reach.
 pub fn off_link_count(targets: &[IpAddr]) -> usize {
     targets.iter().filter(|t| !iface::is_local_link(**t)).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn reply(kind: icmp::ReplyKind, from: &str) -> icmp::Reply {
+        icmp::Reply {
+            kind,
+            from: from.parse().expect("an address"),
+            rtt: Duration::from_millis(1),
+            ttl: 64,
+            code: 1,
+        }
+    }
+
+    #[test]
+    fn a_host_that_answers_for_itself_is_the_one_that_is_up() {
+        let target: IpAddr = "192.0.2.10".parse().unwrap();
+        assert!(answered_itself(&reply(icmp::ReplyKind::Echo, "192.0.2.10"), target).is_ok());
+    }
+
+    #[test]
+    fn something_else_answering_in_its_place_is_not_the_host_being_asked_about() {
+        let target: IpAddr = "192.0.2.10".parse().unwrap();
+
+        // An echo reply from another address: a gateway answering for a
+        // machine that is not there. It has a round-trip time and everything,
+        // and it is still not that machine.
+        let stand_in = answered_itself(&reply(icmp::ReplyKind::Echo, "192.0.2.1"), target)
+            .expect_err("a reply from elsewhere is not this host");
+        assert!(stand_in.to_string().contains("192.0.2.1"), "{stand_in}");
+
+        // And the two reports a router sends about an address, which were
+        // never the address speaking.
+        for kind in [icmp::ReplyKind::Unreachable, icmp::ReplyKind::TimeExceeded] {
+            assert!(answered_itself(&reply(kind, "192.0.2.1"), target).is_err(), "{kind:?}");
+        }
+    }
 }

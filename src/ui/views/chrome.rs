@@ -1755,7 +1755,7 @@ fn tree_row(
     let (tag_value, tag) = (job.tag, job.tag.color());
     let (favourite, open) = (job.favorite, job.open);
     let digest = job.digest();
-    let samples: Option<Vec<f64>> = job.spark(36).map(<[f64]>::to_vec);
+    let samples: Option<Vec<Option<f64>>> = job.spark(36).map(<[Option<f64>]>::to_vec);
     let has_secondary = !digest.is_empty() || samples.is_some();
     let theme_drag = *theme;
     let job_name = job.name().to_string();

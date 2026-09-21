@@ -16,7 +16,12 @@ use super::widgets::Type;
 /// A graph small enough to sit in a list row: the shape of the series and
 /// nothing else. No axis, no numbers, no block characters pretending to be a
 /// picture.
-pub fn spark(values: Vec<f64>, color: gpui::Hsla, width: Pixels, height: Pixels) -> impl IntoElement {
+pub fn spark(
+    values: Vec<Option<f64>>,
+    color: gpui::Hsla,
+    width: Pixels,
+    height: Pixels,
+) -> impl IntoElement {
     let (lo, hi) = bounds_of(&values);
 
     div().w(width).h(height).flex_shrink_0().py(px(3.)).child(
@@ -33,33 +38,100 @@ pub fn spark(values: Vec<f64>, color: gpui::Hsla, width: Pixels, height: Pixels)
                     point(bounds.left() + step * i as f32, y.clamp(bounds.top(), bounds.bottom()))
                 };
 
-                let mut area = PathBuilder::fill();
-                area.move_to(point(bounds.left(), bounds.bottom()));
-                for (i, v) in values.iter().enumerate() {
-                    area.line_to(at(i, *v));
-                }
-                area.line_to(point(bounds.right(), bounds.bottom()));
-                area.close();
-                if let Ok(path) = area.build() {
-                    window.paint_path(path, color.opacity(0.18));
-                }
-
-                let mut stroke = PathBuilder::stroke(px(1.2));
-                for (i, v) in values.iter().enumerate() {
-                    let p = at(i, *v);
-                    if i == 0 {
-                        stroke.move_to(p);
-                    } else {
-                        stroke.line_to(p);
-                    }
-                }
-                if let Ok(path) = stroke.build() {
-                    window.paint_path(path, color);
-                }
+                draw(
+                    window,
+                    &values,
+                    &at,
+                    bounds.bottom(),
+                    color.opacity(0.18).into(),
+                    color,
+                    px(1.2),
+                );
             },
         )
         .size_full(),
     )
+}
+
+/// Draws a series as a filled area under a line, one unbroken run of samples
+/// at a time.
+///
+/// The runs are what makes a gap a gap. A ping that stops answering for a
+/// minute used to be a straight line from the last reply to the first one
+/// after it, which reads as a minute of steady latency rather than a minute
+/// of nothing, and the longer the outage the more confident the lie looked.
+fn draw(
+    window: &mut Window,
+    values: &[Option<f64>],
+    at: &dyn Fn(usize, f64) -> gpui::Point<Pixels>,
+    baseline: Pixels,
+    fill: gpui::Background,
+    line: Hsla,
+    weight: Pixels,
+) {
+    for run in runs(values) {
+        // A single reading between two outages has no line to be part of, so
+        // it is drawn as the point it is rather than dropped.
+        if let [(i, v)] = run[..] {
+            let p = at(i, v);
+            let r = weight.max(px(1.5));
+            window.paint_quad(quad(
+                Bounds::from_corners(point(p.x - r, p.y - r), point(p.x + r, p.y + r)),
+                r,
+                line,
+                px(0.),
+                gpui::transparent_black(),
+                Default::default(),
+            ));
+            continue;
+        }
+
+        let (first, last) = (run[0], run[run.len() - 1]);
+        let mut area = PathBuilder::fill();
+        area.move_to(point(at(first.0, first.1).x, baseline));
+        for &(i, v) in &run {
+            area.line_to(at(i, v));
+        }
+        area.line_to(point(at(last.0, last.1).x, baseline));
+        area.close();
+        if let Ok(path) = area.build() {
+            window.paint_path(path, fill);
+        }
+
+        let mut stroke = PathBuilder::stroke(weight);
+        for (n, &(i, v)) in run.iter().enumerate() {
+            let p = at(i, v);
+            if n == 0 {
+                stroke.move_to(p);
+            } else {
+                stroke.line_to(p);
+            }
+        }
+        if let Ok(path) = stroke.build() {
+            window.paint_path(path, line);
+        }
+    }
+}
+
+/// The stretches of consecutive samples that have a value, each with the
+/// position it sits at, so the missing ones still take up their share of the
+/// width.
+fn runs(values: &[Option<f64>]) -> Vec<Vec<(usize, f64)>> {
+    let mut runs: Vec<Vec<(usize, f64)>> = Vec::new();
+    let mut open = false;
+    for (i, v) in values.iter().enumerate() {
+        match v {
+            Some(v) => {
+                if !open {
+                    runs.push(Vec::new());
+                    open = true;
+                }
+                runs.last_mut().expect("just opened a run").push((i, *v));
+            }
+            None => open = false,
+        }
+    }
+    runs
 }
 
 /// Renders one series as a filled area with a line along its top, an axis, and
@@ -75,7 +147,9 @@ pub fn chart(series: &Series, theme: &Theme, height: Pixels) -> impl IntoElement
 
     let (lo, hi) = bounds_of(&values);
     let unit = series.unit.trim().to_string();
-    let latest = values.last().copied();
+    // What it reads right now, which is nothing at all while the thing being
+    // watched is not answering: the last number known is not the current one.
+    let latest = series.latest();
 
     div()
         .flex()
@@ -132,13 +206,15 @@ pub fn chart(series: &Series, theme: &Theme, height: Pixels) -> impl IntoElement
 }
 
 /// The value range to draw, padded so a flat line does not sit on the floor
-/// and a spike does not touch the ceiling.
-fn bounds_of(values: &[f64]) -> (f64, f64) {
-    if values.is_empty() {
+/// and a spike does not touch the ceiling. Samples with no value say nothing
+/// about the range.
+fn bounds_of(values: &[Option<f64>]) -> (f64, f64) {
+    let mut present = values.iter().flatten().copied().peekable();
+    if present.peek().is_none() {
         return (0.0, 1.0);
     }
-    let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let lo = present.clone().fold(f64::INFINITY, f64::min);
+    let hi = present.fold(f64::NEG_INFINITY, f64::max);
     if (hi - lo).abs() < f64::EPSILON {
         let pad = if hi.abs() < f64::EPSILON { 1.0 } else { hi.abs() * 0.2 };
         return (lo - pad, hi + pad);
@@ -152,7 +228,7 @@ fn paint(
     bounds: Bounds<Pixels>,
     window: &mut Window,
     cx: &mut gpui::App,
-    values: &[f64],
+    values: &[Option<f64>],
     lo: f64,
     hi: f64,
     line_color: Hsla,
@@ -216,41 +292,24 @@ fn paint(
         point(plot.left() + step * i as f32, y.clamp(plot.top(), plot.bottom()))
     };
 
-    // The filled area first, so the line sits on top of its own shading.
-    let mut area = PathBuilder::fill();
-    area.move_to(point(plot.left(), plot.bottom()));
-    for (i, v) in values.iter().enumerate() {
-        area.line_to(at(i, *v));
-    }
-    area.line_to(point(plot.right(), plot.bottom()));
-    area.close();
-    if let Ok(path) = area.build() {
-        window.paint_path(
-            path,
-            gpui::linear_gradient(
-                180.,
-                gpui::linear_color_stop(fill_top, 0.),
-                gpui::linear_color_stop(fill_bottom, 1.),
-            ),
-        );
-    }
+    draw(
+        window,
+        values,
+        &at,
+        plot.bottom(),
+        gpui::linear_gradient(
+            180.,
+            gpui::linear_color_stop(fill_top, 0.),
+            gpui::linear_color_stop(fill_bottom, 1.),
+        ),
+        line_color,
+        px(1.6),
+    );
 
-    let mut stroke = PathBuilder::stroke(px(1.6));
-    for (i, v) in values.iter().enumerate() {
-        let p = at(i, *v);
-        if i == 0 {
-            stroke.move_to(p);
-        } else {
-            stroke.line_to(p);
-        }
-    }
-    if let Ok(path) = stroke.build() {
-        window.paint_path(path, line_color);
-    }
-
-    // A dot on the newest sample, the one being watched.
-    if let Some(last) = values.last() {
-        let p = at(values.len() - 1, *last);
+    // A dot on the newest sample, the one being watched. There is none while
+    // the series is in a gap: nothing is arriving to watch.
+    if let Some(last) = values.last().copied().flatten() {
+        let p = at(values.len() - 1, last);
         let r = px(3.);
         window.paint_quad(quad(
             Bounds::from_corners(point(p.x - r, p.y - r), point(p.x + r, p.y + r)),
@@ -273,5 +332,36 @@ fn fmt_axis(v: f64) -> String {
         _ if a >= 1.0 => format!("{v:.2}"),
         _ if a > 0.0 => format!("{v:.3}"),
         _ => "0".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounds_of, runs};
+
+    #[test]
+    fn a_missing_sample_breaks_the_line_in_two() {
+        let drawn = runs(&[Some(1.0), Some(2.0), None, None, Some(9.0), Some(8.0)]);
+
+        assert_eq!(drawn.len(), 2, "a gap ends one run and starts another");
+        assert_eq!(drawn[0], vec![(0, 1.0), (1, 2.0)]);
+        // The second run keeps its distance from the first: the outage takes
+        // up the width it lasted for.
+        assert_eq!(drawn[1], vec![(4, 9.0), (5, 8.0)]);
+    }
+
+    #[test]
+    fn a_series_with_nothing_in_it_draws_nothing() {
+        assert!(runs(&[None, None]).is_empty());
+        // And it asks for no particular range, rather than one built out of
+        // infinities.
+        assert_eq!(bounds_of(&[None, None]), (0.0, 1.0));
+    }
+
+    #[test]
+    fn the_range_comes_from_the_samples_that_have_a_value() {
+        let (lo, hi) = bounds_of(&[Some(10.0), None, Some(20.0)]);
+        assert!(lo < 10.0 && lo >= 0.0, "padded below, never under zero");
+        assert!(hi > 20.0, "padded above");
     }
 }

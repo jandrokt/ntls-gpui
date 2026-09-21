@@ -573,6 +573,10 @@ async fn run(r: crate::core::Run, emit: Emitter) -> anyhow::Result<()> {
 
         match answered {
             Err(e) => {
+                // Nothing answered, so the response-time graph has nothing to
+                // plot here. A break says that; a line across it would say
+                // the request was as quick as its neighbours.
+                emit.emit(Event::gap("response"));
                 emit.row(
                     Status::Down,
                     url.clone(),

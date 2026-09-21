@@ -140,7 +140,12 @@ pub enum Event {
     Progress { done: usize, total: usize, label: Option<String> },
     /// Records a numeric observation for the live chart. A tool that emits
     /// samples gets a graph without asking for one.
-    Sample { series: String, unit: String, value: f64 },
+    ///
+    /// `None` is a moment the series has no value for: a probe that timed
+    /// out, a request that never answered. It keeps its place on the time
+    /// axis and the chart draws a break there, because a line straight across
+    /// an outage says the opposite of what happened.
+    Sample { series: String, unit: String, value: Option<f64> },
     /// Keeps the whole of what came back, replacing whatever was kept before.
     /// The last answer is the one a document is asking about.
     Answered(Answer),
@@ -209,7 +214,17 @@ impl Event {
     /// Samples with the same series name accumulate into one line; a tool may
     /// emit several series and each gets its own chart.
     pub fn sample(series: impl Into<String>, unit: impl Into<String>, value: f64) -> Event {
-        Event::Sample { series: series.into(), unit: unit.into(), value }
+        Event::Sample { series: series.into(), unit: unit.into(), value: Some(value) }
+    }
+
+    /// A moment that should have produced a sample and did not. The chart
+    /// breaks its line rather than joining the two sides of the outage.
+    ///
+    /// It only ever puts a hole in a series that already exists: a gap cannot
+    /// start one, or a tool whose every probe fails would open an empty
+    /// graph.
+    pub fn gap(series: impl Into<String>) -> Event {
+        Event::Sample { series: series.into(), unit: String::new(), value: None }
     }
 }
 

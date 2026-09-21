@@ -121,7 +121,10 @@ pub struct SavedLog {
 pub struct SavedSeries {
     pub name: String,
     pub unit: String,
-    pub values: Vec<f64>,
+    /// `null` where the run recorded nothing, which is how a break in the
+    /// line survives being saved. A file written before gaps existed holds
+    /// plain numbers and reads back as samples that all have one.
+    pub values: Vec<Option<f64>>,
 }
 
 /// A workspace's own file: everything about it that is not a tool.
@@ -505,6 +508,12 @@ pub struct AppState {
     /// Whether a table that is scrolled to one end stays there as rows arrive.
     #[serde(default = "yes")]
     pub follow_results: bool,
+    /// How many samples a chart keeps. Past this the oldest fall off the
+    /// left, the way a live graph should: a ping left running overnight is
+    /// asked about the last few minutes, and a line drawn out of thirty
+    /// thousand readings is a smear.
+    #[serde(default = "default_chart_samples")]
+    pub chart_samples: usize,
     /// Whether the output panel opens itself when a run fails.
     #[serde(default = "yes")]
     pub open_panel_on_failure: bool,
@@ -529,6 +538,7 @@ impl Default for AppState {
             toasts: true,
             toast_seconds: default_toast_seconds(),
             follow_results: true,
+            chart_samples: default_chart_samples(),
             open_panel_on_failure: true,
             remember_layout: true,
             sidebar_open: None,
@@ -568,12 +578,25 @@ impl AppState {
     pub fn toast_for(&self) -> Duration {
         Duration::from_secs(self.toast_seconds.clamp(2, 60))
     }
+
+    /// How many chart samples to keep, whatever the file says. Zero would
+    /// leave nothing to draw and a very large number is a memory leak with a
+    /// setting in front of it.
+    pub fn chart_keep(&self) -> usize {
+        self.chart_samples.clamp(10, 10_000)
+    }
 }
 
 /// Long enough to read a line without looking up in a hurry, short enough not
 /// to sit over the results.
 fn default_toast_seconds() -> u64 {
     6
+}
+
+/// Enough of a ping to see the shape of the last couple of minutes, few
+/// enough that each sample still has a pixel or two of the panel to itself.
+fn default_chart_samples() -> usize {
+    100
 }
 
 fn state_path() -> PathBuf {
@@ -893,7 +916,11 @@ mod tests {
             stats: vec![crate::core::kv("sent", "4")],
             rows: vec![Row { cells: vec!["1".into()], status: Status::Up, target: "1.1.1.1".into(), note: None, key: None }],
             log: vec![SavedLog { level: Level::Good, text: "done".into(), at: Duration::ZERO }],
-            charts: vec![SavedSeries { name: "rtt".into(), unit: " ms".into(), values: vec![1.0] }],
+            charts: vec![SavedSeries {
+                name: "rtt".into(),
+                unit: " ms".into(),
+                values: vec![Some(1.0), None, Some(3.0)],
+            }],
             answer: None,
         };
         let json = serde_json::to_vec(&record).unwrap();
@@ -904,7 +931,18 @@ mod tests {
         assert!(back.favorite);
         assert_eq!(back.rows.len(), 1);
         assert_eq!(back.rows[0].target, "1.1.1.1");
-        assert_eq!(back.charts[0].values, vec![1.0]);
+        // The hole in the middle is a probe that got no reply, and it has to
+        // come back as a hole or the chart draws a line across it.
+        assert_eq!(back.charts[0].values, vec![Some(1.0), None, Some(3.0)]);
+    }
+
+    /// Gaps came later. A workspace saved before them holds plain numbers,
+    /// and every one of them is a reading that happened.
+    #[test]
+    fn a_chart_saved_before_gaps_existed_still_opens() {
+        let json = br#"{"tool":"ping","params":{},"charts":[{"name":"rtt","unit":" ms","values":[1.0,2.5]}]}"#;
+        let back: JobRecord = serde_json::from_slice(json).unwrap();
+        assert_eq!(back.charts[0].values, vec![Some(1.0), Some(2.5)]);
     }
 
     #[test]

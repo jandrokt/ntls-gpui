@@ -8,12 +8,17 @@
 //! The short version, because it decides what a scan can say: the IEEE is
 //! authoritative for the names, but it publishes a 24-bit block as "IEEE
 //! Registration Authority" once it has subdivided that block into smaller
-//! assignments. That is not a vendor, and a device sitting in such a block
-//! used to be reported by that name, which told nobody anything. Those
-//! placeholders are left out of the table entirely, and several thousand
-//! finer-grained assignments that the IEEE does not publish but Wireshark
-//! maintains are merged in, so the device is named instead of its
-//! registrar.
+//! assignments, and as "Private" where the registrant paid not to be listed.
+//! Neither is a vendor, and a device sitting in such a block used to be
+//! reported by that name, which told nobody anything. Those placeholders are
+//! left out of the table entirely, and several thousand finer-grained
+//! assignments that the IEEE does not publish but Wireshark maintains are
+//! merged in, so the device is named instead of its registrar.
+//!
+//! The names are also tidied there: the corporate form a company registers
+//! under is not what anyone calls it, and a column of "Inc.", "Co.,Ltd" and
+//! "GmbH" is harder to read past than the names themselves. The table holds
+//! "Dell", not "Dell Inc.".
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -134,8 +139,8 @@ mod tests {
         // meant for whoever made the thing. There are several thousand such
         // devices and other scanners name them, because the finer assignments
         // exist even where the IEEE does not publish them.
-        assert_eq!(lookup("00:1b:c5:00:00:01"), "Converging Systems Inc.");
-        assert_eq!(lookup("00:50:c2:00:00:01"), "T.L.S. Corp.");
+        assert_eq!(lookup("00:1b:c5:00:00:01"), "Converging Systems");
+        assert_eq!(lookup("00:50:c2:00:00:01"), "T.L.S.");
         // The registrar's own name is not in the table at all, so a block of
         // its that nobody has claimed says nothing rather than saying that.
         assert!(!table().values().any(|v| v.contains("Registration Authority")));
@@ -147,7 +152,7 @@ mod tests {
         // were given to, so the specific answer has to win over the general
         // one. Apple holds a whole 24-bit block, and nothing finer inside it,
         // so that one is answered by its own prefix.
-        assert_eq!(lookup("a4:83:e7:00:00:01"), "Apple, Inc.");
+        assert_eq!(lookup("a4:83:e7:00:00:01"), "Apple");
         assert_ne!(lookup("00:1b:c5:00:00:01"), lookup("00:1b:c5:f0:00:01"));
     }
 
@@ -193,6 +198,34 @@ mod tests {
         // group bit is the only thing being ruled out here.
         assert!(is_local("06:00:00:00:00:01"));
         assert!(is_local("aa:bb:cc:dd:ee:ff"));
+    }
+
+    #[test]
+    fn a_registrant_who_is_not_listed_is_not_a_vendor_called_private() {
+        // The IEEE writes "Private" against a block whose owner paid not to
+        // be named. It is bookkeeping, not a manufacturer, and a scan of an
+        // office printed it against a dozen rows as though it were one.
+        assert!(!table().values().any(|v| v.eq_ignore_ascii_case("private")));
+        assert_eq!(lookup("00:17:61:00:00:01"), "");
+    }
+
+    #[test]
+    fn a_name_is_the_company_and_not_the_paperwork() {
+        // Whatever the registry wrote, the column is read at a glance, and
+        // the form a company files under is the part nobody reads.
+        for (mac, want) in [
+            ("00:17:88:00:00:01", "Philips Lighting BV"),
+            ("3c:5a:b4:00:00:01", "Google"),
+            ("b8:27:eb:00:00:01", "Raspberry Pi Foundation"),
+        ] {
+            let got = lookup(mac);
+            assert!(!got.is_empty(), "{mac} is not in the table at all");
+            assert!(
+                !got.to_lowercase().trim_end_matches('.').ends_with("inc")
+                    && !got.to_lowercase().ends_with("ltd"),
+                "{mac} still carries its corporate form: {got:?} (wanted something like {want:?})"
+            );
+        }
     }
 
     #[test]
